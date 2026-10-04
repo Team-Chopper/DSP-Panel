@@ -1,0 +1,26 @@
+name: dsp_server
+description: "Web-panel server for t.racks DSP 408 devices: holds the TCP connections and serves the Flutter web client."
+publish_to: 'none'
+version: 0.6.0
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  args: ^2.6.0
+  crypto: ^3.0.6
+  dsp_core:
+    path: ../packages/dsp_core
+  mime: ^2.0.0
+  path: ^1.9.0
+  shelf: ^1.4.2
+  shelf_router: ^1.1.4
+  shelf_static: ^1.1.3
+  shelf_web_socket: ^3.0.0
+  web_socket_channel: ^3.0.1
+  yaml: ^3.1.3
+
+dev_dependencies:
+  http: ^1.2.2
+  lints: ^6.0.0
+  test: ^1.25.0

@@ -1,0 +1,35 @@
+{
+    "name": "DSP Panel",
+    "short_name": "DSP Panel",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#272822",
+    "theme_color": "#3E3D32",
+    "description": "Web panel for t.racks DSP 408 and DSP 206 devices.",
+    "orientation": "any",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

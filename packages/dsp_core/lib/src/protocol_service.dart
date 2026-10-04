@@ -1,0 +1,534 @@
+// DSP Protocol Service
+//
+// Handles encoding and decoding of t.racks DSP 206/408 protocol messages.
+// Includes command building, value encodings, checksum calculation and
+// message parsing.
+//
+// Frame layout (verified against captured traffic):
+//   10 02 [src] [dst] [len] [cmd] [len-1 payload bytes] 10 03 [checksum]
+// Total frame length is len + 8. The checksum is 0x01 XOR every byte from
+// [src] up to the last payload byte. Payload bytes are NOT escaped, so a
+// payload may contain 10 03 — always use [len] to find the end of a frame.
+//
+// Value encodings are shared by both models. Frequency, Q, slope, delay and
+// dynamics encodings follow the FlexiFlizz project, verified on a DSP 206 with
+// captures of the original editor; the config dumps captured from a DSP 408
+// in this repository use the same scales (see TODO.md for what is open).
+
+import 'dart:math' as math;
+
+import 'device_model.dart';
+
+/// Types of protocol messages
+enum MessageType {
+  deviceInfo,
+  preset,
+  channelConfig,
+  presetCount,
+  keepalive,
+  unknown,
+}
+
+/// Base class for protocol messages
+abstract class ProtocolMessage {
+  final MessageType type;
+  final List<int> rawData;
+
+  ProtocolMessage(this.type, this.rawData);
+
+  /// Command byte of the frame.
+  int get command => rawData[5];
+}
+
+/// Preset information message
+class PresetMessage extends ProtocolMessage {
+  final int index;
+  final String name;
+
+  PresetMessage(this.index, this.name, List<int> rawData)
+      : super(MessageType.preset, rawData);
+}
+
+/// Channel config chunk message (cmd 0x24)
+class ChannelConfigMessage extends ProtocolMessage {
+  final int subIndex;
+  final List<int> chunkData;
+
+  ChannelConfigMessage(this.subIndex, this.chunkData, List<int> rawData)
+      : super(MessageType.channelConfig, rawData);
+}
+
+/// Device info message, e.g. "DSP408 V0104P"
+class DeviceInfoMessage extends ProtocolMessage {
+  final String deviceName;
+
+  DeviceInfoMessage(this.deviceName, List<int> rawData)
+      : super(MessageType.deviceInfo, rawData);
+}
+
+/// Preset count message
+class PresetCountMessage extends ProtocolMessage {
+  final int count;
+
+  PresetCountMessage(this.count, List<int> rawData)
+      : super(MessageType.presetCount, rawData);
+}
+
+/// Keepalive/meter message (cmd 0x40 response with one level per channel)
+class KeepaliveMessage extends ProtocolMessage {
+  /// Meter levels as linear float values, in the model's channel order
+  /// (inputs, then outputs).
+  final List<double> meterLevels;
+
+  KeepaliveMessage(this.meterLevels, List<int> rawData)
+      : super(MessageType.keepalive, rawData);
+}
+
+/// Unknown message (including the generic 0x01 acknowledgement)
+class UnknownMessage extends ProtocolMessage {
+  UnknownMessage(List<int> rawData) : super(MessageType.unknown, rawData);
+}
+
+class ProtocolService {
+  /// Model whose channel bytes the command builders use.
+  final DeviceModel model;
+
+  const ProtocolService([this.model = DeviceModel.dsp408]);
+
+  // ─── Framing ───
+
+  /// Decode IEEE 754 half-precision (float16) from 2 bytes in little-endian
+  static double decodeFloat16(int low, int high) {
+    final value = low | (high << 8);
+    final sign = (value >> 15) & 1;
+    final exponent = (value >> 10) & 0x1F;
+    final mantissa = value & 0x3FF;
+
+    double result;
+    if (exponent == 0) {
+      // Subnormal
+      result = (mantissa / 1024.0) * (1.0 / 16384.0); // 2^-14
+    } else if (exponent == 31) {
+      // Inf/NaN
+      result = mantissa == 0 ? double.infinity : double.nan;
+    } else {
+      result = (1.0 + mantissa / 1024.0) * _pow2(exponent - 15);
+    }
+    return sign == 1 ? -result : result;
+  }
+
+  static double _pow2(int exp) {
+    if (exp >= 0) {
+      return (1 << exp).toDouble();
+    } else {
+      return 1.0 / (1 << -exp).toDouble();
+    }
+  }
+
+  /// Parse [count] channel meter levels from a keepalive response frame.
+  /// Each channel is 3 bytes: [float16_low, float16_high, peak_byte]
+  static List<double> parseMeterLevels(List<int> data, int count) {
+    // Data starts at byte 6 (after 10 02 01 00 LEN 40)
+    if (data.length < 6 + count * 3) return List.filled(count, 0.0); // too short
+
+    return [
+      for (int ch = 0; ch < count; ch++)
+        () {
+          final linear = decodeFloat16(data[6 + ch * 3], data[7 + ch * 3]);
+          // DSP returns 0xFF 0xFF (NaN) for channels during PEQ recalculation
+          return linear.isFinite ? linear : 0.0;
+        }(),
+    ];
+  }
+
+  /// Calculate checksum for the DSP protocol
+  static int calculateChecksum(Iterable<int> dataBytes) {
+    int checksum = 1;
+    for (int byte in dataBytes) {
+      checksum ^= byte;
+    }
+    return checksum;
+  }
+
+  /// Build a host → device frame for a command byte and its payload.
+  static List<int> buildFrame(int command, [List<int> payload = const []]) {
+    final dataBytes = [0x00, 0x01, payload.length + 1, command, ...payload];
+    return [0x10, 0x02, ...dataBytes, 0x10, 0x03, calculateChecksum(dataBytes)];
+  }
+
+  static List<int> _u16(int value) => [value & 0xFF, (value >> 8) & 0xFF];
+
+  int _requireChannel(String channel, {bool inputsOnly = false, bool outputsOnly = false}) {
+    final ch = model.channelByte(channel);
+    if (ch == null ||
+        (inputsOnly && !model.isInput(channel)) ||
+        (outputsOnly && !model.isOutput(channel))) {
+      throw ArgumentError('Invalid channel for ${model.name}: $channel');
+    }
+    return ch;
+  }
+
+  // ─── Channel gain ───
+
+  /// Convert dB value to DSP protocol value
+  int gainDbToValue(double dB) {
+    if (dB < -20.0) {
+      // Coarse range: 0.5dB resolution (2 units per dB)
+      return ((dB + 60) * 2).round().clamp(0, 80);
+    } else {
+      // Fine range: 0.1dB resolution (10 units per dB)
+      return (80 + (dB + 20) * 10).round().clamp(80, 400);
+    }
+  }
+
+  /// Convert DSP protocol value back to dB (inverse of [gainDbToValue])
+  double gainValueToDb(int value) {
+    if (value < 80) return value / 2.0 - 60.0;
+    return (value - 280) / 10.0;
+  }
+
+  /// Quantize gain value to appropriate step
+  double quantizeGain(double dB) {
+    if (dB < -20.0) {
+      // Coarse range: round to nearest 0.5dB
+      return (dB * 2).round() / 2;
+    } else {
+      // Fine range: round to nearest 0.1dB
+      return (dB * 10).round() / 10;
+    }
+  }
+
+  // ─── EQ gain (PEQ and GEQ) ───
+
+  /// Convert GEQ dB value (-12.0 to +12.0) to protocol value (0-240)
+  /// Linear: value = (dB * 10) + 120, resolution 0.1 dB
+  int geqDbToValue(double dB) => (dB * 10 + 120).round().clamp(0, 240);
+
+  /// Convert GEQ protocol value back to dB
+  double geqValueToDb(int value) => (value - 120) / 10.0;
+
+  /// Quantize GEQ dB to 0.1 dB resolution
+  double quantizeGeqDb(double dB) => (dB * 10).round() / 10.0;
+
+  /// PEQ gain: same encoding as GEQ (0-240, dB = (value-120)/10.0)
+  double peqGainToDb(int value) => (value - 120) / 10.0;
+  int peqDbToGain(double dB) => (dB * 10 + 120).round().clamp(0, 240);
+
+  // ─── Frequency (PEQ, HPF, LPF) ───
+
+  /// Frequency encoding: log scale from 20 Hz (raw 0) to 20 kHz (raw 300),
+  /// 100 steps per decade: Hz = 20 * 1000^(raw/300).
+  static const int freqRawMax = 300;
+  static const double _freqMinHz = 20.0;
+
+  /// Convert raw frequency value to Hz
+  double peqFreqToHz(int raw) =>
+      _freqMinHz * math.pow(1000.0, raw.clamp(0, freqRawMax) / freqRawMax);
+
+  /// Convert Hz to raw frequency value
+  int peqHzToFreq(double hz) {
+    if (hz <= _freqMinHz) return 0;
+    return (100 * math.log(hz / _freqMinHz) / math.ln10).round().clamp(0, freqRawMax);
+  }
+
+  // ─── Q ───
+
+  /// Q encoding: Q = 10^((raw - 16) / 40); raw 0 ≈ 0.40, raw 100 ≈ 126.
+  static const int qRawMax = 100;
+
+  double peqRawToQ(int raw) => math.pow(10.0, (raw.clamp(0, qRawMax) - 16) / 40.0).toDouble();
+
+  int peqQToRaw(double q) {
+    if (q <= 0) return 0;
+    return (40 * math.log(q) / math.ln10 + 16).round().clamp(0, qRawMax);
+  }
+
+  // ─── Delay and dynamics ───
+
+  /// Delay: raw = ms * 96 (96 kHz sample clock); limited to 680 ms.
+  static const int delayRawMax = 680 * 96;
+  static double delayRawToMs(int raw) => raw / 96.0;
+  static int delayMsToRaw(double ms) => (ms * 96).round().clamp(0, delayRawMax);
+
+  /// Threshold (gate, compressor, limiter): raw = dB * 2 + 180.
+  static double thresholdRawToDb(int raw) => (raw - 180) / 2.0;
+  static int thresholdDbToRaw(double dB) => (dB * 2 + 180).round().clamp(0, 0xFFFF);
+
+  /// Attack, release and hold times: raw = ms - 1.
+  static int timeRawToMs(int raw) => raw + 1;
+  static int timeMsToRaw(int ms) => (ms - 1).clamp(0, 0xFFFF);
+
+  /// PEQ filter types
+  static const peqTypeNames = [
+    'Peak', 'Low Shelf', 'High Shelf',
+    'LP -6dB', 'LP -12dB', 'HP -6dB', 'HP -12dB',
+    'All Pass 1', 'All Pass 2',
+  ];
+
+  /// Hi/Lo Pass crossover slopes; index 0 = bypass (filter off).
+  /// BW = Butterworth, BL = Bessel, LK = Linkwitz-Riley.
+  static const crossoverSlopeNames = [
+    'Bypass',
+    'BW -6', 'BL -6',
+    'BW -12', 'BL -12', 'LK -12',
+    'BW -18', 'BL -18',
+    'BW -24', 'BL -24', 'LK -24',
+    'BW -30', 'BL -30',
+    'BW -36', 'BL -36', 'LK -36',
+    'BW -42', 'BL -42',
+    'BW -48', 'BL -48', 'LK -48',
+  ];
+
+  /// Slope in dB/octave for a crossover slope index (0 for bypass).
+  static int slopeDbPerOctave(int slope) {
+    if (slope <= 0 || slope >= crossoverSlopeNames.length) return 0;
+    return int.parse(crossoverSlopeNames[slope].split(' -').last);
+  }
+
+  /// Default slope when a filter is switched on (BW -24).
+  static const int defaultSlope = 8;
+
+  /// Compressor ratios by index.
+  static const compressorRatioNames = [
+    '1:1', '1:1.1', '1:1.3', '1:1.5', '1:1.7', '1:2', '1:2.5', '1:3',
+    '1:3.5', '1:4', '1:5', '1:6', '1:8', '1:10', '1:20', 'Limit',
+  ];
+
+  // ─── Command builders ───
+
+  /// Gain (0x34): `ch value(2B LE)`
+  List<int> buildGainCommand(String channelLabel, double dB) {
+    final channel = _requireChannel(channelLabel);
+    return buildFrame(0x34, [channel, ..._u16(gainDbToValue(quantizeGain(dB)))]);
+  }
+
+  /// Mute (0x35): `ch 0|1`
+  List<int> buildMuteCommand(String channelLabel, bool mute) {
+    final channel = _requireChannel(channelLabel);
+    return buildFrame(0x35, [channel, mute ? 0x01 : 0x00]);
+  }
+
+  /// Phase invert (0x36): `ch 0|1`
+  List<int> buildPhaseCommand(String channelLabel, bool invert) {
+    final channel = _requireChannel(channelLabel);
+    return buildFrame(0x36, [channel, invert ? 0x01 : 0x00]);
+  }
+
+  /// Delay (0x38): `ch value(2B LE)`, value = ms * 96
+  List<int> buildDelayCommand(String channelLabel, int raw) {
+    final channel = _requireChannel(channelLabel);
+    return buildFrame(0x38, [channel, ..._u16(raw.clamp(0, delayRawMax))]);
+  }
+
+  /// GEQ band (0x48): `ch band value(2B LE)` — inputs only
+  List<int> buildGeqBandCommand(String channel, int bandIndex, double dB) {
+    final ch = _requireChannel(channel, inputsOnly: true);
+    if (bandIndex < 0 || bandIndex >= geqBandCount) {
+      throw ArgumentError('Invalid band index: $bandIndex');
+    }
+    return buildFrame(0x48, [ch, bandIndex, ..._u16(geqDbToValue(quantizeGeqDb(dB)))]);
+  }
+
+  /// Matrix routing (0x3a): `output input_bitmask`
+  List<int> buildMatrixRoutingCommand(String output, int inputBitmask) {
+    final ch = _requireChannel(output, outputsOnly: true);
+    return buildFrame(0x3a, [ch, inputBitmask & model.matrixMask]);
+  }
+
+  /// PEQ band (0x33):
+  /// `ch band gain(2B LE) freq(2B LE) Q type bypass`
+  List<int> buildPeqBandCommand(String channel, int band, {
+    required double gainDb,
+    required int freqRaw,
+    required int qRaw,
+    required int type,
+    required bool bypass,
+  }) {
+    final ch = _requireChannel(channel);
+    if (band < 0 || band >= peqBandCountFor(model, channel)) {
+      throw ArgumentError('Invalid PEQ band: $band');
+    }
+    return buildFrame(0x33, [
+      ch, band, ..._u16(peqDbToGain(gainDb)),
+      ..._u16(freqRaw.clamp(0, freqRawMax)),
+      qRaw & 0xFF, type, bypass ? 1 : 0,
+    ]);
+  }
+
+  /// Hi Pass (0x32): `ch freq(2B LE) slope` — slope 0 = bypass
+  List<int> buildHiPassCommand(String channel, int freqRaw, int slope) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x32, [ch, ..._u16(freqRaw.clamp(0, freqRawMax)), slope]);
+  }
+
+  /// Lo Pass (0x31): `ch freq(2B LE) slope` — slope 0 = bypass
+  List<int> buildLoPassCommand(String channel, int freqRaw, int slope) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x31, [ch, ..._u16(freqRaw.clamp(0, freqRawMax)), slope]);
+  }
+
+  /// Compressor (0x30):
+  /// `ch ratio(2B) attack(2B) release(2B) knee(2B) threshold(2B)`
+  List<int> buildCompressorCommand(String channel, {
+    required int ratio,
+    required int attack,
+    required int release,
+    required int knee,
+    required int threshold,
+  }) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x30, [
+      ch, ..._u16(ratio), ..._u16(attack), ..._u16(release), ..._u16(knee), ..._u16(threshold),
+    ]);
+  }
+
+  /// Gate (0x3E): `ch attack(2B) release(2B) hold(2B) threshold(2B)` — inputs only
+  List<int> buildGateCommand(String channel, {
+    required int attack,
+    required int release,
+    required int hold,
+    required int threshold,
+  }) {
+    final ch = _requireChannel(channel, inputsOnly: true);
+    return buildFrame(0x3E, [
+      ch, ..._u16(attack), ..._u16(release), ..._u16(hold), ..._u16(threshold),
+    ]);
+  }
+
+  /// Limiter (0x3F): `ch attack(2B) release(2B) unknown(2B) threshold(2B)`
+  List<int> buildLimiterCommand(String channel, {
+    required int attack,
+    required int release,
+    required int unknown,
+    required int threshold,
+  }) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x3F, [
+      ch, ..._u16(attack), ..._u16(release), ..._u16(unknown), ..._u16(threshold),
+    ]);
+  }
+
+  /// Channel link (0x3B): `ch mask` — mask of the linked channels of the
+  /// same group, including the channel itself. Seen in captures of the
+  /// original editor (FlexiFlizz) but not verified on a device yet.
+  List<int> buildLinkCommand(String channel, int mask) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x3B, [ch, mask & 0xFF]);
+  }
+
+  /// Channel name (0x3D): `ch name(8 ASCII, zero-padded)`
+  List<int> buildChannelNameCommand(String channel, String name) {
+    final ch = _requireChannel(channel);
+    return buildFrame(0x3D, [ch, ...encodeChannelName(name)]);
+  }
+
+  /// 8 bytes of printable ASCII, zero-padded; other characters become '?'.
+  static List<int> encodeChannelName(String name) {
+    final codes = name.codeUnits
+        .take(8)
+        .map((c) => (c >= 0x20 && c <= 0x7E) ? c : 0x3F)
+        .toList();
+    return [...codes, ...List.filled(8 - codes.length, 0)];
+  }
+
+  /// Build keepalive command
+  List<int> buildKeepaliveCommand() => buildFrame(0x40);
+
+  /// Build a load preset command for the given preset index (0-based).
+  ///
+  /// Protocol: `10 02 00 01 02 20 [index] 10 03 [checksum]`
+  /// The protocol uses 1-based preset indices.
+  List<int> buildLoadPresetCommand(int presetIndex) =>
+      buildFrame(0x20, [presetIndex + 1]);
+
+  /// Build the store preset name command (cmd 0x26).
+  ///
+  /// Protocol: `10 02 00 01 0f 26 [14-char name] 10 03 [checksum]`
+  /// Name is padded with spaces to exactly 14 characters. Characters outside
+  /// printable ASCII are replaced with '?'.
+  List<int> buildStorePresetNameCommand(String name) {
+    final padded = name.length >= 14 ? name.substring(0, 14) : name.padRight(14);
+    final nameBytes = padded.codeUnits
+        .map((c) => (c >= 0x20 && c <= 0x7E) ? c : 0x3F)
+        .toList();
+    return buildFrame(0x26, nameBytes);
+  }
+
+  /// Build the store preset slot command (cmd 0x21).
+  ///
+  /// Protocol: `10 02 00 01 02 21 [slot] 10 03 [checksum]`
+  /// Slot is 1-based (U01 = 1, U20 = 20).
+  List<int> buildStorePresetSlotCommand(int presetIndex) =>
+      buildFrame(0x21, [presetIndex + 1]);
+
+  // ─── Decoding ───
+
+  /// Decode a complete protocol frame (as produced by FrameDecoder).
+  ProtocolMessage? decode(List<int> data) {
+    if (data.length < 8 || data[0] != 0x10 || data[1] != 0x02) {
+      return null;
+    }
+
+    try {
+      // End of payload, i.e. position of the 10 03 footer
+      final footerIndex = 5 + data[4];
+      if (footerIndex > data.length) return null;
+
+      // Only device → host responses carry state
+      final isResponse = data[2] == 0x01;
+      if (!isResponse || data.length <= 7) return null;
+
+      final cmdByte = data[5];
+      final dataByte = footerIndex > 6 ? data[6] : null;
+
+      // Keepalive / meter response
+      if (cmdByte == 0x40) {
+        final levels = parseMeterLevels(data, model.meterCount);
+        return KeepaliveMessage(levels, data);
+      }
+
+      // Device info: the whole payload after the command byte
+      if (cmdByte == 0x13 && footerIndex > 6) {
+        final deviceName = _ascii(data.sublist(6, footerIndex));
+        return DeviceInfoMessage(deviceName, data);
+      }
+
+      // Preset data
+      if (cmdByte == 0x29 && dataByte != null) {
+        final presetName = _ascii(data.sublist(7, footerIndex));
+        return PresetMessage(dataByte, presetName, data);
+      }
+
+      // Preset count
+      if (cmdByte == 0x2c && footerIndex > 7) {
+        return PresetCountMessage(data[7], data);
+      }
+
+      // Channel config chunk (cmd 0x24)
+      if (cmdByte == 0x24 && dataByte != null) {
+        final chunkData = data.sublist(7, footerIndex);
+        return ChannelConfigMessage(dataByte, chunkData, data);
+      }
+
+      return UnknownMessage(data);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static String _ascii(List<int> bytes) => String.fromCharCodes(
+          bytes.where((b) => b != 0).map((b) => (b >= 0x20 && b <= 0x7E) ? b : 0x3F))
+      .trim();
+
+  /// Format data as hex string for display
+  String formatAsHex(List<int> data) {
+    return data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+  }
+
+  /// Format data as ASCII string for display
+  String formatAsAscii(List<int> data) {
+    return data
+        .map((b) => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : '.')
+        .join('');
+  }
+}
