@@ -13,18 +13,8 @@ import 'value_field.dart';
 /// Inner horizontal padding of a fader group (each side).
 const faderGroupPadding = 6.0;
 
-/// Meter fill (0..1) from a DSP meter value.
-///
-/// The DSP meter values have three ranges: ~0.0001 when the channel is off,
-/// ~0.4–0.5 noise floor with no audio, ~0.5–2.0 actual signal. Values at or
-/// below the noise floor show as silence; the signal range fills the meter.
-double meterFill(double level) {
-  const noiseFloor = 0.55;
-  const maxLevel = 2.0;
-  return level <= noiseFloor ? 0.0 : ((level - noiseFloor) / (maxLevel - noiseFloor)).clamp(0.0, 1.0);
-}
-
-/// Inputs or outputs: a titled box with one fader per channel.
+/// Inputs or outputs: a titled box with one fader per channel, separated
+/// by thin lines.
 class FaderGroup extends StatelessWidget {
   final DeviceProvider device;
   final String title;
@@ -59,8 +49,15 @@ class FaderGroup extends StatelessWidget {
           Expanded(
             child: Row(
               children: [
-                for (final ch in channels)
-                  Expanded(child: ChannelFader(device: device, channel: ch, color: color)),
+                for (var i = 0; i < channels.length; i++) ...[
+                  if (i > 0)
+                    Container(
+                      width: 1,
+                      margin: const EdgeInsets.symmetric(vertical: 6),
+                      color: AppColors.border,
+                    ),
+                  Expanded(child: ChannelFader(device: device, channel: channels[i], color: color)),
+                ],
               ],
             ),
           ),
@@ -92,6 +89,7 @@ class ChannelFader extends StatelessWidget {
     final muted = device.getInputMute(channel);
     final inverted = device.getInputPhase(channel);
     final linked = device.linkedWith(channel).isNotEmpty;
+    final master = device.linkMaster(channel);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),
@@ -111,7 +109,13 @@ class ChannelFader extends StatelessWidget {
                           overflow: TextOverflow.ellipsis,
                           style: interWeight(const TextStyle(fontSize: 12, color: AppColors.text), FontWeight.w600)),
                     ),
-                    if (linked) Icon(Icons.link, size: 13, color: color),
+                    if (linked)
+                      Tooltip(
+                        message: master != null
+                            ? 'Linked to ${device.getAlias(master)}'
+                            : 'Master of ${device.linkedWith(channel).map(device.getAlias).join(', ')}',
+                        child: Icon(Icons.link, size: 13, color: color),
+                      ),
                     const Icon(Icons.expand_more, size: 14, color: AppColors.muted),
                   ],
                 ),
@@ -120,17 +124,29 @@ class ChannelFader extends StatelessWidget {
             const SizedBox(height: 2),
           ],
           Expanded(
-            child: ConsoleFader(
-              value: gain,
-              taper: gainTaper,
-              marks: gainMarks,
-              majorMarks: const [0.0],
-              markLabel: gainMarkLabel,
-              color: color,
-              meterLevel: meterFill(device.getMeterLevel(channel)),
-              wheelStep: gain < -20 ? 0.5 : 0.1,
-              resetValue: 0,
-              onChanged: (v) => device.setGain(channel, device.quantizeGain(v.clamp(-60.0, 12.0))),
+            // Only the fader listens to the meters (updated every 25–40 ms), on
+            // its own layer so the rest of the page is not repainted.
+            child: RepaintBoundary(
+              child: ListenableBuilder(
+              listenable: device.meters,
+              builder: (context, _) => ConsoleFader(
+                value: gain,
+                taper: gainTaper,
+                marks: gainMarks,
+                majorMarks: const [0.0],
+                markLabel: gainMarkLabel,
+                color: color,
+                // Meter in dBFS on the fader's dB scale (0 dBFS at the 0 mark).
+                meterLevel: gainTaper.toPosition(device.getMeterDb(channel)),
+                meterPeak: gainTaper.toPosition(device.getMeterPeakDb(channel)),
+                clip: device.isClipping(channel),
+                // Limiter status as reported by the DSP.
+                limit: device.outputs.contains(channel) ? device.isLimiting(channel) : null,
+                wheelStep: gain < -20 ? 0.5 : 0.1,
+                resetValue: 0,
+                onChanged: (v) => device.setGain(channel, device.quantizeGain(v.clamp(-60.0, 12.0))),
+              ),
+            ),
             ),
           ),
           const SizedBox(height: 6),

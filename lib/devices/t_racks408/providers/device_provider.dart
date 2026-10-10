@@ -7,6 +7,7 @@
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:math' as math;
 
 import 'package:dsp_core/dsp_core.dart';
 import 'package:flutter/foundation.dart';
@@ -14,6 +15,11 @@ import 'package:flutter/foundation.dart';
 export 'package:dsp_core/dsp_core.dart'
     show PeqBand, FilterState, GateState, CompressorState, LimiterState, DeviceModel, DeviceState,
         ProtocolService, geqBandCount;
+
+/// Change notifier for the meters of a [DeviceProvider].
+class MeterNotifier extends ChangeNotifier {
+  void notify() => notifyListeners();
+}
 
 class DeviceProvider extends ChangeNotifier {
   final String dspId;
@@ -24,14 +30,14 @@ class DeviceProvider extends ChangeNotifier {
 
   DeviceProvider(this.dspId, this._send, this._isReady, {DeviceModel model = DeviceModel.dsp408})
       : _state = DeviceState(model),
-        _meterLevels = List.filled(model.meterCount, 0.0);
+        _meterDb = List.filled(model.meterCount, ProtocolService.silenceDb);
 
   static const _proto = ProtocolService();
 
   DeviceState _state;
 
-  // Meter levels (linear float values, 0.0 = silence), in channel order
-  List<double> _meterLevels;
+  // Meter levels in dBFS, in channel order
+  List<double> _meterDb;
 
   // Last active slope per filter, restored when a filter is switched back on
   final Map<String, int> _lastSlope = {};
@@ -68,7 +74,7 @@ class DeviceProvider extends ChangeNotifier {
     return (name == null || name == model.defaultDeviceName(channel)) ? channel : name;
   }
 
-  /// Matrix gain for an input-output crossing point (read from the device)
+  /// Matrix gain for an input-output crossing point in dB (−60 … 0)
   double getMatrixGain(String output, String input) =>
       _state.matrixGains['$output:$input'] ?? 0.0;
 
@@ -76,10 +82,10 @@ class DeviceProvider extends ChangeNotifier {
   bool getMatrixEnabled(String output, String input) =>
       (_state.matrixRouting[output] ?? 0) & model.matrixBit(input) != 0;
 
-  /// Get meter level for a channel (linear float, 0 = silence)
-  double getMeterLevel(String channel) {
+  /// Meter level of a channel in dBFS ([ProtocolService.silenceDb] = silence)
+  double getMeterDb(String channel) {
     final idx = model.channels.indexOf(channel);
-    return (idx < 0 || idx >= _meterLevels.length) ? 0.0 : _meterLevels[idx];
+    return (idx < 0 || idx >= _meterDb.length) ? ProtocolService.silenceDb : _meterDb[idx];
   }
 
   /// Get all GEQ band values for a channel
@@ -131,17 +137,46 @@ class DeviceProvider extends ChangeNotifier {
 
   /// Key under which an op is coalesced before sending.
   static String _keyFor(Map<String, Object?> op) =>
-      [op['op'], op['ch'] ?? op['out'], op['band']].whereType<Object>().join(':');
+      [op['op'], op['ch'] ?? op['out'], op['in'], op['band']].whereType<Object>().join(':');
 
   // ─── Linking and copying ───
 
   /// Channels [channel] is linked with (on the device, cmd 0x3B).
   List<String> linkedWith(String channel) => DeviceOps.linkedWith(_state, channel);
 
-  /// Link [channels] (all inputs or all outputs) into one group; a single
-  /// channel is unlinked from its group.
-  void setLinkGroup(List<String> channels) {
-    for (final op in DeviceOps.linkGroup(_state, channels)) {
+  /// Master [channel] is a slave of, or null.
+  String? linkMaster(String channel) => DeviceOps.masterOf(_state, channel);
+
+  /// Slaves of [channel] (empty unless it is a master).
+  List<String> linkSlaves(String channel) => DeviceOps.slavesOf(_state, channel);
+
+  /// Channels that can become slaves of [master].
+  List<String> linkCandidates(String master) => DeviceOps.linkCandidates(_state, master);
+
+  /// Make [slaves] the slaves of [master] (empty = unlink its slaves);
+  /// newly linked slaves get the master's settings if [copySettings] is set.
+  void setLinkSlaves(String master, List<String> slaves, {bool copySettings = true}) {
+    for (final op in DeviceOps.linkSlaves(_state, master, slaves, copySettings: copySettings)) {
+      _change(_keyFor(op), op);
+    }
+  }
+
+  /// Set a raw link mask (used to lift a link for a measurement and restore
+  /// it exactly afterwards).
+  void setLinkMask(String channel, int mask) => _change('link:$channel', DeviceOps.link(channel, mask));
+
+  /// Raw link mask of [channel] as stored on the device.
+  int linkMask(String channel) => _state.links[channel] ?? model.linkBit(channel);
+
+  /// Set mute to [on] (linked channels follow).
+  void setMute(String channel, bool on) {
+    if (!_state.mutes.containsKey(channel)) return;
+    _change('mute:$channel', DeviceOps.mute(channel, on));
+  }
+
+  /// Remove [channel] from its link group.
+  void unlink(String channel) {
+    for (final op in DeviceOps.unlink(_state, channel)) {
       _change(_keyFor(op), op);
     }
   }
@@ -188,6 +223,10 @@ class DeviceProvider extends ChangeNotifier {
     final mask = (_state.matrixRouting[output] ?? 0) ^ model.matrixBit(input);
     _change('matrix:$output', DeviceOps.matrixRoute(output, mask));
   }
+
+  /// Set the gain of a matrix crossing point (−60 … 0 dB)
+  void setMatrixGain(String output, String input, double dB) =>
+      _change('mixgain:$output:$input', DeviceOps.matrixGain(output, input, dB));
 
   /// Set a single GEQ band value
   void setGeqBand(String channel, int bandIndex, double dB) =>
@@ -266,6 +305,14 @@ class DeviceProvider extends ChangeNotifier {
     }
   }
 
+  /// Signal generator of the DSP: type (0 = off, 1 = pink, 2 = white,
+  /// 3 = sine) and the sine frequency index.
+  int get testToneType => _state.testToneType;
+  int get testToneParam => _state.testToneParam;
+
+  void setTestTone(int type, [int? param]) =>
+      _change('testTone', DeviceOps.testTone(type, param ?? _state.testToneParam));
+
   void setGate(String channel, GateState gate) =>
       _change('gate:$channel', DeviceOps.gate(channel, gate));
 
@@ -296,7 +343,9 @@ class DeviceProvider extends ChangeNotifier {
     final next = DeviceState.fromJson(json);
     if (next.model != model) {
       _outgoing.clear();
-      _meterLevels = List.filled(next.model.meterCount, 0.0);
+      _meterDb = List.filled(next.model.meterCount, ProtocolService.silenceDb);
+      _peakDb.clear();
+      meters.notify();
     }
     _state = next;
     // Keep local changes that have not been sent yet.
@@ -320,27 +369,104 @@ class DeviceProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// New meter levels; only rebuild if they changed noticeably.
-  void applyMeters(List<double> levels) {
-    if (levels.length != _meterLevels.length) {
-      _meterLevels = levels;
-      notifyListeners();
+  /// New meter levels in dBFS (channel order) and the compressor/limiter
+  /// status word of the outputs ([dynamics], see KeepaliveMessage); notifies
+  /// [meters] if they (or a hold indicator) changed noticeably.
+  void applyMeters(List<double> levels, {int dynamics = 0}) {
+    final now = DateTime.now();
+    final dt = _lastMeterTime == null ? 0.0 : now.difference(_lastMeterTime!).inMicroseconds / 1e6;
+    _lastMeterTime = now;
+    if (levels.length != _meterDb.length) {
+      _meterDb = levels;
+      _peakDb.clear();
+      meters.notify();
       return;
     }
-    bool changed = false;
-    for (int i = 0; i < levels.length; i++) {
-      if ((levels[i] - _meterLevels[i]).abs() > 0.005) {
+    var changed = false;
+    final channels = model.channels;
+    for (var i = 0; i < levels.length && i < channels.length; i++) {
+      final ch = channels[i];
+      final db = levels[i];
+      if ((db - _meterDb[i]).abs() > 0.2) changed = true;
+      // Peak hold: jumps up, falls slowly after a short hold.
+      final peak = _peakDb[ch] ?? ProtocolService.silenceDb;
+      if (db >= peak) {
+        _peakDb[ch] = db;
+        _peakHeldUntil[ch] = now.add(_peakHold);
+      } else if (now.isAfter(_peakHeldUntil[ch] ?? now)) {
+        final fallen = math.max(db, peak - _peakFallDbPerSecond * dt);
+        if ((fallen - peak).abs() > 0.1) changed = true;
+        _peakDb[ch] = fallen;
+      }
+      // Indicators stay lit for a moment.
+      if (db >= clipDb) _clipUntil[ch] = now.add(_indicatorHold);
+      final output = model.outputs.indexOf(ch);
+      if (output >= 0) {
+        if (ProtocolService.compressorActive(dynamics, output)) _compUntil[ch] = now.add(_indicatorHold);
+        if (ProtocolService.limiterActive(dynamics, output)) _limitUntil[ch] = now.add(_indicatorHold);
+      }
+      // Compare with what was shown last time, so an indicator that times
+      // out between two frames goes dark.
+      if (_shownClip.contains(ch) != isClipping(ch) ||
+          _shownComp.contains(ch) != isCompressing(ch) ||
+          _shownLimit.contains(ch) != isLimiting(ch)) {
         changed = true;
-        break;
       }
     }
-    _meterLevels = levels;
-    if (changed) notifyListeners();
+    _meterDb = levels;
+    if (changed) {
+      _shownClip
+        ..clear()
+        ..addAll(channels.where(isClipping));
+      _shownComp
+        ..clear()
+        ..addAll(channels.where(isCompressing));
+      _shownLimit
+        ..clear()
+        ..addAll(channels.where(isLimiting));
+      meters.notify();
+    }
   }
+
+  /// Notifies when meter levels or indicators change. Kept apart from the
+  /// provider itself so meter updates (every 25–40 ms) only repaint the
+  /// meters, not whole pages with their EQ curves.
+  final MeterNotifier meters = MeterNotifier();
+
+  final Set<String> _shownClip = {};
+  final Set<String> _shownComp = {};
+  final Set<String> _shownLimit = {};
+
+  static const _peakHold = Duration(milliseconds: 900);
+  static const _peakFallDbPerSecond = 20.0;
+  static const _indicatorHold = Duration(milliseconds: 1500);
+
+  /// Level in dBFS at which the clip indicator lights up.
+  static const clipDb = -0.5;
+
+  DateTime? _lastMeterTime;
+  final Map<String, double> _peakDb = {};
+  final Map<String, DateTime> _peakHeldUntil = {};
+  final Map<String, DateTime> _clipUntil = {};
+  final Map<String, DateTime> _compUntil = {};
+  final Map<String, DateTime> _limitUntil = {};
+
+  /// Peak-hold level of a channel's meter in dBFS.
+  double getMeterPeakDb(String channel) => _peakDb[channel] ?? ProtocolService.silenceDb;
+
+  /// The channel reached full scale in the last 1.5 s.
+  bool isClipping(String channel) => DateTime.now().isBefore(_clipUntil[channel] ?? DateTime(0));
+
+  /// The DSP reported the compressor of this output working in the last 1.5 s.
+  bool isCompressing(String channel) => DateTime.now().isBefore(_compUntil[channel] ?? DateTime(0));
+
+  /// The DSP reported the limiter of this output working in the last 1.5 s.
+  bool isLimiting(String channel) => DateTime.now().isBefore(_limitUntil[channel] ?? DateTime(0));
 
   @override
   void dispose() {
     _flushTimer?.cancel();
+    meters.dispose();
     super.dispose();
   }
 }

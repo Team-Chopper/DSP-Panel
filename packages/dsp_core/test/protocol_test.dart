@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:dsp_core/dsp_core.dart';
 import 'package:test/test.dart';
 
@@ -92,6 +94,19 @@ void main() {
       );
       expect(p206.buildGeqBandCommand('In B', 30, -12), frame([0x48, 0x01, 30, 0x00, 0x00]));
       expect(p206.buildMatrixRoutingCommand('Out 4', 0x03), frame([0x3a, 0x05, 0x03]));
+    });
+
+    test('matrix crossing gain (0x41, found in the original editor)', () {
+      // output, input index, value like the channel gain (280 = 0 dB)
+      expect(p408.buildMatrixGainCommand('Out 2', 'In C', 0), frame([0x41, 0x05, 0x02, 0x18, 0x01]));
+      expect(p408.buildMatrixGainCommand('Out 8', 'In A', -60), frame([0x41, 0x0B, 0x00, 0x00, 0x00]));
+      expect(p206.buildMatrixGainCommand('Out 1', 'In B', -6.04), frame([0x41, 0x02, 0x01, 0xDC, 0x00]));
+      // limited to 0 dB
+      expect(p206.buildMatrixGainCommand('Out 1', 'In A', 6), p206.buildMatrixGainCommand('Out 1', 'In A', 0));
+      expect(() => p206.buildMatrixGainCommand('Out 1', 'In C', 0), throwsArgumentError);
+      expect(() => p206.buildMatrixGainCommand('In A', 'In B', 0), throwsArgumentError);
+      expect(PacketDescriber.describe(p408.buildMatrixGainCommand('Out 2', 'In C', -3)),
+          'SET MATRIX GAIN Out 2 ← In C → -3.0 dB');
     });
 
     test('dynamics and channel name', () {
@@ -198,11 +213,44 @@ void main() {
       expect((msg as DeviceInfoMessage).deviceName, 'DSP408 V0104P');
     });
 
-    test('meter levels per model', () {
-      // 1.0 as float16 = 0x3C00, little endian
-      List<int> meters(int n) => response(0x40, [for (var i = 0; i < n; i++) ...[0x00, 0x3C, 0x00], 0, 0]);
-      expect((p408.decode(meters(12)) as KeepaliveMessage).meterLevels, List.filled(12, 1.0));
-      expect((p206.decode(meters(8)) as KeepaliveMessage).meterLevels, List.filled(8, 1.0));
+    /// Meter slot for [value]: upper three bytes of the float32, sent as
+    /// [bits 16–23, bits 24–31, bits 8–15].
+    List<int> slot(double value) {
+      final bits = (ByteData(4)..setFloat32(0, value)).getUint32(0);
+      return [(bits >> 16) & 0xFF, bits >> 24, (bits >> 8) & 0xFF];
+    }
+
+    test('meter slots are truncated float32 values', () {
+      // 1.0 = 0x3F800000: the old float16 reading of these bytes was 1.875.
+      expect(slot(1.0), [0x80, 0x3F, 0x00]);
+      expect(ProtocolService.decodeMeterValue(0x80, 0x3F, 0x00), 1.0);
+      expect(ProtocolService.decodeMeterValue(0xFF, 0xFF, 0x00), 0.0, reason: 'NaN while recalculating');
+      final v = ProtocolService.decodeMeterValue(0x00, 0x38, 0x00); // the old "0.5 noise floor"
+      expect(ProtocolService.levelToDb(v), closeTo(-90.3, 0.1));
+      expect(ProtocolService.levelToDb(0), ProtocolService.silenceDb);
+      expect(ProtocolService.levelToDb(0.5), closeTo(-6.02, 0.01));
+    });
+
+    test('meter levels per model and the dynamics word', () {
+      List<int> meters(int n, int dynamics) =>
+          response(0x40, [for (var i = 0; i < n; i++) ...slot(1.0), dynamics & 0xFF, dynamics >> 8]);
+      final m408 = p408.decode(meters(12, 0x0201)) as KeepaliveMessage;
+      expect(m408.meterLevels, List.filled(12, 1.0));
+      expect(m408.dynamics, 0x0201);
+      expect(ProtocolService.compressorActive(m408.dynamics, 0), isTrue);
+      expect(ProtocolService.limiterActive(m408.dynamics, 0), isFalse);
+      expect(ProtocolService.limiterActive(m408.dynamics, 1), isTrue);
+      expect((p206.decode(meters(8, 0)) as KeepaliveMessage).meterLevels, List.filled(8, 1.0));
+      // A frame without the status word
+      final short = response(0x40, [for (var i = 0; i < 12; i++) ...slot(0.5)]);
+      expect((p408.decode(short) as KeepaliveMessage).dynamics, 0);
+    });
+
+    test('DSP 206 meters in the 12-slot layout: outputs start at slot 4', () {
+      final frame = response(0x40, [for (var i = 0; i < 12; i++) ...slot(i + 1.0), 0, 0]);
+      final levels = (p206.decode(frame) as KeepaliveMessage).meterLevels;
+      expect(levels, [1, 2, 5, 6, 7, 8, 9, 10]);
+      expect((p408.decode(frame) as KeepaliveMessage).meterLevels, [for (var i = 1; i <= 12; i++) i]);
     });
 
     test('config chunk whose payload contains 10 03', () {

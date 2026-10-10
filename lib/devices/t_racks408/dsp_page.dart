@@ -72,9 +72,13 @@ class _DspPageState extends State<DspPage> {
 
   @override
   Widget build(BuildContext context) {
+    // The content is built here, outside the connection builder: status and
+    // progress updates must not rebuild (and re-blur) the whole page.
+    final content = RepaintBoundary(child: _content());
     return ListenableBuilder(
       listenable: _connection,
-      builder: (context, _) {
+      child: content,
+      builder: (context, content) {
         final connection = _connection;
         final offline = connection.offline;
         final locked = !offline && !connection.isConnected;
@@ -105,10 +109,10 @@ class _DspPageState extends State<DspPage> {
                     child: ImageFiltered(
                       enabled: locked,
                       imageFilter: ui.ImageFilter.blur(sigmaX: 7, sigmaY: 7),
-                      child: _content(),
+                      child: content,
                     ),
                   ),
-                  if (locked) _ConnectOverlay(connection: connection),
+                  if (locked) RepaintBoundary(child: _ConnectOverlay(connection: connection)),
                 ],
               ),
             ),
@@ -123,14 +127,24 @@ class _DspPageState extends State<DspPage> {
     final device = _device;
     return switch (_section) {
       DspSection.home => HomePage(device: device, onOpenEq: _openEq),
-      DspSection.eq => EqPage(key: ValueKey('eq-$_eqChannel'), device: device, channel: _eqChannel),
-      DspSection.geq => GeqTab(key: ValueKey('geq-$_eqChannel'), deviceProvider: device, initialChannel: _eqChannel),
+      DspSection.eq => EqPage(
+          key: ValueKey('eq-$_eqChannel'),
+          device: device,
+          channel: _eqChannel,
+          dspGenerator: !_connection.offline,
+        ),
+      DspSection.geq => GeqTab(
+          key: ValueKey('geq-$_eqChannel'),
+          deviceProvider: device,
+          initialChannel: _eqChannel,
+          dspGenerator: !_connection.offline,
+        ),
       DspSection.gate => GatePage(device: device),
       DspSection.compressor => CompressorPage(device: device),
       DspSection.limiter => LimiterPage(device: device),
       DspSection.matrix => MatrixPage(device: device),
       DspSection.delay => DelayPage(device: device),
-      DspSection.rta => const RtaTab(),
+      DspSection.rta => RtaTab(device: _connection.offline ? null : device),
     };
   }
 }
@@ -482,12 +496,16 @@ class _ConnectOverlay extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (working)
+            // No endless spinner: an animation would re-render the blurred page
+            // behind this box on every frame, which makes the panel sluggish.
+            if (info.status == DspStatus.connecting)
+              const Icon(Icons.settings_ethernet, size: 40, color: AppColors.warning)
+            else if (working)
               SizedBox(
                 width: 44,
                 height: 44,
                 child: CircularProgressIndicator(
-                  value: info.status == DspStatus.connecting ? null : info.progress,
+                  value: info.progress,
                   color: AppColors.accent,
                   backgroundColor: AppColors.border,
                   strokeWidth: 4,

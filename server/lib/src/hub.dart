@@ -365,7 +365,8 @@ class Hub {
         _toSubscribers(session.id, {
           't': Msg.meters,
           'dsp': session.id,
-          'v': [for (final v in session.meters) double.parse(v.toStringAsFixed(4))],
+          'v': [for (final v in session.meters) (ProtocolService.levelToDb(v) * 10).round() / 10],
+          'dyn': session.dynamics,
           'tx': session.packetsSent,
           'rx': session.packetsReceived,
         });

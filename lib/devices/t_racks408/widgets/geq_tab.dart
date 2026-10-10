@@ -1,6 +1,7 @@
 // Graphic EQ (GEQ, inputs): curve on top, below it one fader per band,
 // each exactly under its point of the curve (like the original editor).
 
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -12,6 +13,7 @@ import '../../../services/rta_settings_provider.dart';
 import '../../../theme/app_colors.dart';
 import '../providers/device_provider.dart';
 import 'console_fader.dart';
+import 'auto_eq_panel.dart';
 import 'ui_common.dart';
 import 'value_field.dart';
 
@@ -44,7 +46,10 @@ class GeqTab extends StatefulWidget {
   /// Input shown first (e.g. when opened from the EQ overview).
   final String? initialChannel;
 
-  const GeqTab({super.key, required this.deviceProvider, this.initialChannel});
+  /// Offer the DSP's own generator in the Auto-EQ (not in the offline editor).
+  final bool dspGenerator;
+
+  const GeqTab({super.key, required this.deviceProvider, this.initialChannel, this.dspGenerator = true});
 
   @override
   State<GeqTab> createState() => _GeqTabState();
@@ -62,12 +67,32 @@ class _GeqTabState extends State<GeqTab> {
   RtaService? _rtaService;
   bool _disposed = false;
 
+  // ─── Auto-EQ ───
+  bool _autoEqOpen = false;
+  List<double>? _proposal;
+
+  Future<void> _openAutoEq() async {
+    if (_autoEqOpen) {
+      _closeAutoEq();
+      return;
+    }
+    if (!_rtaEnabled) await _toggleRta();
+    if (!mounted || !_rtaEnabled) return;
+    setState(() => _autoEqOpen = true);
+  }
+
+  void _closeAutoEq() => setState(() {
+        _autoEqOpen = false;
+        _proposal = null;
+      });
+
   /// Below this width the curve and the faders scroll sideways together.
   static const _minWidth = 1180.0;
   static const _faderBankHeight = 250.0;
 
-  void _toggleRta() async {
+  Future<void> _toggleRta() async {
     if (_rtaEnabled) {
+      if (_autoEqOpen) _closeAutoEq();
       _rtaService?.release();
       _rtaService = null;
       setState(() => _rtaEnabled = false);
@@ -128,14 +153,35 @@ class _GeqTabState extends State<GeqTab> {
                   device: deviceProvider,
                   selected: _channel,
                   showOutputs: false,
-                  onSelected: (c) => setState(() => _channel = c),
+                  onSelected: (c) => setState(() {
+                    // A proposal belongs to one input.
+                    if (c != _channel) _proposal = null;
+                    _channel = c;
+                  }),
                 ),
               ),
               _ActionButton(label: 'Flat', active: false, onPressed: () => deviceProvider.resetGeqBands(_channel)),
               const SizedBox(width: 8),
               _ActionButton(label: 'RTA', active: _rtaEnabled, onPressed: _toggleRta),
+              const SizedBox(width: 8),
+              _ActionButton(label: 'Auto-EQ', active: _autoEqOpen, onPressed: _openAutoEq),
               const SizedBox(width: 12),
             ]),
+            if (_autoEqOpen && _rtaService != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: AutoEqPanel(
+                  // A new panel per input (restores mutes of the previous one).
+                  key: ValueKey('autoeq-$_channel'),
+                  device: deviceProvider,
+                  channel: _channel,
+                  target: AutoEqTarget.geq,
+                  rta: _rtaService,
+                  dspGenerator: widget.dspGenerator,
+                  onGeqProposal: (p) => setState(() => _proposal = p),
+                  onClose: _closeAutoEq,
+                ),
+              ),
             Expanded(
               child: LayoutBuilder(builder: (context, constraints) {
                 final width = math.max(constraints.maxWidth - 24, _minWidth);
@@ -150,6 +196,7 @@ class _GeqTabState extends State<GeqTab> {
                           activeBandIndex: _activeBandIndex,
                           rtaMagnitudes: _rtaEnabled ? _rtaService?.magnitudes : null,
                           rtaPeaks: _rtaEnabled ? _rtaService?.peaks : null,
+                          proposal: _autoEqOpen ? _proposal : null,
                           width: width,
                           height: inner.maxHeight,
                           narrow: false,
@@ -304,6 +351,7 @@ class _GeqGraph extends StatelessWidget {
   final int? activeBandIndex;
   final List<double>? rtaMagnitudes;
   final List<double>? rtaPeaks;
+  final List<double>? proposal;
   final double width;
   final double height;
   final bool narrow;
@@ -317,6 +365,7 @@ class _GeqGraph extends StatelessWidget {
     required this.activeBandIndex,
     this.rtaMagnitudes,
     this.rtaPeaks,
+    this.proposal,
     required this.width,
     required this.height,
     required this.narrow,
@@ -370,7 +419,7 @@ class _GeqGraph extends StatelessWidget {
     return Listener(
       onPointerSignal: (event) {
         if (event is PointerScrollEvent) {
-          final index = _bandIndexFromX(event.position.dx);
+          final index = _bandIndexFromX(event.localPosition.dx);
           final current = bands[index.clamp(0, 30)];
           final delta = -event.scrollDelta.dy / 50;
           onBandChanged(index, (current + delta).clamp(-12.0, 12.0));
@@ -396,6 +445,7 @@ class _GeqGraph extends StatelessWidget {
             activeBandIndex: activeBandIndex,
             rtaMagnitudes: rtaMagnitudes,
             rtaPeaks: rtaPeaks,
+            proposal: proposal,
             padLeft: _padLeft,
             padRight: _padRight,
             padTop: _padTop,
@@ -415,6 +465,7 @@ class _GeqPainter extends CustomPainter {
   final int? activeBandIndex;
   final List<double>? rtaMagnitudes;
   final List<double>? rtaPeaks;
+  final List<double>? proposal;
   final double padLeft;
   final double padRight;
   final double padTop;
@@ -427,6 +478,7 @@ class _GeqPainter extends CustomPainter {
     this.activeBandIndex,
     this.rtaMagnitudes,
     this.rtaPeaks,
+    this.proposal,
     required this.padLeft,
     required this.padRight,
     required this.padTop,
@@ -585,6 +637,26 @@ class _GeqPainter extends CustomPainter {
         ..strokeWidth = narrow ? 3 : 2.5
         ..strokeJoin = StrokeJoin.round,
     );
+
+    // Auto-EQ proposal
+    final proposed = proposal;
+    if (proposed != null && proposed.length == 31) {
+      final proposalPoints = [
+        for (int i = 0; i < 31; i++)
+          Offset(_freqToX(_bandFrequencies[i], graphW), padTop + graphH * (1.0 - (proposed[i] + 12) / 24)),
+      ];
+      canvas.drawPath(
+        _monotoneCurve(proposalPoints),
+        Paint()
+          ..color = const Color(0xFFFBBF24)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..strokeJoin = StrokeJoin.round,
+      );
+      for (final p in proposalPoints) {
+        canvas.drawCircle(p, 2.5, Paint()..color = const Color(0xFFFBBF24));
+      }
+    }
 
     for (int i = 0; i < 31; i++) {
       final dB = bands[i];

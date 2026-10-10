@@ -41,7 +41,7 @@ void main(List<String> args) {
   final stream = [for (var i = 0; chunks.containsKey(i); i++) ...chunks[i]!];
   final dump = ConfigDump(model);
   stdout.writeln('\nConfig dump: ${chunks.length} chunks, ${stream.length} bytes '
-      '(${model.name} layout expects ${dump.requiredLength}+${ConfigDump.paddingLength})');
+      '(${model.name} layout expects ${dump.totalLength})');
   final result = dump.decode(stream);
   final s = result.state;
   const p = ProtocolService();
@@ -50,10 +50,13 @@ void main(List<String> args) {
   for (final ch in model.channels) {
     final hp = s.hiPass[ch]!, lp = s.loPass[ch]!;
     stdout.writeln('${ch.padRight(6)} name="${s.channelNames[ch]}" gain=${s.gains[ch]} dB '
+        '${s.mutes[ch]! ? 'MUTE ' : ''}${s.phase[ch]! ? 'PHASE ' : ''}'
+        'delay=${ProtocolService.delayRawToMs(s.delays[ch]!).toStringAsFixed(2)} ms '
         'HPF ${hz(hp.freqRaw)} Hz ${ProtocolService.crossoverSlopeNames[hp.slope]} '
         'LPF ${hz(lp.freqRaw)} Hz ${ProtocolService.crossoverSlopeNames[lp.slope]} '
         '${model.isOutput(ch) ? 'routing=0x${s.matrixRouting[ch]!.toRadixString(16)}' : ''}');
   }
+  if (!result.switchesRead) stdout.writeln('\nDump ends before the mute/PEQ bypass bits.');
   if (result.isPlausible) {
     stdout.writeln('\nAll values plausible.');
   } else {
@@ -64,7 +67,7 @@ void main(List<String> args) {
   }
 
   // Raw words around the record tails, to locate unknown fields.
-  stdout.writeln('\nRecord tails [gain ?a ?b link]:');
+  stdout.writeln('\nRecord tails [gain phase delay link]:');
   for (var i = 0; i < model.inputs.length; i++) {
     _tail(stream, dump.inputOffset(i) + 132, model.inputs[i]);
   }

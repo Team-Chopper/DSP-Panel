@@ -9,7 +9,13 @@ import '../providers/device_provider.dart';
 /// Bottom sheet with everything that can be done with one channel.
 Future<void> showChannelMenu(BuildContext context, DeviceProvider device, String channel) {
   final color = AppColors.forChannel(device.inputs.contains(channel));
-  final linked = device.linkedWith(channel);
+  final master = device.linkMaster(channel);
+  final slaves = device.linkSlaves(channel);
+  final linkText = master != null
+      ? 'linked to ${device.getAlias(master)}'
+      : slaves.isNotEmpty
+          ? 'master of ${slaves.map(device.getAlias).join(', ')}'
+          : 'not linked';
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: AppColors.surface,
@@ -24,7 +30,7 @@ Future<void> showChannelMenu(BuildContext context, DeviceProvider device, String
             title: Text(device.getAlias(channel)),
             subtitle: Text([
               if (device.getAlias(channel) != channel) channel,
-              linked.isEmpty ? 'not linked' : 'linked with ${linked.join(', ')}',
+              linkText,
             ].join(' · ')),
           ),
           const Divider(height: 1),
@@ -146,55 +152,122 @@ Future<void> showCopyDialog(BuildContext context, DeviceProvider device, String 
   );
 }
 
+/// Link dialog, master/slave like the original editor: [channel] becomes
+/// the master of the selected channels. A slave cannot be linked further;
+/// its dialog only offers to leave its master.
 Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String channel) {
-  final group = device.model.groupOf(channel);
-  final selection = {channel, ...device.linkedWith(channel)};
-  return showDialog<void>(
-    context: context,
-    builder: (dialog) => StatefulBuilder(
-      builder: (dialog, setState) => AlertDialog(
+  final master = device.linkMaster(channel);
+  if (master != null) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialog) => AlertDialog(
         title: Text('Link ${device.getAlias(channel)}'),
         content: SizedBox(
-          width: 320,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Linked channels change together. The link is stored on the DSP.',
-                  style: TextStyle(fontSize: 12, color: AppColors.muted)),
-              const SizedBox(height: 8),
-              for (final ch in group)
-                CheckboxListTile(
-                  dense: true,
-                  value: selection.contains(ch),
-                  title: Text(device.getAlias(ch)),
-                  enabled: ch != channel,
-                  onChanged: (v) => setState(() => v == true ? selection.add(ch) : selection.remove(ch)),
-                ),
-            ],
+          width: 340,
+          child: Text(
+            '${device.getAlias(channel)} is linked to ${device.getAlias(master)} (master) and follows every change '
+            'of the group. A linked channel cannot be linked to other channels – to add more channels, link them '
+            'to ${device.getAlias(master)}.',
+            style: const TextStyle(fontSize: 13),
           ),
         ),
         actions: [
-          if (selection.length > 1 || device.linkedWith(channel).isNotEmpty)
-            TextButton(
-              onPressed: () {
-                device.setLinkGroup([channel]);
-                Navigator.of(dialog).pop();
-              },
-              child: const Text('Unlink'),
-            ),
-          TextButton(onPressed: () => Navigator.of(dialog).pop(), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.of(dialog).pop(), child: const Text('Close')),
+          TextButton(
+            onPressed: () {
+              Navigator.of(dialog).pop();
+              showLinkDialog(context, device, master);
+            },
+            child: Text('Edit ${device.getAlias(master)} …'),
+          ),
           FilledButton(
             onPressed: () {
-              device.setLinkGroup([for (final ch in group) if (selection.contains(ch)) ch]);
+              device.unlink(channel);
               Navigator.of(dialog).pop();
             },
-            child: const Text('Apply'),
+            child: const Text('Unlink'),
           ),
         ],
       ),
+    );
+  }
+
+  final group = device.model.groupOf(channel);
+  final current = device.linkSlaves(channel);
+  final candidates = device.linkCandidates(channel);
+  final selection = {...current};
+  var copySettings = true;
+  return showDialog<void>(
+    context: context,
+    builder: (dialog) => StatefulBuilder(
+      builder: (dialog, setState) {
+        final added = selection.difference(current.toSet());
+        return AlertDialog(
+          title: Text('Link ${device.getAlias(channel)} with …'),
+          content: SizedBox(
+            width: 340,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${device.getAlias(channel)} becomes the master, the selected channels follow it. Changes on any '
+                  'linked channel apply to all of them. The link is stored on the DSP.',
+                  style: const TextStyle(fontSize: 12, color: AppColors.muted),
+                ),
+                const SizedBox(height: 8),
+                for (final ch in group)
+                  if (ch != channel)
+                    CheckboxListTile(
+                      dense: true,
+                      value: selection.contains(ch),
+                      title: Text(device.getAlias(ch)),
+                      subtitle: candidates.contains(ch) ? null : Text(_linkReason(device, ch)),
+                      enabled: candidates.contains(ch),
+                      onChanged: (v) => setState(() => v == true ? selection.add(ch) : selection.remove(ch)),
+                    ),
+                const Divider(),
+                CheckboxListTile(
+                  dense: true,
+                  value: copySettings,
+                  enabled: added.isNotEmpty,
+                  title: Text('Copy the settings of ${device.getAlias(channel)} to newly linked channels'),
+                  subtitle: const Text('Gain, phase, delay, EQ, filters, dynamics – not names, mute or routing'),
+                  onChanged: (v) => setState(() => copySettings = v ?? true),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            if (current.isNotEmpty)
+              TextButton(
+                onPressed: () {
+                  device.unlink(channel);
+                  Navigator.of(dialog).pop();
+                },
+                child: const Text('Unlink all'),
+              ),
+            TextButton(onPressed: () => Navigator.of(dialog).pop(), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                device.setLinkSlaves(channel, [for (final ch in group) if (selection.contains(ch)) ch],
+                    copySettings: copySettings);
+                Navigator.of(dialog).pop();
+              },
+              child: const Text('Apply'),
+            ),
+          ],
+        );
+      },
     ),
   );
+}
+
+/// Why [ch] cannot be linked as a slave right now.
+String _linkReason(DeviceProvider device, String ch) {
+  final master = device.linkMaster(ch);
+  if (master != null) return 'linked to ${device.getAlias(master)}';
+  return 'master of ${device.linkSlaves(ch).map(device.getAlias).join(', ')}';
 }
 
 Future<void> showGainDialog(BuildContext context, DeviceProvider device, String channel) {

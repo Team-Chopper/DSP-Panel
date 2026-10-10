@@ -24,11 +24,11 @@ void main() {
   late FakeDsp fake;
   late DspSession session;
 
-  DspSession createSession({int refreshMs = 300, String model = 'auto', RememberedValues? remembered}) =>
+  DspSession createSession({int refreshMs = 300, String model = 'auto'}) =>
       DspSession(
         DspConfig(
             id: 'test', name: 'Test', host: '127.0.0.1', port: fake.port, refreshMs: refreshMs,
-            model: model, remembered: remembered),
+            model: model),
         requestTimeout: const Duration(milliseconds: 200),
         sequenceGap: Duration.zero,
         reconnectDelays: const [Duration(milliseconds: 100)],
@@ -74,11 +74,18 @@ void main() {
     expect(fake.received.take(initSequence408.length).toList(), initSequence408);
   });
 
-  test('polls meters when idle', () async {
+  test('polls meters when idle, with the limiter status of the outputs', () async {
     session = createSession(refreshMs: 20);
     session.start();
     await waitFor(() => session.status == DspStatus.ready);
     await waitFor(() => session.meters.any((v) => v > 0));
+    expect(session.meters.every((v) => v < 1.0), isTrue, reason: 'fake levels stay below full scale');
+    expect(session.dynamics, 0);
+
+    // A limiter at -90 dB works all the time.
+    expect(session.applyOp(DeviceOps.limiter('Out 2', LimiterState(threshold: 0))), isNull);
+    await waitFor(() => ProtocolService.limiterActive(session.dynamics, 1));
+    expect(ProtocolService.limiterActive(session.dynamics, 0), isFalse);
   });
 
   test('coalesces rapid value changes per key', () async {
@@ -205,8 +212,10 @@ void main() {
         DeviceOps.phase('Out 1', true),
         DeviceOps.delay('Out 2', 960),
         DeviceOps.matrixRoute('Out 3', 3),
+        DeviceOps.matrixGain('Out 3', 'In B', -9.5),
         DeviceOps.geqBand('In A', 10, -3.5),
         DeviceOps.peqBand('Out 4', 8, PeqBand(freqRaw: 250, qRaw: 30, gainDb: 4.5, type: 2)),
+        DeviceOps.peqBand('In B', 3, PeqBand(bypass: true)),
         DeviceOps.hiPass('Out 1', FilterState(freqRaw: 11, slope: 8)),
         DeviceOps.loPass('Out 1', FilterState(freqRaw: 61, slope: 8)),
         DeviceOps.gate('In A', GateState(attack: 4, release: 199, hold: 49, threshold: 40)),
@@ -223,7 +232,9 @@ void main() {
       expect(fake.state.gains['Out 6'], -12.0);
       expect(fake.state.phase['Out 1'], isTrue);
       expect(fake.state.delays['Out 2'], 960);
+      expect(fake.state.matrixGains['Out 3:In B'], -9.5);
       expect(fake.state.compressors['Out 5']!.ratio, 9);
+      expect(fake.receivedSetCommands, contains('SET MATRIX GAIN Out 3 ← In B → -9.5 dB'));
 
       // Reconnect: everything in the dump comes back from the device.
       fake.dropConnections();
@@ -232,6 +243,7 @@ void main() {
       final s = session.state;
       expect(s.gains['Out 6'], -12.0);
       expect(s.matrixRouting['Out 3'], 3);
+      expect(s.matrixGains['Out 3:In B'], -9.5);
       expect(s.geqBands['In A']![10], -3.5);
       expect(s.peqBands['Out 4']![8].gainDb, 4.5);
       expect(s.hiPass['Out 1']!.toJson(), {'freqRaw': 11, 'slope': 8});
@@ -239,18 +251,18 @@ void main() {
       expect(s.compressors['Out 5']!.toJson(), CompressorState(ratio: 9, attack: 9, release: 99, knee: 2, threshold: 170).toJson());
       expect(s.limiters['Out 6']!.threshold, 200);
       expect(s.channelNames['Out 1'], 'Sub L');
-      // Not in the dump: shown from the values the server remembers.
       expect(s.mutes['In B'], isTrue);
+      expect(s.mutes['In A'], isFalse);
       expect(s.phase['Out 1'], isTrue);
       expect(s.delays['Out 2'], 960);
-      expect(session.config.remembered.mutes['In B'], isTrue);
+      expect([for (final b in s.peqBands['In B']!) b.bypass], [false, false, false, true, false, false, false, false]);
     });
 
     test('linked channels get every change', () async {
       session = createSession(refreshMs: 300);
       session.start();
       await waitFor(() => session.status == DspStatus.ready);
-      for (final op in DeviceOps.linkGroup(session.state, ['Out 1', 'Out 2'])) {
+      for (final op in DeviceOps.linkSlaves(session.state, 'Out 1', ['Out 2'], copySettings: false)) {
         expect(session.applyOp(op), isNull);
       }
       expect(session.applyOp(DeviceOps.gain('Out 1', -9)), isNull);
@@ -258,7 +270,7 @@ void main() {
       await waitFor(() => fake.state.hiPass['Out 1']!.slope == 8);
       expect(fake.state.gains['Out 2'], -9.0);
       expect(fake.state.links['Out 1'], 3);
-      expect(fake.receivedSetCommands, contains('SET LINK Out 2 → Out 1 + Out 2'));
+      expect(fake.receivedSetCommands, contains('SET LINK Out 1 → Out 1 + Out 2'));
       expect(session.state.gains['Out 2'], -9.0);
     });
 
@@ -288,7 +300,6 @@ void main() {
       expect(fake.state.channelNames['Out 1'], 'Sub');
       expect(fake.state.mutes['In A'], isTrue);
       expect(session.state.currentPreset, 'Club');
-      expect(session.config.remembered.mutes['In A'], isTrue);
     });
 
     test('a wrong configured model is reported, not shown', () async {
@@ -302,13 +313,17 @@ void main() {
     });
   });
 
-  test('remembered values are applied on connect', () async {
-    session = createSession(remembered: RememberedValues(mutes: {'Out 3': true}, delays: {'In A': 96}));
+  test('mute, phase and delay of a DSP 408 come from the device', () async {
+    fake.state.mutes['Out 3'] = true;
+    fake.state.phase['In C'] = true;
+    fake.state.delays['In A'] = 96;
+    session = createSession();
     session.start();
     await waitFor(() => session.status == DspStatus.ready);
     expect(session.state.mutes['Out 3'], isTrue);
-    expect(session.state.delays['In A'], 96);
     expect(session.state.mutes['Out 2'], isFalse);
+    expect(session.state.phase['In C'], isTrue);
+    expect(session.state.delays['In A'], 96);
   });
 
   test('stop disconnects and does not reconnect', () async {

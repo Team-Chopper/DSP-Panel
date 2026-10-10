@@ -31,8 +31,8 @@ Browser (Flutter web) ──────────────────▶ 
 **Devices** (detected automatically, or chosen per DSP):
 - t.racks DSP 408 (4 in / 8 out)
 - t.racks DSP 206 (2 in / 6 out) – protocol from the
-  [FlexiFlizz project](https://github.com/FlexiFlizz/t.racks-DSP-control); reading its configuration
-  is based on an assumed layout, see [TODO.md](TODO.md)
+  [FlexiFlizz project](https://github.com/FlexiFlizz/t.racks-DSP-control); the configuration layout
+  comes from the original 206 editor, see [PROTOCOL-RE.md](PROTOCOL-RE.md)
 - t.racks DSP 204 (probably doesn't work yet--will work on this later)
 
 The native apps (Windows, Android, …) in this repository are not adapted to the panel server.
@@ -44,28 +44,39 @@ Delay · RTA). All faders look like console faders (dB scale, ridged cap) and ev
 directly.
 
 - **Gain:** EQ overview of all channels above the faders (each EQ block exactly as wide as its fader block;
-  every curve can be hidden with a checkbox, remembered per browser), faders with dB scale and meter, mute
-  and phase – inputs left, outputs right
+  every curve can be hidden with a checkbox, remembered per browser), faders with dB scale, mute and phase –
+  inputs left, outputs right. Segmented level meters in dBFS (dim until the signal lights them up) with peak
+  hold, clip indicator and the limiter status reported by the DSP, updated every 40 ms
 - **EQ:** channel selection In A … Out 8, PEQ graph over the full width (drag the points, scroll for Q),
   table of all bands (8 per input, 9 per output) with Freq/Q/Gain faders for the selected band, HPF and LPF
-  (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct) with bypass, and the channel gain
-- **GEQ** (31 bands, inputs): curve with one fader per band right below its point, RTA overlay
-- **Gate** (inputs), **Compressor** and **Limiter** (outputs): transfer curve and horizontal faders
-- **Matrix** over the whole page (inputs on top, outputs on the side); crossing gains are shown read-only
+  (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct) with bypass, and the channel gain. The curves are the
+  real filter responses (biquad PEQ types, Butterworth/Bessel/Linkwitz-Riley crossovers); bypassed bands
+  show a dashed preview
+- **GEQ** (31 bands, inputs): curve with one fader per band right below its point, RTA overlay and
+  **Auto-EQ** (measure pink noise with a microphone, review the proposed correction, apply it). The EQ page has
+  an Auto-EQ for every channel (e.g. per output for subs and tops) that uses the free PEQ bands; the other
+  channels are muted while measuring, linked channels are measured together or alone
+- **Gate** (inputs), **Compressor** and **Limiter** (outputs): transfer curve over the whole page,
+  horizontal faders and a live indicator while the DSP reduces the gain
+- **Matrix:** routing diagram (inputs → outputs) next to the crossing grid; the gain of every crossing
+  (−60 … 0 dB) is typed into its cell
 - **Delay:** drag a speaker per channel (inputs left, outputs right), fine-tune with faders, ms or metres,
   zoomable range
+- **RTA:** browser microphone, 1/24 octave, 16k FFT at 48 kHz, averaging Off/Fast/Slow/Long, peak hold;
+  signal generator in the browser (sine, pink/white noise) and the DSP's own generator
+- Every fader can be moved with the arrow keys after clicking it (Shift: 10 steps, Page Up/Down: 10 %)
 - Channel menu (tap a channel name): rename (stored on the DSP, max. 8 characters), copy settings to other
-  channels, link channels (stored on the DSP; linked channels change together – except the matrix routing,
-  so left/right pairs keep their inputs)
-- Level meters, RTA (browser microphone)
+  channels, link channels like the original editor: a master with one or more slaves (stored on the DSP).
+  A change on any linked channel applies to the whole group – except the matrix routing, so left/right pairs
+  keep their inputs. Linked channels are highlighted together on every page
 - **Presets:** the 20 presets stored on the DSP (load/store), plus a preset library on the server: save the
   current settings, edit a preset offline (without a DSP) in its own tab and load it onto any DSP of the
   same model
 - Connection status per DSP, disconnect/connect without logging out of the panel
 
-When connecting, the panel reads the complete configuration from the DSP before it shows it. Mute, phase,
-delay and PEQ bypass cannot be read back yet; the panel shows the last values set through it. Open protocol
-questions are collected in [TODO.md](TODO.md).
+When connecting, the panel reads the complete configuration from the DSP before it shows it, including
+mute, phase, delay, PEQ bypass and the matrix crossing gains. Open protocol questions are collected in
+[TODO.md](TODO.md).
 
 ## Installing the panel on an Ubuntu server
 
@@ -81,7 +92,7 @@ questions are collected in [TODO.md](TODO.md).
    password and starts the `dsp-panel` service. Re-running it updates the program and keeps configuration,
    DSP list and password.
 3. Open `https://<server-ip>:8443` in a browser. The browser warns once about the self-signed certificate –
-   accept it. Log in and add your DSPs with **+** (IP address and port 9761).
+   accept it. Log in and add your DSPs with the **+** next to the DSP tabs (IP address and port 9761).
 
 If `ufw` is active: `sudo ufw allow 8443/tcp`. The server needs to reach the DSPs on TCP port 9761.
 

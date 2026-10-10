@@ -106,6 +106,8 @@ class CompressorPage extends StatelessWidget {
             thresholdDb: thresholdDb,
             side: [
               _StateBadge(active: c.ratio != 0 && thresholdDb < 20, color: color),
+              const SizedBox(height: 10),
+              _ActivityLed(device: device, channel: ch, limiter: false),
               const SizedBox(height: 12),
               const Text('Ratio', style: TextStyle(fontSize: 11, color: AppColors.muted)),
               const SizedBox(height: 4),
@@ -185,6 +187,8 @@ class LimiterPage extends StatelessWidget {
             thresholdDb: thresholdDb,
             side: [
               _StateBadge(active: thresholdDb < 20, color: color),
+              const SizedBox(height: 10),
+              _ActivityLed(device: device, channel: ch, limiter: true),
               const SizedBox(height: 12),
               const _Hint('+20 dB means the limiter never engages.'),
             ],
@@ -342,15 +346,14 @@ class _DynamicsContent extends StatelessWidget {
           child: PanelCard(
             title: title,
             accent: color,
-            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Spacer(),
-              AspectRatio(aspectRatio: 1, child: TransferCurve(color: color, response: curve, thresholdDb: thresholdDb)),
-              const SizedBox(width: 24),
+            // The curve uses the whole width of the page.
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Expanded(child: TransferCurve(color: color, response: curve, thresholdDb: thresholdDb)),
+              const SizedBox(width: 20),
               SizedBox(
                 width: 220,
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: side),
               ),
-              const Spacer(),
             ]),
           ),
         ),
@@ -397,6 +400,48 @@ class _StateBadge extends StatelessWidget {
           border: Border.all(color: active ? color : AppColors.border),
         ),
         child: Text(active ? 'Active' : 'Off', style: TextStyle(fontSize: 12, color: active ? color : AppColors.muted)),
+      );
+}
+
+/// Lights while the DSP reports the compressor or limiter of [channel]
+/// reducing the gain (status word of the meter answer). Only this widget
+/// listens to the meters.
+class _ActivityLed extends StatelessWidget {
+  final DeviceProvider device;
+  final String channel;
+  final bool limiter;
+
+  const _ActivityLed({required this.device, required this.channel, required this.limiter});
+
+  @override
+  Widget build(BuildContext context) => RepaintBoundary(
+        child: ListenableBuilder(
+          listenable: device.meters,
+          builder: (context, _) {
+            final on = limiter ? device.isLimiting(channel) : device.isCompressing(channel);
+            const c = AppColors.warning;
+            return Row(children: [
+              Container(
+                width: 14,
+                height: 14,
+                padding: const EdgeInsets.all(2),
+                decoration: BoxDecoration(shape: BoxShape.circle, color: on ? c.withAlpha(70) : Colors.transparent),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: on ? c : AppColors.surfaceHigh,
+                    border: Border.all(color: on ? c : AppColors.border),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(on ? 'Reducing gain' : 'Not reducing gain',
+                    overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, color: on ? c : AppColors.muted)),
+              ),
+            ]);
+          },
+        ),
       );
 }
 
@@ -452,13 +497,17 @@ class _TransferPainter extends CustomPainter {
       ..color = AppColors.border
       ..strokeWidth = 1;
     final label = TextPainter(textDirection: TextDirection.ltr);
-    for (var db = -80.0; db <= 20; db += 20) {
-      canvas.drawLine(Offset(x(db), 0), Offset(x(db), size.height), grid);
-      canvas.drawLine(Offset(0, y(db)), Offset(size.width, y(db)), grid);
+    for (var db = -80.0; db <= 20; db += 10) {
+      final major = db % 20 == 0;
+      final line = major ? grid : (Paint()..color = AppColors.border.withAlpha(90));
+      canvas.drawLine(Offset(x(db), 0), Offset(x(db), size.height), line);
+      canvas.drawLine(Offset(0, y(db)), Offset(size.width, y(db)), line);
+      if (!major) continue;
       label
-        ..text = TextSpan(text: '${db.round()}', style: monoValue.copyWith(fontSize: 8, color: AppColors.muted))
+        ..text = TextSpan(text: '${db.round()}', style: monoValue.copyWith(fontSize: 9, color: AppColors.muted))
         ..layout();
       label.paint(canvas, Offset(x(db) + 2, size.height - label.height - 1));
+      label.paint(canvas, Offset(2, y(db) - label.height - 1));
     }
     // Unity line (no processing)
     canvas.drawLine(Offset(x(_min), y(_min)), Offset(x(_max), y(_max)),
@@ -487,6 +536,20 @@ class _TransferPainter extends CustomPainter {
         ..strokeWidth = 2.5
         ..strokeJoin = StrokeJoin.round,
     );
+
+    // Ball on the threshold line where it meets the curve; it follows the
+    // threshold.
+    final t = thresholdDb.clamp(_min, _max);
+    final knob = Offset(x(t), y(response(t)));
+    canvas.drawCircle(knob, 9, Paint()..color = color.withAlpha(60));
+    canvas.drawCircle(knob, 6, Paint()..color = color);
+    canvas.drawCircle(
+        knob,
+        6,
+        Paint()
+          ..color = AppColors.backgroundDeep
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5);
 
     label
       ..text = const TextSpan(text: 'in → out', style: TextStyle(fontFamily: 'Inter', fontSize: 9, color: AppColors.muted))

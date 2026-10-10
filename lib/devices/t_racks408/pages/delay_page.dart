@@ -218,6 +218,10 @@ class _StageState extends State<_Stage> {
   /// otherwise change under the pointer).
   double? _dragRange;
 
+  /// Delay at the start of the current drag and the distance dragged since.
+  double _dragStartMs = 0;
+  double _dragDx = 0;
+
   static const _labelWidth = 76.0;
   static const _speakerSize = 26.0;
 
@@ -286,10 +290,11 @@ class _StageState extends State<_Stage> {
         bottom: 0,
         child: Center(child: Container(height: 1, color: AppColors.border)),
       ),
-      if (ms > 0)
-        Positioned(
+      // Always present (zero width at 0 ms): inserting it would rebuild the
+      // speaker below and cancel a running drag.
+      Positioned(
           left: _labelWidth + _speakerSize / 2,
-          width: x - _labelWidth,
+          width: math.max(0.0, x - _labelWidth),
           top: 0,
           bottom: 0,
           child: Center(child: Container(height: 2, color: widget.color.withAlpha(120))),
@@ -301,10 +306,16 @@ class _StageState extends State<_Stage> {
         bottom: 0,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onHorizontalDragStart: (_) => setState(() => _dragRange = widget.rangeMs),
+          onHorizontalDragStart: (_) => setState(() {
+            _dragRange = widget.rangeMs;
+            _dragStartMs = device.getDelayMs(ch);
+            _dragDx = 0;
+          }),
           onHorizontalDragUpdate: (d) {
-            final current = device.getDelayMs(ch);
-            final next = (current + d.delta.dx / laneWidth * _range).clamp(0.0, math.min(_range, _maxMs)).toDouble();
+            // Relative to the start of the drag, so small steps are not lost
+            // to the 1/96 ms resolution.
+            _dragDx += d.delta.dx;
+            final next = (_dragStartMs + _dragDx / laneWidth * _range).clamp(0.0, math.min(_range, _maxMs)).toDouble();
             device.setDelayMs(ch, next);
           },
           onHorizontalDragEnd: (_) => setState(() => _dragRange = null),

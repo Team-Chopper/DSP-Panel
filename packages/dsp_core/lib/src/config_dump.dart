@@ -4,23 +4,25 @@
 // sub-index 0, 1, …); each 0x24 response carries a 50-byte chunk. Together
 // the chunks form one stream: a header followed by one record per channel.
 //
-// Layout, decoded from DSP 408 dumps (see TODO.md for what is still open).
-// All values are u16 little-endian unless marked u8.
+// Layout, decoded from DSP 408 dumps and confirmed for both models by the
+// original editor (PROTOCOL-RE.md). All values are u16 little-endian unless
+// marked u8.
 //
 //   Header (16):   flags(2) preset name(14 ASCII)
 //   Input (140):   name(8) | gate: attack release hold threshold
 //                  | GEQ 31 × value | PEQ 8 × [gain freq Q:u8 type:u8]
 //                  | filter: hpfFreq lpfFreq hpfSlope:u8 lpfSlope:u8
-//                  | tail: gain ?a ?b link
+//                  | tail: gain phase delay link
 //   Output:        name(8) | routing mask | crossing gain × inputs
 //                  | filter (6) | PEQ 9 × 6 | compressor: ratio attack
 //                  release knee threshold | limiter: attack release ?
-//                  threshold | tail: gain ?a ?b link
-//   Padding (40):  unknown, all zero in every capture
+//                  threshold | tail: gain phase delay link
+//   Switches:      mute bits of the inputs | mute bits of the outputs
+//                  | PEQ bypass bits (bit = band), one word per channel byte
+//   Rest:          unknown(4) | delay display unit | unknown(6)
 //
-// The DSP 206 is assumed to use the same layout with 2 inputs and 6 outputs.
-// Mute, phase, delay and PEQ bypass have not been located in the dump yet
-// (probably in the ?a/?b words) and are not decoded.
+// DSP 408: records end at 0x580, total 0x5A8 bytes (29 chunks).
+// DSP 206: records end at 0x380, total 0x3A0 bytes (19 chunks).
 
 import 'device_model.dart';
 import 'device_state.dart';
@@ -30,7 +32,6 @@ class ConfigDump {
   static const int chunkSize = 50;
   static const int headerLength = 16;
   static const int inputRecordLength = 140;
-  static const int paddingLength = 40;
 
   final DeviceModel model;
 
@@ -38,15 +39,27 @@ class ConfigDump {
 
   int get outputRecordLength => 8 + 2 + 2 * model.inputs.length + 6 + 9 * 6 + 10 + 8 + 8;
 
-  /// Bytes needed to decode every channel.
+  /// Bytes needed to decode every channel record.
   int get requiredLength =>
       headerLength + model.inputs.length * inputRecordLength + model.outputs.length * outputRecordLength;
 
-  /// Full dump length including the trailing padding.
-  int get totalLength => requiredLength + paddingLength;
+  /// Mute bits of the inputs; the outputs follow at +2.
+  int get muteOffset => requiredLength;
 
-  /// Number of 0x27 requests needed to read [requiredLength] bytes.
-  int get chunkCount => (requiredLength + chunkSize - 1) ~/ chunkSize;
+  /// PEQ bypass words, one per channel byte (inputs from 0, outputs from
+  /// the model's first output byte).
+  int get peqBypassOffset => muteOffset + 4;
+
+  int get _channelSlots => model.channelByte(model.outputs.last)! + 1;
+
+  /// Bytes needed to decode mute and PEQ bypass as well.
+  int get switchesLength => peqBypassOffset + 2 * _channelSlots;
+
+  /// Full dump length as the original editor reads it.
+  int get totalLength => switchesLength + 4 + 2 + 6;
+
+  /// Number of 0x27 requests needed to read [totalLength] bytes.
+  int get chunkCount => (totalLength + chunkSize - 1) ~/ chunkSize;
 
   int inputOffset(int index) => headerLength + index * inputRecordLength;
 
@@ -122,7 +135,27 @@ class ConfigDump {
       _decodeTail(r, state, ch, limBase + o + 8);
     }
 
-    return ConfigDumpResult(state, problems);
+    // Mute and PEQ bypass follow the records; a shorter dump leaves them off.
+    final switchesRead = stream.length >= switchesLength;
+    if (switchesRead) {
+      final inputMutes = r.u16(muteOffset);
+      final outputMutes = r.u16(muteOffset + 2);
+      for (var i = 0; i < model.inputs.length; i++) {
+        state.mutes[model.inputs[i]] = inputMutes & (1 << i) != 0;
+      }
+      for (var j = 0; j < model.outputs.length; j++) {
+        state.mutes[model.outputs[j]] = outputMutes & (1 << j) != 0;
+      }
+      for (final ch in model.channels) {
+        final bits = r.u16(peqBypassOffset + 2 * model.channelByte(ch)!);
+        final bands = state.peqBands[ch]!;
+        for (var b = 0; b < bands.length; b++) {
+          bands[b].bypass = bits & (1 << b) != 0;
+        }
+      }
+    }
+
+    return ConfigDumpResult(state, problems, switchesRead: switchesRead);
   }
 
   void _decodeName(_Reader r, DeviceState state, String ch, int offset) {
@@ -155,13 +188,16 @@ class ConfigDump {
   void _decodeTail(_Reader r, DeviceState state, String ch, int o) {
     state.gains[ch] = const ProtocolService().quantizeGain(
         const ProtocolService().gainValueToDb(r.u16(o, max: 400, fallback: 280, what: '$ch gain')));
+    state.phase[ch] = r.u16(o + 2, max: 1, what: '$ch phase') == 1;
+    state.delays[ch] = r.u16(o + 4, max: ProtocolService.delayRawMax, what: '$ch delay');
     state.links[ch] = r.u16(o + 6, max: 0xFF, what: '$ch link');
   }
 
   // ─── Encode ───
 
   /// Encode [state] as a dump stream of [totalLength] bytes. Fields that are
-  /// not decoded (?a/?b, padding) are written as zero.
+  /// not decoded (limiter "?", the rest after the switches) are written as
+  /// zero.
   List<int> encode(DeviceState state) {
     const proto = ProtocolService();
     final out = List<int>.filled(totalLength, 0);
@@ -187,7 +223,17 @@ class ConfigDump {
     }
     void tail(int at, String ch) {
       u16(at, proto.gainDbToValue(state.gains[ch]!));
+      u16(at + 2, state.phase[ch]! ? 1 : 0);
+      u16(at + 4, state.delays[ch]!);
       u16(at + 6, state.links[ch]!);
+    }
+    int bits(Iterable<bool> flags) {
+      var mask = 0, bit = 1;
+      for (final on in flags) {
+        if (on) mask |= bit;
+        bit <<= 1;
+      }
+      return mask;
     }
 
     out[0] = 0xFF;
@@ -242,6 +288,12 @@ class ConfigDump {
       u16(compBase + 16, l.threshold);
       tail(compBase + 18, ch);
     }
+
+    u16(muteOffset, bits(model.inputs.map((ch) => state.mutes[ch]!)));
+    u16(muteOffset + 2, bits(model.outputs.map((ch) => state.mutes[ch]!)));
+    for (final ch in model.channels) {
+      u16(peqBypassOffset + 2 * model.channelByte(ch)!, bits(state.peqBands[ch]!.map((b) => b.bypass)));
+    }
     return out;
   }
 
@@ -258,7 +310,10 @@ class ConfigDumpResult {
   /// Values that were out of range; empty if the dump looks plausible.
   final List<String> problems;
 
-  ConfigDumpResult(this.state, this.problems);
+  /// False if the dump ended before the mute and PEQ bypass bits.
+  final bool switchesRead;
+
+  ConfigDumpResult(this.state, this.problems, {this.switchesRead = false});
 
   bool get isPlausible => problems.isEmpty;
 }

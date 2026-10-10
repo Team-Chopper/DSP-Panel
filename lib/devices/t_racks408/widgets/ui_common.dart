@@ -83,11 +83,17 @@ class ChannelSelector extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Channels linked with the selected one are highlighted as well: a
+    // change on this page applies to all of them.
+    final partners = device.linkedWith(selected).toSet();
     Widget chip(String ch) {
       final isInput = device.inputs.contains(ch);
       final color = AppColors.forChannel(isInput);
       final active = ch == selected;
-      return Padding(
+      final partner = partners.contains(ch);
+      final linked = device.linkedWith(ch).isNotEmpty;
+      final master = device.linkMaster(ch);
+      final chipWidget = Padding(
         padding: const EdgeInsets.only(right: 6),
         child: InkWell(
           borderRadius: BorderRadius.circular(8),
@@ -96,22 +102,36 @@ class ChannelSelector extends StatelessWidget {
             duration: const Duration(milliseconds: 120),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
             decoration: BoxDecoration(
-              color: active ? color.withAlpha(40) : AppColors.surfaceHigh,
+              color: active
+                  ? color.withAlpha(40)
+                  : partner
+                      ? color.withAlpha(18)
+                      : AppColors.surfaceHigh,
               borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: active ? color : AppColors.border),
+              border: Border.all(
+                color: active ? color : (partner ? color.withAlpha(150) : AppColors.border),
+              ),
             ),
             child: Row(mainAxisSize: MainAxisSize.min, children: [
               Text(device.getAlias(ch),
                   style: interWeight(
-                      TextStyle(fontSize: 12, color: active ? color : AppColors.text),
+                      TextStyle(fontSize: 12, color: active || partner ? color : AppColors.text),
                       active ? FontWeight.w600 : FontWeight.w400)),
-              if (device.linkedWith(ch).isNotEmpty) ...[
+              if (linked) ...[
                 const SizedBox(width: 4),
-                Icon(Icons.link, size: 12, color: active ? color : AppColors.muted),
+                Icon(Icons.link, size: 12, color: active || partner ? color : AppColors.muted),
               ],
             ]),
           ),
         ),
+      );
+      if (!linked) return chipWidget;
+      return Tooltip(
+        message: master != null
+            ? 'Linked to ${device.getAlias(master)}'
+            : 'Master of ${device.linkedWith(ch).map(device.getAlias).join(', ')}',
+        waitDuration: const Duration(milliseconds: 600),
+        child: chipWidget,
       );
     }
 

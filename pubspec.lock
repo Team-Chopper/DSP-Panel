@@ -63,7 +63,7 @@ packages:
       path: "packages/dsp_core"
       relative: true
     source: path
-    version: "0.6.0"
+    version: "0.7.3"
   fake_async:
     dependency: "direct dev"
     description:

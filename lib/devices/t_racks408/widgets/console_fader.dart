@@ -3,12 +3,14 @@
 // for gain, EQ, filter, GEQ and delay, horizontally for the dynamics.
 //
 // Drag the cap (or anywhere on the track) to move it, scroll to step,
-// double-tap to reset.
+// double-tap to reset. A clicked fader takes the keyboard focus: the arrow
+// keys step it (Shift: 10 steps), Page Up/Down move 10 % of the travel.
 
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../../theme/app_colors.dart';
 import '../../../theme/app_theme.dart';
@@ -114,7 +116,17 @@ class ConsoleFader extends StatefulWidget {
   /// Level meter beside the slot (0..1), vertical faders only.
   final double? meterLevel;
 
-  /// Scroll wheel step in value units (default: 1 % of the travel).
+  /// Peak-hold position of the meter (0..1).
+  final double? meterPeak;
+
+  /// Clip indicator on top of the meter (null: none).
+  final bool? clip;
+
+  /// Limiter indicator on top of the meter (null: none).
+  final bool? limit;
+
+  /// Scroll wheel and arrow key step in value units (default: 1 % of the
+  /// travel).
   final double? wheelStep;
 
   /// Cap size along the travel.
@@ -132,6 +144,9 @@ class ConsoleFader extends StatefulWidget {
     this.color = AppColors.accent,
     this.axis = Axis.vertical,
     this.meterLevel,
+    this.meterPeak,
+    this.clip,
+    this.limit,
     this.wheelStep,
     this.capLength = 30,
   });
@@ -144,8 +159,16 @@ class _ConsoleFaderState extends State<ConsoleFader> {
   /// Pointer offset from the cap centre while dragging.
   double _grab = 0;
   bool _dragging = false;
+  final FocusNode _focus = FocusNode(debugLabel: 'fader');
+  bool _focused = false;
 
   bool get _vertical => widget.axis == Axis.vertical;
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
 
   _FaderGeometry _geometry(Size size) => _FaderGeometry(
         size: size,
@@ -153,7 +176,38 @@ class _ConsoleFaderState extends State<ConsoleFader> {
         capLength: widget.capLength,
         hasLabels: widget.markLabel != null,
         hasMeter: widget.meterLevel != null,
+        hasIndicators: widget.clip != null || widget.limit != null,
       );
+
+  /// One step up (+1) or down (-1), [count] times.
+  void _step(int direction, {int count = 1}) {
+    final step = widget.wheelStep;
+    if (step != null) {
+      widget.onChanged(widget.value + direction * step * count);
+    } else {
+      _emit(widget.taper.toPosition(widget.value) + direction * 0.01 * count);
+    }
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    final count = HardwareKeyboard.instance.isShiftPressed ? 10 : 1;
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowUp || key == LogicalKeyboardKey.arrowRight) {
+      _step(1, count: count);
+    } else if (key == LogicalKeyboardKey.arrowDown || key == LogicalKeyboardKey.arrowLeft) {
+      _step(-1, count: count);
+    } else if (key == LogicalKeyboardKey.pageUp) {
+      _emit(widget.taper.toPosition(widget.value) + 0.1);
+    } else if (key == LogicalKeyboardKey.pageDown) {
+      _emit(widget.taper.toPosition(widget.value) - 0.1);
+    } else if (key == LogicalKeyboardKey.escape) {
+      _focus.unfocus();
+    } else {
+      return KeyEventResult.ignored;
+    }
+    return KeyEventResult.handled;
+  }
 
   double _along(Offset p) => _vertical ? p.dy : p.dx;
 
@@ -179,45 +233,49 @@ class _ConsoleFaderState extends State<ConsoleFader> {
   void _wheel(PointerScrollEvent event) {
     final delta = _vertical || event.scrollDelta.dx == 0 ? -event.scrollDelta.dy : event.scrollDelta.dx;
     if (delta == 0) return;
-    final direction = delta > 0 ? 1 : -1;
-    final step = widget.wheelStep;
-    if (step != null) {
-      widget.onChanged(widget.value + direction * step);
-    } else {
-      _emit(widget.taper.toPosition(widget.value) + direction * 0.01);
-    }
+    _step(delta > 0 ? 1 : -1);
   }
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(builder: (context, constraints) {
       final size = Size(constraints.maxWidth, constraints.maxHeight);
-      return Listener(
-        onPointerSignal: (e) {
-          if (e is PointerScrollEvent) {
-            GestureBinding.instance.pointerSignalResolver.register(e, (e) => _wheel(e as PointerScrollEvent));
-          }
-        },
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onDoubleTap: widget.resetValue == null ? null : () => widget.onChanged(widget.resetValue!),
-          onVerticalDragStart: _vertical ? (d) => _start(d.localPosition, size) : null,
-          onVerticalDragUpdate: _vertical ? (d) => _update(d.localPosition, size) : null,
-          onVerticalDragEnd: _vertical ? (_) => _end() : null,
-          onHorizontalDragStart: !_vertical ? (d) => _start(d.localPosition, size) : null,
-          onHorizontalDragUpdate: !_vertical ? (d) => _update(d.localPosition, size) : null,
-          onHorizontalDragEnd: !_vertical ? (_) => _end() : null,
-          child: CustomPaint(
-            size: size,
-            painter: _FaderPainter(
-              geometry: _geometry(size),
-              position: widget.taper.toPosition(widget.value),
-              marks: [for (final m in widget.marks) (widget.taper.toPosition(m), m)],
-              majorMarks: widget.majorMarks,
-              markLabel: widget.markLabel,
-              color: widget.color,
-              meterLevel: widget.meterLevel,
-              active: _dragging,
+      return Focus(
+        focusNode: _focus,
+        onKeyEvent: _onKey,
+        onFocusChange: (f) => setState(() => _focused = f),
+        child: Listener(
+          onPointerDown: (_) => _focus.requestFocus(),
+          onPointerSignal: (e) {
+            if (e is PointerScrollEvent) {
+              GestureBinding.instance.pointerSignalResolver.register(e, (e) => _wheel(e as PointerScrollEvent));
+            }
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onDoubleTap: widget.resetValue == null ? null : () => widget.onChanged(widget.resetValue!),
+            onVerticalDragStart: _vertical ? (d) => _start(d.localPosition, size) : null,
+            onVerticalDragUpdate: _vertical ? (d) => _update(d.localPosition, size) : null,
+            onVerticalDragEnd: _vertical ? (_) => _end() : null,
+            onHorizontalDragStart: !_vertical ? (d) => _start(d.localPosition, size) : null,
+            onHorizontalDragUpdate: !_vertical ? (d) => _update(d.localPosition, size) : null,
+            onHorizontalDragEnd: !_vertical ? (_) => _end() : null,
+            child: CustomPaint(
+              size: size,
+              painter: _FaderPainter(
+                geometry: _geometry(size),
+                position: widget.taper.toPosition(widget.value),
+                marks: [for (final m in widget.marks) (widget.taper.toPosition(m), m)],
+                majorMarks: widget.majorMarks,
+                markLabel: widget.markLabel,
+                color: widget.color,
+                meterLevel: widget.meterLevel,
+                meterPeak: widget.meterPeak,
+                clip: widget.clip,
+                limit: widget.limit,
+                active: _dragging,
+                focused: _focused,
+              ),
             ),
           ),
         ),
@@ -281,16 +339,24 @@ class _FaderGeometry {
   final bool hasLabels;
   final bool hasMeter;
 
+  /// Clip/limit indicators above the scale (space for two is reserved, so
+  /// faders with one or two indicators line up).
+  final bool hasIndicators;
+
   _FaderGeometry({
     required this.size,
     required this.vertical,
     required this.capLength,
     required this.hasLabels,
     required this.hasMeter,
+    this.hasIndicators = false,
   });
 
   static const labelSpace = 24.0;
-  static const meterWidth = 6.0;
+  static const meterWidth = 22.0;
+
+  /// Space above the meter for the clip/limit indicators.
+  static const indicatorHeight = 20.0;
 
   double get _cross => vertical ? size.width : size.height;
   double get _travel => vertical ? size.height : size.width;
@@ -301,7 +367,10 @@ class _FaderGeometry {
   double get trackCenter => (trackStart + trackEnd) / 2;
   double get capWidth => math.min(trackEnd - trackStart - 2, vertical ? 40.0 : 26.0).clamp(10.0, 60.0);
 
-  double get _min => capLength / 2 + 2;
+  /// Height reserved above the travel for the indicators.
+  double get indicatorSpace => hasIndicators && vertical ? 2 * (indicatorHeight + 3) : 0;
+
+  double get _min => capLength / 2 + 2 + indicatorSpace;
   double get _max => _travel - capLength / 2 - 2;
 
   /// Pixel along the travel axis for a position (vertical: 1 = top).
@@ -319,7 +388,11 @@ class _FaderPainter extends CustomPainter {
   final String Function(double value)? markLabel;
   final Color color;
   final double? meterLevel;
+  final double? meterPeak;
+  final bool? clip;
+  final bool? limit;
   final bool active;
+  final bool focused;
 
   _FaderPainter({
     required this.geometry,
@@ -329,8 +402,113 @@ class _FaderPainter extends CustomPainter {
     required this.markLabel,
     required this.color,
     required this.meterLevel,
+    required this.meterPeak,
+    required this.clip,
+    required this.limit,
     required this.active,
+    required this.focused,
   });
+
+  /// Laid-out scale labels, shared by all faders (a page repaints its
+  /// faders often; text layout is the expensive part).
+  static final Map<String, TextPainter> _labels = {};
+
+  static TextPainter _labelPainter(String text, bool major) => _labels.putIfAbsent(
+        '$text|$major',
+        () => TextPainter(
+          text: TextSpan(text: text, style: monoValue.copyWith(fontSize: 9, color: major ? AppColors.text : AppColors.muted)),
+          textDirection: TextDirection.ltr,
+        )..layout(),
+      );
+
+  static final Map<String, TextPainter> _indicatorLabels = {};
+
+  /// Path with the 1 px gaps between 3 px segments, cached per meter size.
+  static final Map<Rect, Path> _gapPaths = {};
+
+  static Path _segmentGaps(Rect meter) {
+    if (_gapPaths.length > 64) _gapPaths.clear();
+    return _gapPaths.putIfAbsent(meter, () {
+      const segment = 3.0, gap = 1.0;
+      final path = Path();
+      for (var y = meter.bottom - segment; y > meter.top; y -= segment + gap) {
+        path.addRect(Rect.fromLTRB(meter.left, y - gap, meter.right, y));
+      }
+      return path;
+    });
+  }
+
+  /// [_meterColors] dimmed (unlit segments).
+  static const _meterColorsDim = [Color(0xFF173A26), Color(0xFF173A26), Color(0xFF3F3A24), Color(0xFF3E1F22)];
+
+  static const _meterColors = [AppColors.accent, AppColors.accent, Color(0xFFFDE68A), AppColors.danger];
+  /// Colour stops in fader positions of [gainTaper]: green up to about -8 dB,
+  /// yellow towards 0 dB, red from 0 dB.
+  static const _meterStops = [0.0, 0.6, 0.72, 0.78];
+
+  /// Segmented level meter: every segment is pre-coloured but dim and
+  /// lights up when the level reaches it. Clip and limit indicators sit on
+  /// top.
+  void _paintMeter(Canvas canvas, Size size, double top, double bottom) {
+    final level = meterLevel!.clamp(0.0, 1.0);
+    final x0 = size.width - _FaderGeometry.meterWidth;
+    final indicators = [
+      // Limit on top, clip right at the end of the scale.
+      if (limit != null) (limit!, AppColors.warning, 'L'),
+      if (clip != null) (clip!, AppColors.danger, 'C'),
+    ];
+    const ind = _FaderGeometry.indicatorHeight;
+    // The meter spans exactly the scale, so its level reads against the dB
+    // labels; the indicators sit above the scale.
+    final meter = Rect.fromLTRB(x0, top, size.width, bottom);
+    canvas.drawRRect(RRect.fromRectAndRadius(meter.inflate(1), const Radius.circular(2)), Paint()..color = Colors.black);
+
+    // Few draw calls: the browser renders the whole page again on every
+    // frame of any animation (dialogs, tab ripples), so a meter must be cheap.
+    // 1. the whole scale pre-coloured but dim, 2. the lit part, 3. one path
+    // with all segment gaps on top.
+    LinearGradient gradient(List<Color> colors) =>
+        LinearGradient(begin: Alignment.bottomCenter, end: Alignment.topCenter, colors: colors, stops: _meterStops);
+    canvas.drawRect(meter, Paint()..shader = gradient(_meterColorsDim).createShader(meter));
+    final litTop = meter.bottom - meter.height * level;
+    if (level > 0) {
+      canvas.drawRect(Rect.fromLTRB(x0, litTop, size.width, meter.bottom),
+          Paint()..shader = gradient(_meterColors).createShader(meter));
+    }
+    canvas.drawPath(_segmentGaps(meter), Paint()..color = Colors.black);
+    final peak = meterPeak;
+    if (peak != null && peak > 0.01) {
+      final py = meter.bottom - meter.height * peak.clamp(0.0, 1.0);
+      canvas.drawRect(
+          Rect.fromLTRB(x0, py - 1, size.width, py + 1), Paint()..shader = gradient(_meterColors).createShader(meter));
+    }
+
+    // Indicators above the meter
+    for (var i = 0; i < indicators.length; i++) {
+      final (on, c, letter) = indicators[i];
+      // Bottom slot right above the scale: clip; top slot: limit.
+      final slot = indicators.length == 2 ? i : 1;
+      final r = Rect.fromLTWH(x0, 2 + slot * (ind + 3), _FaderGeometry.meterWidth, ind);
+      final rr = RRect.fromRectAndRadius(r, const Radius.circular(2));
+      if (on) {
+        // Glow as a soft ring (no blur filter: blurs are expensive in the browser)
+        canvas.drawRRect(rr.inflate(2), Paint()..color = c.withAlpha(70));
+      }
+      canvas.drawRRect(rr, Paint()..color = on ? c : c.withAlpha(45));
+      final t = _indicatorLabels.putIfAbsent(
+        '$letter|$on',
+        () => TextPainter(
+          text: TextSpan(
+              text: letter,
+              style: interWeight(
+                  TextStyle(fontSize: 12, height: 1, color: on ? AppColors.backgroundDeep : c.withAlpha(150)),
+                  FontWeight.w800)),
+          textDirection: TextDirection.ltr,
+        )..layout(),
+      );
+      t.paint(canvas, r.center - Offset(t.width / 2, t.height / 2));
+    }
+  }
 
   bool get _v => geometry.vertical;
 
@@ -350,7 +528,6 @@ class _FaderPainter extends CustomPainter {
     final bottom = g.positionToPixel(_v ? 0 : 1);
 
     // Scale lines across the slot, labels beside it
-    final label = TextPainter(textDirection: TextDirection.ltr);
     double? lastLabelAt;
     for (final (pos, value) in marks) {
       final at = g.positionToPixel(pos);
@@ -364,11 +541,7 @@ class _FaderPainter extends CustomPainter {
       );
       final text = markLabel?.call(value);
       if (text == null || text.isEmpty) continue;
-      label
-        ..text = TextSpan(
-            text: text,
-            style: monoValue.copyWith(fontSize: 9, color: major ? AppColors.text : AppColors.muted))
-        ..layout();
+      final label = _labelPainter(text, major);
       final extent = _v ? label.height : label.width;
       if (lastLabelAt != null && (at - lastLabelAt).abs() < extent + 1) continue;
       lastLabelAt = at;
@@ -396,39 +569,27 @@ class _FaderPainter extends CustomPainter {
     );
 
     // Meter
-    final level = meterLevel;
-    if (level != null && _v) {
-      final x0 = size.width - _FaderGeometry.meterWidth;
-      final meter = Rect.fromLTRB(x0, top - 4, size.width, bottom + 4);
-      canvas.drawRRect(RRect.fromRectAndRadius(meter, const Radius.circular(2)), Paint()..color = Colors.black);
-      final fill = level.clamp(0.0, 1.0);
-      if (fill > 0) {
-        final filled = Rect.fromLTRB(x0, meter.bottom - meter.height * fill, size.width, meter.bottom);
-        canvas.save();
-        canvas.clipRRect(RRect.fromRectAndRadius(filled, const Radius.circular(2)));
-        canvas.drawRect(
-          meter,
-          Paint()
-            ..shader = const LinearGradient(
-              begin: Alignment.bottomCenter,
-              end: Alignment.topCenter,
-              colors: [AppColors.accent, AppColors.accent, Color(0xFFFDE68A), AppColors.danger],
-              stops: [0.0, 0.55, 0.8, 1.0],
-            ).createShader(meter),
-        );
-        canvas.restore();
-      }
-    }
+    if (meterLevel != null && _v) _paintMeter(canvas, size, top, bottom);
 
     // Cap: shadow, body with gradient, grip ridges, centre line
     final half = g.capLength / 2;
     final capRect = _rect(capAt - half, capAt + half, c - g.capWidth / 2, c + g.capWidth / 2);
     final cap = RRect.fromRectAndRadius(capRect, const Radius.circular(4));
+    if (focused) {
+      // Keyboard focus: coloured glow around the cap
+      canvas.drawRRect(
+        cap.inflate(3),
+        Paint()
+          ..color = color.withAlpha(150)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
+    }
     canvas.drawRRect(
       cap.shift(_v ? const Offset(0, 3) : const Offset(2, 2)),
-      Paint()
-        ..color = Colors.black.withAlpha(140)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3),
+      // Hard, slightly transparent shadow: a blur filter per fader is too
+      // expensive when the browser repaints the page on every frame.
+      Paint()..color = Colors.black.withAlpha(110),
     );
     canvas.drawRRect(
       cap,

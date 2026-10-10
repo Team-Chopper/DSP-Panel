@@ -1,5 +1,6 @@
 // Settings Overlay
 
+import 'package:dsp_core/dsp_core.dart' show defaultRefreshMs;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -35,8 +36,8 @@ class SettingsOverlay {
                 controller: controller,
                 keyboardType: TextInputType.number,
                 decoration: const InputDecoration(
-                  labelText: 'Refresh interval (5–300 ms)',
-                  helperText: 'Applies to this DSP for all clients',
+                  labelText: 'Meter refresh interval (5–300 ms)',
+                  helperText: 'Applies to this DSP for all clients (default $defaultRefreshMs ms)',
                   border: OutlineInputBorder(),
                 ),
                 autofocus: true,
@@ -85,7 +86,7 @@ class SettingsOverlay {
         actions: [
           TextButton(
             onPressed: () {
-              connection.setRefreshInterval(300);
+              connection.setRefreshInterval(defaultRefreshMs);
               Navigator.of(context).pop();
             },
             child: const Text('Reset'),

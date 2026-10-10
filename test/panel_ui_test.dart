@@ -204,7 +204,7 @@ void main() {
     testWidgets('matrix: toggling a linked output does not change its partner', (tester) async {
       server.receive(_hello([_foh]));
       final device = panel.dsps.single.device;
-      device.setLinkGroup(['Out 1', 'Out 2']);
+      device.setLinkSlaves('Out 1', ['Out 2']);
       final before = device.getMatrixEnabled('Out 2', 'In C');
       device.toggleMatrixInput('Out 1', 'In C');
       expect(device.getMatrixEnabled('Out 1', 'In C'), !before);

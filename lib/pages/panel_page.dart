@@ -84,11 +84,6 @@ class _PanelPageState extends State<PanelPage> {
           Text('DSP Panel', style: interWeight(const TextStyle(fontSize: 18), FontWeight.w700)),
         ]),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: 'Add DSP',
-            onPressed: () => showAddDspDialog(context),
-          ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.menu),
             tooltip: 'Menu',
@@ -133,6 +128,19 @@ class _PanelPageState extends State<PanelPage> {
                             onTap: () => panel.select(dsp.id),
                           ),
                         ),
+                      // New-tab button right after the DSP tabs
+                      Center(
+                        child: IconButton(
+                          icon: const Icon(Icons.add, size: 18),
+                          tooltip: 'Add DSP',
+                          visualDensity: VisualDensity.compact,
+                          style: IconButton.styleFrom(
+                            foregroundColor: AppColors.muted,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          onPressed: () => showAddDspDialog(context),
+                        ),
+                      ),
                       if (editors.isNotEmpty)
                         Container(
                           width: 1,

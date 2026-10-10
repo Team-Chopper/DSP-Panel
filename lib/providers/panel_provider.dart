@@ -211,7 +211,8 @@ class PanelProvider extends ChangeNotifier {
       case Msg.meters:
         if (dsp == null) return;
         dsp.connection.updateCounters((msg['tx'] as num).toInt(), (msg['rx'] as num).toInt());
-        dsp.device.applyMeters([for (final v in msg['v'] as List) (v as num).toDouble()]);
+        dsp.device.applyMeters([for (final v in msg['v'] as List) (v as num).toDouble()],
+            dynamics: (msg['dyn'] as num?)?.toInt() ?? 0);
       case Msg.log:
         dsp?.connection.applyLog(
           [for (final e in msg['entries'] as List) LogEntry.fromJson((e as Map).cast())],

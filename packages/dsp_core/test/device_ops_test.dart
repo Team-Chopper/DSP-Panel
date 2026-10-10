@@ -15,6 +15,7 @@ void main() {
         DeviceOps.phase('In B', true),
         DeviceOps.delay('Out 2', 960),
         DeviceOps.matrixRoute('Out 2', 0x0F),
+        DeviceOps.matrixGain('Out 1', 'In D', -6.5),
         DeviceOps.geqBand('In D', 30, 4.2),
         DeviceOps.geqReset('In A'),
         DeviceOps.peqBand('Out 1', 8, PeqBand(gainDb: 3)),
@@ -55,7 +56,9 @@ void main() {
         {'op': 'limiter', 'ch': 'Out 1', 'attack': 0, 'release': 0, 'threshold': 221},
         {'op': 'channelName', 'ch': 'In A', 'name': 'too long name'},
         {'op': 'channelName', 'ch': 'In A', 'name': 'Bässe'},
-        {'op': 'matrixGain', 'out': 'Out 1', 'in': 'In A', 'db': 0},
+        {'op': 'matrixGain', 'out': 'In A', 'in': 'In A', 'db': 0},
+        {'op': 'matrixGain', 'out': 'Out 1', 'in': 'Out 2', 'db': 0},
+        {'op': 'matrixGain', 'out': 'Out 1', 'in': 'In A', 'db': 'quiet'},
         {'op': 'alias', 'ch': 'In A', 'alias': 'x'},
         {'op': 'selfDestruct'},
       ];
@@ -113,6 +116,23 @@ void main() {
           const ProtocolService().buildHiPassCommand('In A', 61, 0));
     });
 
+    test('matrix gain is clamped to -60 … 0 dB, quantized and sent per crossing', () {
+      final state = DeviceState(m206);
+      final op = DeviceOps.matrixGain('Out 3', 'In B', -33.3);
+      expect(DeviceOps.validate(op, m206), isNull);
+      DeviceOps.apply(state, op);
+      expect(state.matrixGains['Out 3:In B'], -33.5);
+      expect(DeviceOps.commands(state, op), {
+        'mixgain:Out 3:In B': [const ProtocolService(m206).buildMatrixGainCommand('Out 3', 'In B', -33.5)],
+      });
+      DeviceOps.apply(state, DeviceOps.matrixGain('Out 3', 'In B', 4));
+      expect(state.matrixGains['Out 3:In B'], 0.0);
+      expect(DeviceOps.validate(DeviceOps.matrixGain('Out 1', 'In C', 0), m206), isNotNull);
+      // Not shared with linked channels
+      final linked = DeviceState(m206)..links['Out 1'] = 3;
+      expect(DeviceOps.expandLinked(linked, DeviceOps.matrixGain('Out 1', 'In A', -3)).length, 1);
+    });
+
     test('limiter keeps the unknown parameter', () {
       final state = DeviceState();
       state.limiters['Out 1']!.unknown = 7;
@@ -134,41 +154,88 @@ void main() {
   });
 
   group('linking', () {
-    test('link op: mask must stay in the group and contain the channel', () {
+    void applyAll(DeviceState state, List<Map<String, Object?>> ops) {
+      for (final op in ops) {
+        expect(DeviceOps.validate(op, state.model), isNull, reason: '$op');
+        DeviceOps.apply(state, op);
+      }
+    }
+
+    test('link op: mask must stay in the group and contain the channel (or be empty)', () {
       expect(DeviceOps.validate(DeviceOps.link('Out 1', 0x03), m408), isNull);
       expect(DeviceOps.validate(DeviceOps.link('Out 1', 0x02), m408), isNotNull, reason: 'own bit missing');
+      expect(DeviceOps.validate(DeviceOps.link('Out 2', 0x00), m408), isNull, reason: 'slave stored without bits');
       expect(DeviceOps.validate(DeviceOps.link('Out 1', 0x100), m408), isNotNull);
       expect(DeviceOps.validate(DeviceOps.link('In A', 0x10), m408), isNotNull, reason: 'only 4 inputs');
       expect(DeviceOps.validate(DeviceOps.link('Out 6', 0x30), m206), isNull);
     });
 
-    test('linkGroup sets the same mask on every member and frees others', () {
-      final state = DeviceState(m408);
-      for (final op in DeviceOps.linkGroup(state, ['Out 1', 'Out 2', 'Out 3'])) {
-        DeviceOps.apply(state, op);
-      }
-      expect([for (final o in ['Out 1', 'Out 2', 'Out 3']) state.links[o]], [7, 7, 7]);
+    test('master/slave as read from the device: a link 1 → 2 also moves 1 when 2 changes', () {
+      // DSP 206 dump: Out 1 lists Out 2, Out 2 only itself.
+      final state = DeviceState(m206)
+        ..links['Out 1'] = 0x03
+        ..links['Out 2'] = 0x02;
+      expect(DeviceOps.masterOf(state, 'Out 2'), 'Out 1');
+      expect(DeviceOps.masterOf(state, 'Out 1'), isNull);
+      expect(DeviceOps.slavesOf(state, 'Out 1'), ['Out 2']);
+      expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 2', -3)),
+          [DeviceOps.gain('Out 2', -3), DeviceOps.gain('Out 1', -3)]);
+      expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 1', -3)),
+          [DeviceOps.gain('Out 1', -3), DeviceOps.gain('Out 2', -3)]);
+    });
+
+    test('symmetric masks of older versions form one group with the first channel as master', () {
+      final state = DeviceState(m408)
+        ..links['Out 1'] = 7
+        ..links['Out 2'] = 7
+        ..links['Out 3'] = 7;
+      expect(DeviceOps.linkGroupOf(state, 'Out 3'), ['Out 1', 'Out 2', 'Out 3']);
+      expect(DeviceOps.masterOf(state, 'Out 2'), 'Out 1');
       expect(DeviceOps.linkedWith(state, 'Out 2'), ['Out 1', 'Out 3']);
+    });
 
-      // Re-link Out 3 with Out 4: Out 1 and Out 2 stay linked together.
-      for (final op in DeviceOps.linkGroup(state, ['Out 3', 'Out 4'])) {
-        DeviceOps.apply(state, op);
-      }
-      expect(DeviceOps.linkedWith(state, 'Out 1'), ['Out 2']);
-      expect(DeviceOps.linkedWith(state, 'Out 4'), ['Out 3']);
+    test('linkSlaves: master keeps the mask, slaves only their own bit', () {
+      final state = DeviceState(m408);
+      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2'], copySettings: false));
+      expect(state.links['Out 1'], 0x03);
+      expect(state.links['Out 2'], 0x02);
 
-      // A single channel unlinks it.
-      for (final op in DeviceOps.linkGroup(state, ['Out 3'])) {
-        DeviceOps.apply(state, op);
-      }
-      expect(DeviceOps.linkedWith(state, 'Out 3'), isEmpty);
+      // A slave cannot be linked further, nor become a slave of another master.
+      expect(DeviceOps.linkCandidates(state, 'Out 2'), isEmpty);
+      expect(() => DeviceOps.linkSlaves(state, 'Out 2', ['Out 3']), throwsArgumentError);
+      expect(DeviceOps.linkCandidates(state, 'Out 3'), isNot(contains('Out 2')));
+      expect(DeviceOps.linkCandidates(state, 'Out 3'), isNot(contains('Out 1')), reason: 'Out 1 is a master');
+
+      // More channels are added to the master.
+      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2', 'Out 4'], copySettings: false));
+      expect(state.links['Out 1'], 0x0B);
+      expect(DeviceOps.linkedWith(state, 'Out 4'), ['Out 1', 'Out 2']);
+
+      // A slave leaves its master; the rest stays linked.
+      applyAll(state, DeviceOps.unlink(state, 'Out 2'));
+      expect(DeviceOps.linkedWith(state, 'Out 1'), ['Out 4']);
+      expect(DeviceOps.linkedWith(state, 'Out 2'), isEmpty);
+
+      // Unlinking the master releases everything.
+      applyAll(state, DeviceOps.unlink(state, 'Out 1'));
+      expect(state.links['Out 1'], 0x01);
       expect(DeviceOps.linkedWith(state, 'Out 4'), isEmpty);
-      expect(() => DeviceOps.linkGroup(state, ['In A', 'Out 1']), throwsArgumentError);
+      expect(() => DeviceOps.linkSlaves(state, 'In A', ['Out 1']), throwsArgumentError);
+    });
+
+    test('linkSlaves copies the master settings to new slaves', () {
+      final state = DeviceState(m408);
+      DeviceOps.apply(state, DeviceOps.gain('In A', -7));
+      DeviceOps.apply(state, DeviceOps.geqBand('In A', 3, 4));
+      applyAll(state, DeviceOps.linkSlaves(state, 'In A', ['In C']));
+      expect(state.gains['In C'], -7);
+      expect(state.geqBands['In C']![3], 4);
+      expect(state.gains['In B'], 0);
     });
 
     test('expandLinked repeats channel ops for linked channels', () {
       final state = DeviceState(m206);
-      for (final op in DeviceOps.linkGroup(state, ['Out 1', 'Out 2'])) {
+      for (final op in DeviceOps.linkSlaves(state, 'Out 1', ['Out 2'])) {
         DeviceOps.apply(state, op);
       }
       final ops = DeviceOps.expandLinked(state, DeviceOps.gain('Out 1', -6));
@@ -187,6 +254,19 @@ void main() {
       expect(DeviceOps.commands(state, op)['link:Out 2']!.single,
           ProtocolService.buildFrame(0x3B, [0x03, 0x03]));
     });
+  });
+
+  test('test tone (0x39 type param)', () {
+    final state = DeviceState(m206);
+    expect(DeviceOps.validate(DeviceOps.testTone(1), m206), isNull);
+    expect(DeviceOps.validate(DeviceOps.testTone(4), m206), isNotNull);
+    expect(DeviceOps.validate(DeviceOps.testTone(3, 31), m206), isNotNull);
+    final op = DeviceOps.testTone(3, 17);
+    expect(DeviceOps.expandLinked(state, op), [op]);
+    DeviceOps.apply(state, op);
+    expect([state.testToneType, state.testToneParam], [3, 17]);
+    expect(DeviceOps.commands(state, op)['testTone']!.single, ProtocolService.buildFrame(0x39, [3, 17]));
+    expect(DeviceState.fromJson(state.toJson()).testToneParam, 17);
   });
 
   group('copyChannel', () {
@@ -243,6 +323,7 @@ void main() {
       DeviceOps.link('Out 1', 3),
       DeviceOps.link('Out 2', 3),
       DeviceOps.matrixRoute('Out 5', 3),
+      DeviceOps.matrixGain('Out 5', 'In B', -12),
     ]) {
       DeviceOps.apply(source, op);
     }

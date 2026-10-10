@@ -175,7 +175,8 @@ class DeviceState {
   /// Matrix routing: active input bitmask per output (cmd 0x3a)
   final Map<String, int> matrixRouting;
 
-  /// Matrix gain per crossing point in dB, key "Out 1:In A" (read-only)
+  /// Matrix gain per crossing point in dB (−60 … 0), key "Out 1:In A"
+  /// (cmd 0x41)
   final Map<String, double> matrixGains;
 
   /// 31-band GEQ per input channel (-12 to +12 dB)
@@ -193,8 +194,15 @@ class DeviceState {
   /// Channel names stored on the device ("InA", "Kick" …)
   final Map<String, String> channelNames;
 
-  /// Channel link mask per channel as stored on the device (not editable yet)
+  /// Channel link mask per channel as stored on the device: a master holds
+  /// its own bit and the bits of its slaves, a slave only its own bit.
   final Map<String, int> links;
+
+  /// Signal generator of the DSP (cmd 0x39): type (0 = off, 1 = pink,
+  /// 2 = white, 3 = sine) and parameter (sine frequency index). Not part of
+  /// the config dump: it is what the panel last set.
+  int testToneType = 0;
+  int testToneParam = 0;
 
   DeviceState._(
     this.model, {
@@ -279,6 +287,7 @@ class DeviceState {
     'limiters': {for (final e in limiters.entries) e.key: e.value.toJson()},
     'channelNames': channelNames,
     'links': links,
+    'testTone': [testToneType, testToneParam],
   };
 
   factory DeviceState.fromJson(Map<String, Object?> json) {
@@ -307,6 +316,11 @@ class DeviceState {
     map('limiters').forEach((k, v) => state.limiters[k] = LimiterState.fromJson(obj(v)));
     map('channelNames').forEach((k, v) => state.channelNames[k] = v as String);
     map('links').forEach((k, v) => state.links[k] = (v as num).toInt());
+    final tone = json['testTone'];
+    if (tone is List && tone.length == 2) {
+      state.testToneType = (tone[0] as num).toInt();
+      state.testToneParam = (tone[1] as num).toInt();
+    }
     return state;
   }
 }

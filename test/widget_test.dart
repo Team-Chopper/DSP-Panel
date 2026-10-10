@@ -66,9 +66,39 @@ void main() {
       expect(device.model, DeviceModel.dsp206);
       expect(device.inputs, ['In A', 'In B']);
       expect(device.outputs.length, 6);
-      device.applyMeters(List.filled(8, 0.5));
-      expect(device.getMeterLevel('Out 6'), 0.5);
-      expect(device.getMeterLevel('Out 7'), 0.0);
+      device.applyMeters(List.filled(8, -12.0));
+      expect(device.getMeterDb('Out 6'), -12.0);
+      expect(device.getMeterDb('Out 7'), ProtocolService.silenceDb);
+    });
+
+    test('meters: peak hold, clip and the compressor/limiter status from the DSP', () {
+      final levels = List.filled(12, -30.0);
+      levels[0] = -0.2; // In A at full scale
+      // Out 2: compressor working, Out 3: limiter working
+      device.applyMeters(levels, dynamics: 0x0402);
+      expect(device.isClipping('In A'), isTrue);
+      expect(device.isClipping('In B'), isFalse);
+      expect(device.isCompressing('Out 2'), isTrue);
+      expect(device.isLimiting('Out 2'), isFalse);
+      expect(device.isLimiting('Out 3'), isTrue);
+      expect(device.getMeterPeakDb('In A'), -0.2);
+      device.applyMeters(List.filled(12, -40.0));
+      expect(device.getMeterPeakDb('In A'), -0.2, reason: 'held');
+      expect(device.isLimiting('Out 3'), isTrue, reason: 'indicators stay lit for a moment');
+    });
+
+    test('matrix crossing gain is sent per crossing point', () {
+      fakeAsync((async) {
+        device.setMatrixGain('Out 2', 'In C', -7.25);
+        device.setMatrixGain('Out 2', 'In D', 3);
+        expect(device.getMatrixGain('Out 2', 'In C'), -7.3);
+        expect(device.getMatrixGain('Out 2', 'In D'), 0.0);
+        async.elapse(const Duration(milliseconds: 50));
+        expect(sent.map((m) => m['op']), [
+          DeviceOps.matrixGain('Out 2', 'In C', -7.25),
+          DeviceOps.matrixGain('Out 2', 'In D', 3),
+        ]);
+      });
     });
 
     test('filter on/off restores the last slope', () {
@@ -103,9 +133,9 @@ void main() {
 
     test('linked channels change together, only the original op is sent', () {
       fakeAsync((async) {
-        device.setLinkGroup(['Out 1', 'Out 2']);
+        device.setLinkSlaves('Out 1', ['Out 2'], copySettings: false);
         async.elapse(const Duration(milliseconds: 50));
-        expect(sent.map((m) => (m['op'] as Map)['op']), ['link', 'link']);
+        expect(sent.map((m) => m['op']), [DeviceOps.link('Out 1', 0x03)]);
         expect(device.linkedWith('Out 1'), ['Out 2']);
 
         sent.clear();

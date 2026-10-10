@@ -7,6 +7,9 @@ import 'package:provider/provider.dart';
 
 import '../../../services/rta_service.dart';
 import '../../../services/rta_settings_provider.dart';
+import '../../../theme/app_colors.dart';
+import '../providers/device_provider.dart';
+import 'tone_generator_panel.dart';
 
 // ─── Log-frequency helpers ───
 
@@ -27,7 +30,10 @@ String _formatFreq(double freq) {
 }
 
 class RtaTab extends StatefulWidget {
-  const RtaTab({super.key});
+  /// DSP whose own signal generator is offered (null: offline editor).
+  final DeviceProvider? device;
+
+  const RtaTab({super.key, this.device});
 
   @override
   State<RtaTab> createState() => _RtaTabState();
@@ -122,38 +128,83 @@ class _RtaTabState extends State<RtaTab> {
         // Controls row
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: Row(
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              GestureDetector(
-                onTap: _rtaService.isRunning ? _stopCapture : _startCapture,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: _rtaService.isRunning
-                        ? const Color(0xFFF87171)
-                        : const Color(0xFF4ADE80),
-                    borderRadius: BorderRadius.circular(6),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: _rtaService.isRunning ? AppColors.danger : AppColors.accent,
+                  foregroundColor: AppColors.backgroundDeep,
+                  visualDensity: VisualDensity.compact,
+                ),
+                icon: Icon(_rtaService.isRunning ? Icons.stop : Icons.mic, size: 18),
+                label: Text(_rtaService.isRunning ? 'Stop' : 'Start'),
+                onPressed: _rtaService.isRunning ? _stopCapture : _startCapture,
+              ),
+              SegmentedButton<RtaAveraging>(
+                style: const ButtonStyle(visualDensity: VisualDensity.compact),
+                showSelectedIcon: false,
+                segments: [
+                  for (final a in RtaAveraging.values) ButtonSegment(value: a, label: Text(a.label)),
+                ],
+                selected: {_rtaService.averaging},
+                onSelectionChanged: (s) => setState(() => _rtaService.averaging = s.first),
+              ),
+              OutlinedButton(
+                style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
+                onPressed: () => setState(_rtaService.resetPeaks),
+                child: const Text('Reset peaks'),
+              ),
+              Text(
+                '1/$rtaBandsPerOctave octave · FFT $rtaFftSize · '
+                '${(_rtaService.sampleRate / 1000).toStringAsFixed(1)} kHz · '
+                '${(_rtaService.sampleRate / rtaFftSize).toStringAsFixed(1)} Hz/bin',
+                style: const TextStyle(color: AppColors.muted, fontSize: 12),
+              ),
+              const Text('Auto-EQ: GEQ page (inputs) or EQ page (any channel)',
+                  style: TextStyle(color: AppColors.muted, fontSize: 12)),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(children: [
+              const Row(children: [
+                SizedBox(
+                  width: 130,
+                  child: Tooltip(
+                    message: 'Plays through the audio output of this computer/phone',
+                    child: Text('Browser generator', style: TextStyle(fontSize: 12, color: AppColors.text)),
                   ),
-                  child: Text(
-                    _rtaService.isRunning ? 'Stop' : 'Start',
-                    style: const TextStyle(
-                      color: Color(0xFF14161A),
-                      fontWeight: FontWeight.w600,
-                      fontSize: 13,
+                ),
+                SizedBox(width: 16),
+                Expanded(child: ToneGeneratorPanel()),
+              ]),
+              if (widget.device != null) ...[
+                const Divider(height: 16),
+                Row(children: [
+                  const SizedBox(
+                    width: 130,
+                    child: Tooltip(
+                      message: 'Generator built into the DSP (cmd 0x39)',
+                      child: Text('DSP generator', style: TextStyle(fontSize: 12, color: AppColors.text)),
                     ),
                   ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Text(
-                '$rtaBandCount bands @ ${rtaSampleRate}Hz',
-                style: const TextStyle(
-                  color: Color(0xFF7D8590),
-                  fontSize: 12,
-                ),
-              ),
-            ],
+                  const SizedBox(width: 16),
+                  Expanded(child: DspGeneratorPanel(device: widget.device!)),
+                ]),
+              ],
+            ]),
           ),
         ),
         if (!_isMobile)

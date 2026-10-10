@@ -5,6 +5,13 @@ available today. These points still need captures from real hardware. Each
 item says what is assumed now, how it shows up in the panel, and how to
 capture what is missing.
 
+> **2026-10-10:** most of these questions are now answered by static analysis of
+> the original editors (mute/phase/delay/PEQ bypass in the dump, 0x41 matrix
+> crossing gain, limiter knee, 206 dump length, meters, 0x2C, link behaviour …),
+> see [PROTOCOL-RE.md](PROTOCOL-RE.md). The panel uses them for the items ticked
+> below; the other findings are not used yet. Hardware checks are still useful
+> for the points marked *inferred* there.
+
 ## How to capture
 
 1. Run the original *t.racks DSP Processor Editor* (408 or 206 version) on a
@@ -26,36 +33,32 @@ capture what is missing.
 
 ## DSP 206
 
-- [ ] **Config dump layout.** Assumed: same record format as the DSP 408,
-      with 2 input records, 6 output records and 2 crossing gains per output
-      (896 bytes, 18 chunks).
-      *Panel:* if the assumption is wrong, the DSP tab shows a warning banner
-      and default values; controls still work.
-      *Capture:* connect the 206 editor to the 206 (it reads the whole
-      configuration on connect) and run `inspect_capture.dart --model dsp206`.
-      If it reports implausible values, the dump layout differs.
-- [ ] **Number of config chunks** the 206 answers (`GET CONFIG CHUNK` frames
-      in the same capture).
+- [x] **Config dump layout.** Confirmed by the 206 editor: same record format
+      as the DSP 408 with 2 input and 6 output records (896 bytes), then mute
+      and PEQ bypass bits; 928 bytes in total.
+      *Panel:* decodes it; if a device ever answers differently, the DSP tab
+      shows a warning banner and default values.
+      *Still worth a capture:* connect the 206 editor and run
+      `inspect_capture.dart --model dsp206` to see it on hardware.
+- [x] **Number of config chunks:** the 206 editor reads 19 chunks
+      (0x00–0x12), the 408 editor 29; the panel does the same.
 - [ ] **Startup commands** 0x22, 0x14 and the preset count 0x2c: does the 206
       answer them like the 408? (The panel tolerates missing answers.)
 
 ## Both models
 
-- [ ] **Mute, phase, delay in the config dump.** Every channel record ends
-      with `[gain, ?a, ?b, link]`; ?a and ?b were 0 in every capture.
-      Probably mute, phase and/or delay.
-      *Panel:* these values (and PEQ bypass) are not read from the DSP; the
-      server remembers what was last set in the panel.
-      *Capture:* in the editor mute **In A**, invert phase on **Out 2**, set
-      the delay of **Out 3** to **10 ms**, then reconnect (or store and
-      recall a preset) so the editor reads the configuration again.
-- [ ] **PEQ bypass in the config dump.** A PEQ band in the dump is 6 bytes
-      (gain, freq, Q, type) without bypass.
-      *Capture:* bypass PEQ band 1 of **In A**, then reconnect.
-- [ ] **Matrix crossing gain command.** The dump has one gain per output and
-      input (0 dB = raw 280), but the command to set it is unknown.
-      *Panel:* shown read-only on the Matrix page.
-      *Capture:* change the level of one crossing point in the editor's matrix.
+- [x] **Mute, phase, delay in the config dump.** The channel record ends
+      with `[gain, phase, delay, link]`; mute is a bit mask per group right
+      after the records (see PROTOCOL-RE.md). *Panel:* read from the device
+      on connect and preset load (the server no longer remembers them).
+      *Capture to confirm on hardware:* mute **In A**, invert phase on
+      **Out 2**, set the delay of **Out 3** to **10 ms**, reconnect.
+- [x] **PEQ bypass in the config dump:** one u16 per channel after the mute
+      bits, bit = band. *Panel:* read from the device.
+- [x] **Matrix crossing gain command:** 0x41 `output input-index gain(2B)`,
+      gain like the channel gain (−60 … 0 dB). *Panel:* editable on the
+      Matrix page. *Capture to confirm:* change one crossing point in the
+      editor's matrix.
 - [ ] **Limiter: unknown third parameter** (`attack release ? threshold`,
       always 0 so far). *Capture:* change every limiter control in the editor
       once.
@@ -71,23 +74,50 @@ capture what is missing.
 - [ ] **Value ranges** of gate/compressor/limiter attack, release, hold,
       threshold and knee, and the maximum delay (the panel allows
       680 ms). *Capture:* move each control to its minimum and maximum.
-- [ ] **Channel link (0x3B `ch mask`).** Taken from the FlexiFlizz capture,
-      not tested on a device. The mask holds one bit per channel of the same
-      group (inputs or outputs, like the link byte in the dump) and includes
-      the channel itself.
-      *Panel:* sends 0x3B for every channel of the group and additionally
-      sends each change to all linked channels itself, so linking works even
-      if the DSP does not mirror changes. Matrix routing is deliberately not
-      shared (left/right pairs are fed from different inputs).
-      *Capture:* in the editor link **Out 1** and **Out 2**, then change the
-      gain and a PEQ band of **Out 1**. Check (a) the 0x3B frames, (b) whether
-      the editor also sends the change for **Out 2** or the DSP mirrors it,
-      (c) the link byte in the dump after reconnecting and (d) whether
-      changing the routing of **Out 1** also changes **Out 2** on the device
-      itself – the panel could not prevent that. Repeat for two inputs.
-- [ ] **Commands seen but not implemented:** test tone (0x39), copy channel
-      (0x2D/0x2F), lock (0x2A). The panel copies channels by sending the
-      single values instead of 0x2D/0x2F.
+- [ ] **Channel link (0x3B `ch mask`), master/slave.** The original editor
+      links in one direction: linking Out 1 with Out 2 makes Out 1 the master
+      (mask = Out 1 + Out 2) and Out 2 a slave that cannot be linked any
+      further; more channels are linked to the master. A DSP 206 dump showed
+      exactly that (Out 1 lists Out 2, Out 2 only itself).
+      *Panel:* reads the masks like that (older symmetric masks are read as a
+      group with the first channel as master), sends 0x3B for the master
+      (mask with its slaves) and for released slaves (own bit only), and sends
+      every change of any member to the whole group itself, so linking works
+      even if the DSP does not mirror changes. Matrix routing is deliberately
+      not shared (left/right pairs are fed from different inputs).
+      *Capture:* in the editor link **Out 1** with **Out 2**, then change the
+      gain and a PEQ band of **Out 2** (the slave). Check (a) the 0x3B frames
+      (is a frame sent for the slave, and with which mask?), (b) whether the
+      editor also sends the change for **Out 1** or the DSP mirrors it, (c)
+      the link bytes in the dump after reconnecting and (d) whether changing
+      the routing of **Out 1** also changes **Out 2** on the device itself.
+      Repeat for two inputs.
+- [ ] **Test tone (0x39 `type param`).** From the FlexiFlizz capture:
+      type 0 = off, 1 = pink noise, 2 = white noise, 3 = sine with param =
+      frequency index. Not tested on a device.
+      *Panel:* RTA page → DSP generator. The sine frequency index is
+      *assumed* to count the 31 ISO 1/3-octave frequencies (0 = 20 Hz …
+      30 = 20 kHz); the generator state is not read back (the panel shows
+      what it last set).
+      *Capture:* in the editor switch the generator through pink, white and
+      sine at 20 Hz, 1 kHz and 20 kHz; note which inputs/outputs carry the
+      signal and whether a level is sent.
+- [x] **Meter values.** 0x40 answers with 12 slots, each the upper three
+      bytes of a float32 (the old "float16 0.5 … 2.0" reading), then a status
+      word: bit n = compressor, bit 8+n = limiter of output n working. On the
+      DSP 206 the outputs start at slot 4. *Panel:* meters in dBFS
+      (20·log10, 1.0 = 0 dBFS), clip at −0.5 dBFS, compressor/limiter
+      indicators from the status word.
+      *Still worth a capture:* feed a 1 kHz sine at −40, −20, −10 and 0 dBFS
+      into **In A** to confirm that 1.0 really is full scale.
+- [ ] **Shelf filters.** The EQ graphs draw the PEQ low/high shelf as an
+      RBJ cookbook shelf with the band's Q. Whether the DSP uses Q, a slope
+      or a fixed shape for shelves is unknown.
+      *Capture/compare:* set a shelf with Q 0.7 and Q 3 in the editor and
+      compare the curve the editor draws.
+- [ ] **Commands seen but not implemented:** copy channel (0x2D/0x2F), lock
+      (0x2A). The panel copies channels by sending the single values instead
+      of 0x2D/0x2F.
 - [ ] **Preset count response** (`2c 00 27 0f 00 00 00` on the 408): meaning
       of the bytes.
 

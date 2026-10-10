@@ -29,7 +29,8 @@
 //   {t: dspRemoved, id}
 //   {t: state,      dsp, state}           full DeviceState
 //   {t: op,         dsp, op}              change made by another client
-//   {t: meters,     dsp, v: [one double per channel], tx, rx}
+//   {t: meters,     dsp, v: [dBFS per channel], dyn, tx, rx}
+//                   dyn: bit n = compressor, bit 8+n = limiter of output n active
 //   {t: log,        dsp, entries: [LogEntry], reset?}
 //   {t: presets,    presets: [ServerPresetInfo]}  on connect and on every change
 //   {t: error,      dsp?, message}
@@ -108,6 +109,9 @@ enum DspStatus {
   error,
 }
 
+/// Default keepalive/meter polling interval in ms (allowed: 5–300).
+const int defaultRefreshMs = 40;
+
 /// Public description of one configured DSP and its connection.
 class DspInfo {
   final String id;
@@ -144,7 +148,7 @@ class DspInfo {
     this.status = DspStatus.disconnected,
     this.progress = 0.0,
     this.message,
-    this.refreshMs = 300,
+    this.refreshMs = defaultRefreshMs,
     this.logRx = false,
     this.logTx = false,
     this.model = 'dsp408',
@@ -179,7 +183,7 @@ class DspInfo {
         (s) => s.name == json['status'], orElse: () => DspStatus.disconnected),
     progress: (json['progress'] as num? ?? 0).toDouble(),
     message: json['message'] as String?,
-    refreshMs: (json['refreshMs'] as num? ?? 300).toInt(),
+    refreshMs: (json['refreshMs'] as num? ?? defaultRefreshMs).toInt(),
     logRx: json['logRx'] as bool? ?? false,
     logTx: json['logTx'] as bool? ?? false,
     model: json['model'] as String? ?? 'dsp408',

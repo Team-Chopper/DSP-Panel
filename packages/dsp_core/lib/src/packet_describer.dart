@@ -41,10 +41,17 @@ class PacketDescriber {
       final channels = model.channels;
       final parts = <String>[];
       for (int i = 0; i < message.meterLevels.length && i < channels.length; i++) {
-        final v = message.meterLevels[i];
-        if (v > 0.0001) parts.add('${channels[i]}:${v.toStringAsFixed(3)}');
+        final db = ProtocolService.levelToDb(message.meterLevels[i]);
+        if (db > -100) parts.add('${channels[i]}:${db.toStringAsFixed(1)}');
       }
-      return 'METERS ${parts.isEmpty ? "(silence)" : parts.join(" ")}';
+      final dynamics = [
+        for (var o = 0; o < model.outputs.length; o++) ...[
+          if (ProtocolService.compressorActive(message.dynamics, o)) '${model.outputs[o]}:COMP',
+          if (ProtocolService.limiterActive(message.dynamics, o)) '${model.outputs[o]}:LIMIT',
+        ],
+      ];
+      return 'METERS dBFS ${parts.isEmpty ? "(silence)" : parts.join(" ")}'
+          '${dynamics.isEmpty ? '' : ' ${dynamics.join(' ')}'}';
     }
     if (message is PresetCountMessage) {
       return 'PRESET COUNT: ${message.count}';
@@ -161,6 +168,13 @@ class PacketDescriber {
               '${ProtocolService.timeRawToMs(_u16(data, 7))}/${ProtocolService.timeRawToMs(_u16(data, 9))} ms';
         }
         return 'SET LIMITER';
+      case 0x39: // Test tone: type param
+        if (data.length > 8) {
+          final type = data[6];
+          final name = type < ProtocolService.testToneTypeNames.length ? ProtocolService.testToneTypeNames[type] : '?';
+          return 'SET TEST TONE → $name${type == 3 ? ' (frequency index ${data[7]})' : ''}';
+        }
+        return 'SET TEST TONE';
       case 0x3B: // Link: ch mask
         if (data.length > 7) {
           final group = model.groupOf(ch());
@@ -186,6 +200,12 @@ class PacketDescriber {
           return 'SET MATRIX ${ch()} ← ${inputs.isEmpty ? "none" : inputs.join(" + ")}';
         }
         return 'SET MATRIX';
+      case 0x41: // Matrix crossing gain: output input value(2)
+        if (data.length > 9) {
+          final input = data[7] < model.inputs.length ? model.inputs[data[7]] : 'input ${data[7]}';
+          return 'SET MATRIX GAIN ${ch()} ← $input → ${_db(proto.gainValueToDb(_u16(data, 8)))} dB';
+        }
+        return 'SET MATRIX GAIN';
       case 0x24: // Config chunk response
         if (data.length > 6) {
           return 'CONFIG CHUNK 0x${data[6].toRadixString(16).padLeft(2, '0')} (${data.length} bytes)';

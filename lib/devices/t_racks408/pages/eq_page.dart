@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import '../../../theme/app_colors.dart';
 import '../../../theme/app_theme.dart';
 import '../providers/device_provider.dart';
+import '../widgets/auto_eq_panel.dart';
 import '../widgets/console_fader.dart';
 import '../widgets/fader_strip.dart';
 import '../widgets/peq_graph.dart';
@@ -49,7 +50,10 @@ class EqPage extends StatefulWidget {
   /// Channel to show first (from the EQ overview), or null.
   final String? channel;
 
-  const EqPage({super.key, required this.device, this.channel});
+  /// Offer the DSP's own generator in the Auto-EQ (not in the offline editor).
+  final bool dspGenerator;
+
+  const EqPage({super.key, required this.device, this.channel, this.dspGenerator = true});
 
   @override
   State<EqPage> createState() => _EqPageState();
@@ -59,9 +63,12 @@ class _EqPageState extends State<EqPage> {
   late String _channel = widget.channel ?? widget.device.inputs.first;
   int _band = 0;
 
+  bool _autoEq = false;
+  List<PeqBand>? _proposal;
+
   static const _bottomHeight = 362.0;
   static const _minGraphHeight = 220.0;
-  static const _minWidth = 1060.0;
+  static const _minWidth = 1150.0;
 
   @override
   Widget build(BuildContext context) {
@@ -76,8 +83,10 @@ class _EqPageState extends State<EqPage> {
 
         return LayoutBuilder(builder: (context, constraints) {
           const selectorHeight = 46.0;
-          final graphHeight =
-              math.max(_minGraphHeight, constraints.maxHeight - selectorHeight - _bottomHeight - 24);
+          // The Auto-EQ panel takes about 200 px; the page scrolls if it needs more.
+          final panelHeight = _autoEq ? 200.0 : 0.0;
+          final graphHeight = math.max(
+              _minGraphHeight, constraints.maxHeight - selectorHeight - _bottomHeight - 24 - panelHeight);
           final tooLow = graphHeight + selectorHeight + _bottomHeight + 24 > constraints.maxHeight;
 
           final bottom = SizedBox(
@@ -85,16 +94,33 @@ class _EqPageState extends State<EqPage> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(
+                SizedBox(
+                  // Compact table + band faders; the filters take the rest.
+                  width: _BandTable.width + 12 + _BandFaders.width + 26, // + card padding and border
                   child: PanelCard(
                     title: 'PEQ · ${device.getAlias(_channel)}',
                     accent: color,
-                    trailing: Text('${bands.length} bands',
-                        style: const TextStyle(fontSize: 11, color: AppColors.muted)),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Text('${bands.length} bands', style: const TextStyle(fontSize: 11, color: AppColors.muted)),
+                      const SizedBox(width: 8),
+                      TextButton.icon(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          foregroundColor: _autoEq ? AppColors.warning : AppColors.text,
+                        ),
+                        icon: const Icon(Icons.auto_fix_high, size: 16),
+                        label: const Text('Auto-EQ', style: TextStyle(fontSize: 12)),
+                        onPressed: () => setState(() {
+                          _autoEq = !_autoEq;
+                          _proposal = null;
+                        }),
+                      ),
+                    ]),
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        Expanded(
+                        SizedBox(
+                          width: _BandTable.width,
                           child: _BandTable(
                             device: device,
                             channel: _channel,
@@ -110,8 +136,7 @@ class _EqPageState extends State<EqPage> {
                   ),
                 ),
                 const SizedBox(width: 12),
-                SizedBox(
-                  width: 250,
+                Expanded(
                   child: PanelCard(
                     title: 'Filters',
                     child: Row(
@@ -126,7 +151,7 @@ class _EqPageState extends State<EqPage> {
                 ),
                 const SizedBox(width: 12),
                 SizedBox(
-                  width: 112,
+                  width: 150,
                   child: PanelCard(
                     title: 'Gain',
                     child: ChannelFader(device: device, channel: _channel, color: color, showName: false),
@@ -143,9 +168,28 @@ class _EqPageState extends State<EqPage> {
                 child: ChannelSelector(
                   device: device,
                   selected: _channel,
-                  onSelected: (c) => setState(() => _channel = c),
+                  onSelected: (c) => setState(() {
+                    if (c != _channel) _proposal = null;
+                    _channel = c;
+                  }),
                 ),
               ),
+              if (_autoEq)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                  child: AutoEqPanel(
+                    key: ValueKey('autoeq-$_channel'),
+                    device: device,
+                    channel: _channel,
+                    target: AutoEqTarget.peq,
+                    dspGenerator: widget.dspGenerator,
+                    onPeqProposal: (p) => setState(() => _proposal = p),
+                    onClose: () => setState(() {
+                      _autoEq = false;
+                      _proposal = null;
+                    }),
+                  ),
+                ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
                 child: SizedBox(
@@ -158,6 +202,9 @@ class _EqPageState extends State<EqPage> {
                     onSelect: (b) => setState(() => _band = b),
                     onMove: (b, freqRaw, gainDb) => device.setPeqBand(_channel, b, freqRaw: freqRaw, gainDb: gainDb),
                     onQ: (b, qRaw) => device.setPeqBand(_channel, b, qRaw: qRaw),
+                    proposal: _proposal,
+                    hiPassPreviewSlope: device.filterSlope(_channel, highPass: true),
+                    loPassPreviewSlope: device.filterSlope(_channel, highPass: false),
                   ),
                 ),
               ),
@@ -172,7 +219,7 @@ class _EqPageState extends State<EqPage> {
               ),
             ],
           );
-          return tooLow ? SingleChildScrollView(child: page) : page;
+          return tooLow || _autoEq ? SingleChildScrollView(child: page) : page;
         });
       },
     );
@@ -196,7 +243,15 @@ class _BandTable extends StatelessWidget {
     required this.onSelect,
   });
 
-  static const _rowHeight = 28.0;
+  static const _typeWidth = 112.0;
+  static const _valueWidth = 76.0;
+  static const _bypassWidth = 56.0;
+
+  /// Width of the whole table (row padding and border included).
+  static const width = 14 + 30 + _typeWidth + 3 * (6 + _valueWidth) + 6 + _bypassWidth;
+
+  /// Short type names for the narrow type column.
+  static const _shortTypeNames = ['Peak', 'Lo Shelf', 'Hi Shelf', 'LP 6', 'LP 12', 'HP 6', 'HP 12', 'AP 1', 'AP 2'];
 
   Widget _header(String text, {double? width, int? flex}) {
     final t = Text(text, style: const TextStyle(fontSize: 10, color: AppColors.muted, letterSpacing: 0.5));
@@ -212,14 +267,15 @@ class _BandTable extends StatelessWidget {
           padding: const EdgeInsets.only(left: 6, bottom: 4),
           child: Row(children: [
             _header('#', width: 30),
-            _header('TYPE', flex: 3),
-            _header('FREQ (Hz)', flex: 2),
-            _header('GAIN (dB)', flex: 2),
-            _header('Q', flex: 2),
-            _header('', width: 62),
+            _header('TYPE', width: _typeWidth + 6),
+            _header('FREQ Hz', width: _valueWidth + 6),
+            _header('GAIN dB', width: _valueWidth + 6),
+            _header('Q', width: _valueWidth + 6),
           ]),
         ),
-        for (var i = 0; i < bands.length; i++) _row(i, bands[i]),
+        // The rows share the whole height of the card, like the faders.
+        for (var i = 0; i < bands.length; i++)
+          Expanded(child: _row(i, bands[i])),
       ],
     );
   }
@@ -232,7 +288,7 @@ class _BandTable extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       onTap: () => onSelect(i),
       child: Container(
-        height: _rowHeight,
+        constraints: const BoxConstraints(minHeight: 28),
         margin: const EdgeInsets.only(bottom: 2),
         padding: const EdgeInsets.symmetric(horizontal: 6),
         decoration: BoxDecoration(
@@ -249,13 +305,26 @@ class _BandTable extends StatelessWidget {
               Text('${i + 1}', style: monoValue.copyWith(fontSize: 11, color: AppColors.text)),
             ]),
           ),
-          Expanded(
-            flex: 3,
+          // Looks like a field with an arrow, so it is clearly a choice.
+          Container(
+            width: _typeWidth,
+            height: 24,
+            padding: const EdgeInsets.only(left: 7, right: 2),
+            decoration: BoxDecoration(
+              color: AppColors.surfaceHigh,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: active ? color.withAlpha(160) : AppColors.muted.withAlpha(120)),
+            ),
             child: DropdownButtonHideUnderline(
               child: DropdownButton<int>(
                 value: b.type,
                 isDense: true,
                 isExpanded: true,
+                icon: const Icon(Icons.arrow_drop_down, size: 18, color: AppColors.text),
+                selectedItemBuilder: (context) => [
+                  for (final name in _shortTypeNames)
+                    Align(alignment: Alignment.centerLeft, child: Text(name, overflow: TextOverflow.ellipsis)),
+                ],
                 dropdownColor: AppColors.surfaceHigh,
                 style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: AppColors.text),
                 items: [
@@ -270,8 +339,8 @@ class _BandTable extends StatelessWidget {
             ),
           ),
           gap,
-          Expanded(
-            flex: 2,
+          SizedBox(
+            width: _valueWidth,
             child: ValueField(
               text: formatHz(_proto.peqFreqToHz(b.freqRaw)),
               height: 24,
@@ -285,8 +354,8 @@ class _BandTable extends StatelessWidget {
             ),
           ),
           gap,
-          Expanded(
-            flex: 2,
+          SizedBox(
+            width: _valueWidth,
             child: ValueField(
               text: formatDbValue(b.gainDb),
               height: 24,
@@ -300,8 +369,8 @@ class _BandTable extends StatelessWidget {
             ),
           ),
           gap,
-          Expanded(
-            flex: 2,
+          SizedBox(
+            width: _valueWidth,
             child: ValueField(
               text: _qText(b.qRaw),
               height: 24,
@@ -316,7 +385,7 @@ class _BandTable extends StatelessWidget {
           ),
           gap,
           SizedBox(
-            width: 56,
+            width: _bypassWidth,
             child: _SmallToggle(
               label: 'Bypass',
               active: b.bypass,
@@ -343,12 +412,14 @@ class _BandFaders extends StatelessWidget {
 
   const _BandFaders({required this.device, required this.channel, required this.band, required this.bandData});
 
+  static const width = 3 * 74.0;
+
   @override
   Widget build(BuildContext context) {
     final color = peqBandColors[band % peqBandColors.length];
     final b = bandData;
     return SizedBox(
-      width: 3 * 74,
+      width: width,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [

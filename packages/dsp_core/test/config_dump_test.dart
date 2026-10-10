@@ -12,17 +12,75 @@ void main() {
   final defaultStream = join(capturedConfigChunks());
   final testStream = join(capturedTestPresetChunks());
 
-  test('layout sizes', () {
+  test('layout sizes (offsets as used by the original editor)', () {
     expect(dump408.outputRecordLength, 104);
     expect(dump408.requiredLength, 1408);
-    expect(dump408.totalLength, 1448);
+    expect(dump408.muteOffset, 0x580);
+    expect(dump408.peqBypassOffset, 0x584);
+    expect(dump408.switchesLength, 0x59C);
+    expect(dump408.totalLength, 0x5A8);
     expect(dump408.chunkCount, 29);
     expect(dump206.outputRecordLength, 100);
     expect(dump206.requiredLength, 896);
-    expect(dump206.chunkCount, 18);
+    expect(dump206.muteOffset, 0x380);
+    expect(dump206.peqBypassOffset, 0x384);
+    expect(dump206.switchesLength, 0x394);
+    expect(dump206.totalLength, 0x3A0);
+    expect(dump206.chunkCount, 19);
     // The captured dumps have exactly the expected size.
     expect(defaultStream.length, dump408.totalLength);
     expect(testStream.length, dump408.totalLength);
+  });
+
+  group('mute, phase, delay and PEQ bypass', () {
+    DeviceState changed(DeviceModel model) {
+      final state = DeviceState(model);
+      for (final op in [
+        DeviceOps.mute(model.inputs.last, true),
+        DeviceOps.mute(model.outputs.last, true),
+        DeviceOps.phase('In A', true),
+        DeviceOps.phase('Out 2', true),
+        DeviceOps.delay('Out 3', 960),
+        DeviceOps.delay('In B', 65280),
+        DeviceOps.peqBand('In A', 0, PeqBand(bypass: true)),
+        DeviceOps.peqBand(model.outputs.last, 8, PeqBand(bypass: true)),
+      ]) {
+        DeviceOps.apply(state, op);
+      }
+      return state;
+    }
+
+    for (final dump in [dump408, dump206]) {
+      test('${dump.model.name}: written and read at their offsets', () {
+        final model = dump.model;
+        final state = changed(model);
+        final stream = dump.encode(state);
+        int u16(int at) => stream[at] | (stream[at + 1] << 8);
+
+        expect(u16(dump.muteOffset), 1 << (model.inputs.length - 1));
+        expect(u16(dump.muteOffset + 2), 1 << (model.outputs.length - 1));
+        expect(u16(dump.peqBypassOffset), 1, reason: 'In A band 1');
+        expect(u16(dump.peqBypassOffset + 2 * model.channelByte(model.outputs.last)!), 1 << 8);
+        // Channel tail: gain, phase, delay, link
+        expect(u16(dump.inputOffset(0) + 134), 1);
+        expect(u16(dump.outputOffset(1) + dump.outputRecordLength - 6), 1);
+        expect(u16(dump.outputOffset(2) + dump.outputRecordLength - 4), 960);
+
+        final decoded = dump.decode(stream);
+        expect(decoded.problems, isEmpty);
+        expect(decoded.switchesRead, isTrue);
+        expect(decoded.state.toJson(), state.toJson());
+      });
+    }
+
+    test('a dump that ends after the records leaves the switches off', () {
+      final stream = dump206.encode(changed(DeviceModel.dsp206)).sublist(0, dump206.requiredLength);
+      final result = dump206.decode(stream);
+      expect(result.isPlausible, isTrue);
+      expect(result.switchesRead, isFalse);
+      expect(result.state.mutes.values.toSet(), {false});
+      expect(result.state.phase['Out 2'], isTrue, reason: 'phase is part of the records');
+    });
   });
 
   group('DSP 408 "Default Preset" dump', () {
@@ -68,6 +126,14 @@ void main() {
       expect(s.links['Out 8'], 0x80);
     });
 
+    test('nothing muted, inverted, delayed or bypassed', () {
+      expect(result.switchesRead, isTrue);
+      expect(s.mutes.values.toSet(), {false});
+      expect(s.phase.values.toSet(), {false});
+      expect(s.delays.values.toSet(), {0});
+      expect(s.peqBands.values.expand((b) => b).any((b) => b.bypass), isFalse);
+    });
+
     test('re-encodes to the identical bytes', () {
       expect(dump408.encode(s), defaultStream);
     });
@@ -97,7 +163,7 @@ void main() {
     });
   });
 
-  group('DSP 206 (assumed layout)', () {
+  group('DSP 206', () {
     test('round trip of a modified state', () {
       final state = DeviceState(DeviceModel.dsp206)
         ..currentPreset = 'Club'

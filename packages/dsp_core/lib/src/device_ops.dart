@@ -30,6 +30,8 @@ class DeviceOps {
       {'op': 'delay', 'ch': ch, 'raw': raw};
   static Map<String, Object?> matrixRoute(String out, int mask) =>
       {'op': 'matrixRoute', 'out': out, 'mask': mask};
+  static Map<String, Object?> matrixGain(String out, String input, double db) =>
+      {'op': 'matrixGain', 'out': out, 'in': input, 'db': db};
   static Map<String, Object?> geqBand(String ch, int band, double db) =>
       {'op': 'geqBand', 'ch': ch, 'band': band, 'db': db};
   static Map<String, Object?> geqReset(String ch) => {'op': 'geqReset', 'ch': ch};
@@ -50,62 +52,142 @@ class DeviceOps {
   static Map<String, Object?> channelName(String ch, String? name) =>
       {'op': 'channelName', 'ch': ch, 'name': name};
 
-  /// Link mask of a channel (bits of the linked channels of its group,
-  /// including itself).
+  /// Link mask of a channel (bits of the channels of its group it is the
+  /// master of, including itself; a slave or unlinked channel has only its
+  /// own bit).
   static Map<String, Object?> link(String ch, int mask) => {'op': 'link', 'ch': ch, 'mask': mask};
 
-  // ─── Linking, copying, whole states ───
+  /// Signal generator of the DSP (0 = off, 1 = pink, 2 = white, 3 = sine
+  /// with [param] = frequency index).
+  static Map<String, Object?> testTone(int type, [int param = 0]) =>
+      {'op': 'testTone', 'type': type, 'param': param};
+
+  /// Highest sine frequency index of the generator (31 ISO frequencies).
+  static const int maxTestToneParam = geqBandCount - 1;
+
+  // ─── Linking (master/slave), copying, whole states ───
+  //
+  // Links work like in the original editor: a master is linked to one or
+  // more slaves (In A → In B). The master's link mask holds its own bit and
+  // the bits of its slaves; a slave keeps only its own bit and cannot be
+  // linked to anything else. A change of any member applies to the whole
+  // group (master and all slaves).
 
   /// Ops that change another channel with the same value when it is linked.
-  /// Matrix routing is not mirrored: linked channels are usually a left/right
-  /// pair fed from different inputs.
+  /// Matrix routing and crossing gains are not mirrored: linked channels are
+  /// usually a left/right pair fed from different inputs.
   static const _linkableOps = {
     'gain', 'mute', 'phase', 'delay', 'peqBand', 'hiPass', 'loPass',
     'gate', 'compressor', 'limiter', 'geqBand', 'geqReset',
   };
 
-  /// [op] plus a copy for every channel linked to the channel it changes.
-  static List<Map<String, Object?>> expandLinked(DeviceState state, Map<String, Object?> op) {
-    if (!_linkableOps.contains(op['op'])) return [op];
-    final ch = op['ch'] as String;
+  static int _mask(DeviceState state, String ch) => state.links[ch] ?? state.model.linkBit(ch);
+
+  /// Master whose link mask contains [ch] (not [ch] itself), or null.
+  ///
+  /// Symmetric masks (every member lists every other, as stored by older
+  /// panel versions) are read as a group whose first channel is the master.
+  static String? masterOf(DeviceState state, String ch) {
     final model = state.model;
-    final mask = state.links[ch] ?? model.linkBit(ch);
+    final group = model.groupOf(ch);
+    final bit = model.linkBit(ch);
+    final own = _mask(state, ch);
+    for (final other in group) {
+      if (other == ch || _mask(state, other) & bit == 0) continue;
+      final mutual = own & model.linkBit(other) != 0;
+      if (mutual && group.indexOf(ch) < group.indexOf(other)) continue;
+      return other;
+    }
+    return null;
+  }
+
+  /// Slaves of [ch] (empty unless [ch] is a master).
+  static List<String> slavesOf(DeviceState state, String ch) {
+    final model = state.model;
+    if (masterOf(state, ch) != null) return const [];
+    final mask = _mask(state, ch);
     return [
-      op,
       for (final other in model.groupOf(ch))
-        if (other != ch && mask & model.linkBit(other) != 0) {...op, 'ch': other},
+        if (other != ch && mask & model.linkBit(other) != 0 && masterOf(state, other) == ch) other,
     ];
   }
 
-  /// Ops that link [channels] (all inputs or all outputs) into one group.
-  /// A single channel unlinks it from its group.
-  static List<Map<String, Object?>> linkGroup(DeviceState state, List<String> channels) {
-    final model = state.model;
-    if (channels.isEmpty) return const [];
-    final group = model.groupOf(channels.first);
-    if (channels.any((c) => !group.contains(c))) {
-      throw ArgumentError('Only inputs or only outputs can be linked');
-    }
-    final mask = channels.fold<int>(0, (m, c) => m | model.linkBit(c));
-    final ops = <Map<String, Object?>>[for (final c in channels) link(c, mask)];
-    // Channels that were linked to one of these but are not part of the
-    // new group keep their remaining links.
-    for (final other in group) {
-      if (channels.contains(other)) continue;
-      final current = state.links[other] ?? model.linkBit(other);
-      final remaining = current & ~mask;
-      if (remaining != current) ops.add(link(other, remaining | model.linkBit(other)));
-    }
-    return ops;
+  /// All members of [ch]'s link group, master first; just [ch] if unlinked.
+  static List<String> linkGroupOf(DeviceState state, String ch) {
+    final master = masterOf(state, ch) ?? ch;
+    return [master, ...slavesOf(state, master)];
   }
 
   /// Channels [ch] is linked with (not including itself).
-  static List<String> linkedWith(DeviceState state, String ch) {
-    final model = state.model;
-    final mask = state.links[ch] ?? model.linkBit(ch);
+  static List<String> linkedWith(DeviceState state, String ch) =>
+      [for (final c in linkGroupOf(state, ch)) if (c != ch) c];
+
+  /// [op] plus a copy for every other member of the link group of the
+  /// channel it changes.
+  static List<Map<String, Object?>> expandLinked(DeviceState state, Map<String, Object?> op) {
+    if (!_linkableOps.contains(op['op'])) return [op];
+    final ch = op['ch'] as String;
     return [
-      for (final other in model.groupOf(ch))
-        if (other != ch && mask & model.linkBit(other) != 0) other,
+      op,
+      for (final other in linkedWith(state, ch)) {...op, 'ch': other},
+    ];
+  }
+
+  /// Channels that can become slaves of [master]: same group, not [master],
+  /// not a slave of another master and not a master themselves.
+  static List<String> linkCandidates(DeviceState state, String master) {
+    if (masterOf(state, master) != null) return const [];
+    return [
+      for (final other in state.model.groupOf(master))
+        if (other != master &&
+            (masterOf(state, other) ?? master) == master &&
+            slavesOf(state, other).isEmpty)
+          other,
+    ];
+  }
+
+  /// Ops that make [slaves] the slaves of [master] (replacing its previous
+  /// slaves); an empty list unlinks [master]. If [copySettings] is set, the
+  /// settings of the master are copied to newly linked slaves.
+  static List<Map<String, Object?>> linkSlaves(DeviceState state, String master, List<String> slaves,
+      {bool copySettings = true}) {
+    final model = state.model;
+    if (!model.hasChannel(master)) throw ArgumentError('Unknown channel $master');
+    final group = model.groupOf(master);
+    if (slaves.any((c) => !group.contains(c) || c == master)) {
+      throw ArgumentError('Only inputs or only outputs can be linked');
+    }
+    if (masterOf(state, master) != null) {
+      throw ArgumentError('$master is linked to ${masterOf(state, master)} and cannot be a master');
+    }
+    final candidates = linkCandidates(state, master);
+    final invalid = slaves.where((s) => !candidates.contains(s)).toList();
+    if (invalid.isNotEmpty) throw ArgumentError('${invalid.join(', ')} cannot be linked to $master');
+
+    final previous = slavesOf(state, master);
+    final mask = slaves.fold<int>(model.linkBit(master), (m, c) => m | model.linkBit(c));
+    return [
+      link(master, mask),
+      for (final s in {...previous, ...slaves})
+        if (_mask(state, s) != model.linkBit(s)) link(s, model.linkBit(s)),
+      if (copySettings)
+        for (final s in slaves)
+          if (!previous.contains(s)) ...copyChannel(state, master, s),
+    ];
+  }
+
+  /// Ops that remove [ch] from its link group (a slave leaves its master,
+  /// a master releases all its slaves).
+  static List<Map<String, Object?>> unlink(DeviceState state, String ch) {
+    final master = masterOf(state, ch);
+    if (master == null) return linkSlaves(state, ch, const [], copySettings: false);
+    final model = state.model;
+    return [
+      link(master, _mask(state, master) & ~model.linkBit(ch)),
+      // All slaves get their own bit only (also normalises symmetric masks
+      // of older versions, which would otherwise still point to [ch]).
+      for (final s in slavesOf(state, master))
+        if (_mask(state, s) != model.linkBit(s)) link(s, model.linkBit(s)),
     ];
   }
 
@@ -158,6 +240,7 @@ class DeviceOps {
       ],
       for (final ch in model.outputs) ...[
         matrixRoute(ch, state.matrixRouting[ch]!),
+        for (final input in model.inputs) matrixGain(ch, input, state.matrixGains['$ch:$input'] ?? 0),
         compressor(ch, state.compressors[ch]!),
         limiter(ch, state.limiters[ch]!),
       ],
@@ -204,6 +287,12 @@ class DeviceOps {
         final out = str('out');
         if (out == null || !model.isOutput(out)) return 'invalid output';
         if (!intIn('mask', 0, model.matrixMask)) return 'invalid input mask';
+      case 'matrixGain':
+        final out = str('out');
+        final input = str('in');
+        if (out == null || !model.isOutput(out)) return 'invalid output';
+        if (input == null || !model.isInput(input)) return 'invalid input';
+        if (!isNum('db')) return 'db must be a number';
       case 'geqBand':
         if (!isInput) return 'invalid GEQ channel';
         if (!intIn('band', 0, geqBandCount - 1)) return 'invalid band';
@@ -260,8 +349,15 @@ class DeviceOps {
         }
       case 'link':
         if (!hasChannel) return 'invalid channel';
-        if (!intIn('mask', 1, model.groupMask(ch)) || (op['mask'] as int) & model.linkBit(ch) == 0) {
+        // A slave may also be stored with an empty mask.
+        if (!intIn('mask', 0, model.groupMask(ch)) ||
+            (op['mask'] != 0 && (op['mask'] as int) & model.linkBit(ch) == 0)) {
           return 'invalid link mask';
+        }
+      case 'testTone':
+        if (!intIn('type', 0, ProtocolService.testToneTypeNames.length - 1) ||
+            !intIn('param', 0, maxTestToneParam)) {
+          return 'invalid test tone';
         }
       default:
         return 'unknown op ${op['op']}';
@@ -287,6 +383,9 @@ class DeviceOps {
         state.delays[ch!] = i('raw');
       case 'matrixRoute':
         state.matrixRouting[op['out'] as String] = i('mask');
+      case 'matrixGain':
+        state.matrixGains['${op['out']}:${op['in']}'] = _proto
+            .quantizeGain((op['db'] as num).toDouble().clamp(-60.0, ProtocolService.matrixGainMaxDb));
       case 'geqBand':
         state.geqBands[ch!]![i('band')] =
             _proto.quantizeGeqDb((op['db'] as num).toDouble().clamp(-12.0, 12.0));
@@ -325,6 +424,9 @@ class DeviceOps {
             (name == null || name.isEmpty) ? state.model.defaultDeviceName(ch) : name;
       case 'link':
         state.links[ch!] = i('mask');
+      case 'testTone':
+        state.testToneType = i('type');
+        state.testToneParam = i('param');
     }
   }
 
@@ -351,6 +453,14 @@ class DeviceOps {
       case 'matrixRoute':
         final out = op['out'] as String;
         return {'matrix:$out': [proto.buildMatrixRoutingCommand(out, state.matrixRouting[out]!)]};
+      case 'matrixGain':
+        final out = op['out'] as String;
+        final input = op['in'] as String;
+        return {
+          'mixgain:$out:$input': [
+            proto.buildMatrixGainCommand(out, input, state.matrixGains['$out:$input'] ?? 0),
+          ],
+        };
       case 'geqBand':
         final band = op['band'] as int;
         return {'geq:$ch:$band': [proto.buildGeqBandCommand(ch!, band, state.geqBands[ch]![band])]};
@@ -402,6 +512,8 @@ class DeviceOps {
         return {'name:$ch': [proto.buildChannelNameCommand(ch!, state.channelNames[ch]!)]};
       case 'link':
         return {'link:$ch': [proto.buildLinkCommand(ch!, state.links[ch]!)]};
+      case 'testTone':
+        return {'testTone': [proto.buildTestToneCommand(state.testToneType, state.testToneParam)]};
       default:
         return const {};
     }

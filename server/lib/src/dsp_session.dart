@@ -114,9 +114,9 @@ class DspSession {
       Duration(seconds: 10),
       Duration(seconds: 30),
     ],
-    this.meterInterval = const Duration(milliseconds: 50),
+    this.meterInterval = const Duration(milliseconds: 25),
   }) : _connector = connector ?? _defaultConnector {
-    state = _defaultState(_configuredModel ?? DeviceModel.dsp408);
+    state = DeviceState(_configuredModel ?? DeviceModel.dsp408);
     meters = List.filled(state.model.meterCount, 0.0);
   }
 
@@ -129,7 +129,12 @@ class DspSession {
   DspStatus status = DspStatus.disconnected;
   double progress = 0.0;
   String? message;
+  /// Linear meter levels (1.0 = full scale) in channel order.
   late List<double> meters;
+
+  /// Compressor/limiter status of the outputs from the last meter frame
+  /// (see KeepaliveMessage.dynamics).
+  int dynamics = 0;
   int packetsSent = 0;
   int packetsReceived = 0;
   bool logRx = false;
@@ -162,13 +167,6 @@ class DspSession {
   /// Model set explicitly in the configuration, or null for auto-detection.
   DeviceModel? get _configuredModel =>
       _config.model == 'auto' ? null : DeviceModel.byId(_config.model);
-
-  /// Default state with the values remembered by the server applied.
-  DeviceState _defaultState(DeviceModel model) {
-    final fresh = DeviceState(model);
-    _config.remembered.applyTo(fresh);
-    return fresh;
-  }
 
   ProtocolService get _proto => ProtocolService(model);
 
@@ -380,8 +378,9 @@ class DspSession {
       _addStatusLog('Device: $deviceName (${model.name})');
       // Collect preset names into a fresh state of the right model; it is
       // published after the config dump.
-      state = _defaultState(model)..deviceName = deviceName;
+      state = DeviceState(model)..deviceName = deviceName;
       meters = List.filled(model.meterCount, 0.0);
+      dynamics = 0;
 
       // The original editor sends these; their meaning is unknown and a
       // missing answer is not an error.
@@ -431,18 +430,19 @@ class DspSession {
     return [for (var i = 0; chunks.containsKey(i); i++) ...chunks[i]!];
   }
 
-  /// Decode [stream] into the state. Keeps preset names and device name,
-  /// and applies the values the server remembers.
+  /// Decode [stream] into the state. Keeps preset names and device name.
   void _applyDump(List<int> stream) {
     final result = ConfigDump(model).decode(stream);
     configReadable = result.isPlausible;
     final next = configReadable ? result.state : DeviceState(model);
     next.presets.addAll(state.presets);
     next.deviceName = state.deviceName;
-    _config.remembered.applyTo(next);
     state = next;
     if (configReadable) {
       _addStatusLog('Configuration read – active preset: ${state.currentPreset}');
+      if (!result.switchesRead) {
+        _addStatusLog('The dump ends before the mute and PEQ bypass bits – shown as off');
+      }
     } else {
       _addStatusLog('Configuration could not be decoded (${result.problems.length} implausible '
           'values, e.g. ${result.problems.take(3).join('; ')}) – showing defaults');
@@ -577,8 +577,9 @@ class DspSession {
     }
 
     switch (message) {
-      case KeepaliveMessage(:final meterLevels):
+      case KeepaliveMessage(:final meterLevels, :final dynamics):
         meters = meterLevels;
+        this.dynamics = dynamics;
         _scheduleMeters();
       case PresetMessage(:final index, :final name):
         state.presets[index] = name;
@@ -659,18 +660,16 @@ class DspSession {
       return status == DspStatus.busy ? 'DSP is busy' : 'DSP is not connected';
     }
 
-    // Linked channels get the same change. The DSP may mirror linked
-    // channels itself (0x3B), but that is not verified; sending the values
-    // explicitly is correct either way.
-    var remembered = false;
+    // Linked channels get the same change. The DSP probably mirrors linked
+    // channels itself (the original editor sends a change only once), but
+    // that is not verified; sending the values explicitly is correct either
+    // way.
     for (final expanded in DeviceOps.expandLinked(state, op)) {
       DeviceOps.apply(state, expanded);
       // A newer value for a key replaces the queued one but keeps its place.
       DeviceOps.commands(state, expanded).forEach((key, frames) => _pendingOps[key] = frames);
       _events.add(OpApplied(expanded, origin));
-      remembered |= _config.remembered.record(state, expanded);
     }
-    if (remembered) _events.add(const ConfigChanged());
     _pump();
     return null;
   }
@@ -697,12 +696,10 @@ class DspSession {
             }
           }
         }
-        _config.remembered.record(state, op);
         steps.next();
       }
       state.currentPreset = label;
       _events.add(const StateReplaced());
-      _events.add(const ConfigChanged());
       _addStatusLog('Server preset "$label" loaded (${ops.length} settings)');
     }));
     return null;

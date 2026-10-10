@@ -153,7 +153,11 @@ void main() {
     a.send({'t': Msg.op, 'dsp': id, 'op': DeviceOps.gain('Out 3', -12)});
     final op = await b.waitFor((m) => m['t'] == Msg.op);
     expect(op['op'], DeviceOps.gain('Out 3', -12));
-    await b.waitFor((m) => m['t'] == Msg.meters);
+    final meters = await b.waitFor((m) => m['t'] == Msg.meters);
+    // dBFS per channel plus the compressor/limiter status word
+    expect((meters['v'] as List).length, 12);
+    expect((meters['v'] as List).every((v) => (v as num) <= 0 && v >= ProtocolService.silenceDb), isTrue);
+    expect(meters['dyn'], 0);
     await Future<void>.delayed(const Duration(milliseconds: 100));
     expect(a.ofType(Msg.op), isEmpty, reason: 'sender does not get its own op back');
     expect(fake.receivedSetCommands, contains('SET GAIN Out 3 → -12.0 dB'));
@@ -164,14 +168,15 @@ void main() {
     await a.waitFor((m) => m['t'] == Msg.error);
     await a.waitFor((_) => a.ofType(Msg.state).length > statesBefore);
 
-    // Channel names go to the device; values the dump does not contain
-    // (mute) are remembered by the server.
+    // Channel names, mutes and crossing gains go to the device.
     a.send({'t': Msg.op, 'dsp': id, 'op': DeviceOps.channelName('In A', 'Vocals')});
     a.send({'t': Msg.op, 'dsp': id, 'op': DeviceOps.mute('Out 2', true)});
+    a.send({'t': Msg.op, 'dsp': id, 'op': DeviceOps.matrixGain('Out 2', 'In D', -20)});
     await Future<void>.delayed(const Duration(milliseconds: 700));
     expect(fake.state.channelNames['In A'], 'Vocals');
+    expect(fake.state.mutes['Out 2'], isTrue);
+    expect(fake.state.matrixGains['Out 2:In D'], -20.0);
     final saved = DeviceRegistry(File('${dataDir.path}/devices.json')).load();
-    expect(saved.single.remembered.mutes['Out 2'], isTrue);
     expect(saved.single.port, fake.port);
     expect(saved.single.model, 'auto');
 

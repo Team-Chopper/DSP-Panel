@@ -16,6 +16,7 @@
 // in this repository use the same scales (see TODO.md for what is open).
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'device_model.dart';
 
@@ -76,11 +77,15 @@ class PresetCountMessage extends ProtocolMessage {
 
 /// Keepalive/meter message (cmd 0x40 response with one level per channel)
 class KeepaliveMessage extends ProtocolMessage {
-  /// Meter levels as linear float values, in the model's channel order
-  /// (inputs, then outputs).
+  /// Meter levels as linear amplitudes (1.0 = full scale), in the model's
+  /// channel order (inputs, then outputs).
   final List<double> meterLevels;
 
-  KeepaliveMessage(this.meterLevels, List<int> rawData)
+  /// Status word after the meter slots: bit n = compressor of output n
+  /// working, bit 8 + n = limiter of output n working.
+  final int dynamics;
+
+  KeepaliveMessage(this.meterLevels, List<int> rawData, {this.dynamics = 0})
       : super(MessageType.keepalive, rawData);
 }
 
@@ -95,51 +100,73 @@ class ProtocolService {
 
   const ProtocolService([this.model = DeviceModel.dsp408]);
 
-  // ─── Framing ───
+  // ─── Meters ───
 
-  /// Decode IEEE 754 half-precision (float16) from 2 bytes in little-endian
-  static double decodeFloat16(int low, int high) {
-    final value = low | (high << 8);
-    final sign = (value >> 15) & 1;
-    final exponent = (value >> 10) & 0x1F;
-    final mantissa = value & 0x3FF;
-
-    double result;
-    if (exponent == 0) {
-      // Subnormal
-      result = (mantissa / 1024.0) * (1.0 / 16384.0); // 2^-14
-    } else if (exponent == 31) {
-      // Inf/NaN
-      result = mantissa == 0 ? double.infinity : double.nan;
-    } else {
-      result = (1.0 + mantissa / 1024.0) * _pow2(exponent - 15);
-    }
-    return sign == 1 ? -result : result;
+  /// A meter slot holds the upper three bytes of an IEEE 754 float32:
+  /// `bits = d1 << 24 | d0 << 16 | d2 << 8` (read like this by the original
+  /// editor, which shows 20·log10 of it). Read as float16, `d0 d1` gave the
+  /// old "0.5 … 2.0" scale; 1.0 is full scale.
+  static double decodeMeterValue(int d0, int d1, int d2) {
+    final bits = (d1 << 24) | (d0 << 16) | (d2 << 8);
+    final value = (ByteData(4)..setUint32(0, bits)).getFloat32(0);
+    // The DSP answers 0xFF 0xFF (NaN) for channels during PEQ recalculation.
+    return value.isFinite ? value.abs() : 0.0;
   }
 
-  static double _pow2(int exp) {
-    if (exp >= 0) {
-      return (1 << exp).toDouble();
-    } else {
-      return 1.0 / (1 << -exp).toDouble();
-    }
-  }
+  /// Level in dBFS of a linear meter value, at least [silenceDb].
+  static double levelToDb(double level) =>
+      level <= 1e-6 ? silenceDb : math.max(silenceDb, 20 * math.log(level) / math.ln10);
+
+  /// Meter level shown for silence.
+  static const double silenceDb = -120.0;
 
   /// Parse [count] channel meter levels from a keepalive response frame.
-  /// Each channel is 3 bytes: [float16_low, float16_high, peak_byte]
+  /// Each channel is 3 bytes, see [decodeMeterValue].
   static List<double> parseMeterLevels(List<int> data, int count) {
     // Data starts at byte 6 (after 10 02 01 00 LEN 40)
     if (data.length < 6 + count * 3) return List.filled(count, 0.0); // too short
 
-    return [
-      for (int ch = 0; ch < count; ch++)
-        () {
-          final linear = decodeFloat16(data[6 + ch * 3], data[7 + ch * 3]);
-          // DSP returns 0xFF 0xFF (NaN) for channels during PEQ recalculation
-          return linear.isFinite ? linear : 0.0;
-        }(),
-    ];
+    return [for (int ch = 0; ch < count; ch++) _meterAt(data, ch)];
   }
+
+  static double _meterAt(List<int> data, int slot) =>
+      decodeMeterValue(data[6 + slot * 3], data[7 + slot * 3], data[8 + slot * 3]);
+
+  /// Status word (u16 LE) after the meter slots of a 0x40 response, or 0.
+  static int parseDynamics(List<int> data) {
+    if (data.length < 6) return 0;
+    final footer = (5 + data[4]).clamp(6, data.length);
+    final at = 6 + (footer - 6) ~/ 3 * 3;
+    return at + 2 <= footer ? data[at] | (data[at + 1] << 8) : 0;
+  }
+
+  /// The compressor of the output with index [output] reduces the gain.
+  static bool compressorActive(int dynamics, int output) => dynamics & (1 << output) != 0;
+
+  /// The limiter of the output with index [output] reduces the gain.
+  static bool limiterActive(int dynamics, int output) => dynamics & (0x100 << output) != 0;
+
+  /// Meter levels of [model] in channel order (inputs, then outputs).
+  ///
+  /// The 0x40 response of the DSP 408 has 12 slots: In A–D, then Out 1–8.
+  /// The DSP 206 answers with the same layout: its outputs start at slot 4
+  /// (slots 2 and 3 are unused), seen on hardware as Out 1 being shown at
+  /// Out 3. Shorter frames are read without the gap.
+  static List<double> parseModelMeters(List<int> data, DeviceModel model) {
+    if (data.length < 6) return List.filled(model.meterCount, 0.0);
+    final footer = data.length >= 5 ? 5 + data[4] : data.length;
+    final slots = ((footer.clamp(6, data.length) - 6) ~/ 3);
+    const outputSlot = 4;
+    if (model.inputs.length < outputSlot && slots >= outputSlot + model.outputs.length) {
+      return [
+        for (var i = 0; i < model.inputs.length; i++) _meterAt(data, i),
+        for (var o = 0; o < model.outputs.length; o++) _meterAt(data, outputSlot + o),
+      ];
+    }
+    return parseMeterLevels(data, model.meterCount);
+  }
+
+  // ─── Framing ───
 
   /// Calculate checksum for the DSP protocol
   static int calculateChecksum(Iterable<int> dataBytes) {
@@ -335,6 +362,19 @@ class ProtocolService {
     return buildFrame(0x3a, [ch, inputBitmask & model.matrixMask]);
   }
 
+  /// Highest matrix crossing gain (the original editor allows −60 … 0 dB).
+  static const double matrixGainMaxDb = 0.0;
+
+  /// Matrix crossing gain (0x41): `output input_index value(2B LE)`, value
+  /// encoded like the channel gain (found in the original editor).
+  List<int> buildMatrixGainCommand(String output, String input, double dB) {
+    final ch = _requireChannel(output, outputsOnly: true);
+    final index = model.inputs.indexOf(input);
+    if (index < 0) throw ArgumentError('Invalid input for ${model.name}: $input');
+    final value = gainDbToValue(quantizeGain(math.min(dB, matrixGainMaxDb)));
+    return buildFrame(0x41, [ch, index, ..._u16(value)]);
+  }
+
   /// PEQ band (0x33):
   /// `ch band gain(2B LE) freq(2B LE) Q type bypass`
   List<int> buildPeqBandCommand(String channel, int band, {
@@ -416,6 +456,16 @@ class ProtocolService {
     return buildFrame(0x3B, [ch, mask & 0xFF]);
   }
 
+  /// Signal generator types of the test tone command (index = type byte).
+  static const testToneTypeNames = ['Off', 'Pink noise', 'White noise', 'Sine'];
+
+  /// Test tone (0x39): `type param` — type 0 = off, 1 = pink noise,
+  /// 2 = white noise, 3 = sine with param = frequency index. From a capture
+  /// of the original editor (FlexiFlizz), not verified on a device; the
+  /// frequency index is assumed to count the ISO 1/3-octave frequencies
+  /// (0 = 20 Hz … 30 = 20 kHz).
+  List<int> buildTestToneCommand(int type, int param) => buildFrame(0x39, [type & 0xFF, param & 0xFF]);
+
   /// Channel name (0x3D): `ch name(8 ASCII, zero-padded)`
   List<int> buildChannelNameCommand(String channel, String name) {
     final ch = _requireChannel(channel);
@@ -483,8 +533,8 @@ class ProtocolService {
 
       // Keepalive / meter response
       if (cmdByte == 0x40) {
-        final levels = parseMeterLevels(data, model.meterCount);
-        return KeepaliveMessage(levels, data);
+        final levels = parseModelMeters(data, model);
+        return KeepaliveMessage(levels, data, dynamics: parseDynamics(data));
       }
 
       // Device info: the whole payload after the command byte

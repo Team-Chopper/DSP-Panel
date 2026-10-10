@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:dsp_core/dsp_core.dart';
 import 'package:dsp_core/testing.dart';
@@ -96,7 +97,8 @@ class FakeDsp {
       ];
 
   static bool _isSetCommand(int cmd) => const {
-        0x20, 0x21, 0x26, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x3a, 0x3b, 0x3d, 0x3e, 0x3f, 0x48,
+        0x20, 0x21, 0x26, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x3a, 0x3b, 0x3d, 0x3e, 0x3f, 0x41,
+        0x48,
       }.contains(cmd);
 
   void _accept(Socket socket) {
@@ -170,6 +172,8 @@ class FakeDsp {
         state.delays[c] = u16(1);
       case 0x3a when c != null:
         state.matrixRouting[c] = a[1];
+      case 0x41 when c != null && a.length >= 4 && a[1] < model.inputs.length:
+        state.matrixGains['$c:${model.inputs[a[1]]}'] = _proto.gainValueToDb(u16(2));
       case 0x48 when c != null && state.geqBands.containsKey(c):
         state.geqBands[c]![a[1]] = _proto.geqValueToDb(u16(2));
       case 0x33 when c != null:
@@ -224,27 +228,39 @@ class FakeDsp {
   List<int> _meterPayload() {
     final t = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final payload = <int>[];
-    final channels = model.channels;
+    var dynamics = 0;
+    // Like the hardware, both models answer with 12 slots: four input slots
+    // (unused ones are zero on the DSP 206), then the outputs.
+    final channels = [
+      for (var i = 0; i < 4; i++) i < model.inputs.length ? model.inputs[i] : null,
+      for (var o = 0; o < 8; o++) o < model.outputs.length ? model.outputs[o] : null,
+    ];
     for (var i = 0; i < channels.length; i++) {
       final ch = channels[i];
-      // Slowly pulsing levels with a little noise, different per channel;
-      // muted channels and channels far below 0 dB stay quiet.
-      var level = (0.4 + 0.35 * sin(t * (0.7 + i * 0.13) + i) + _random.nextDouble() * 0.1)
-          .clamp(0.0, 1.6) * pow(10, (state.gains[ch] ?? 0) / 20);
-      if (state.mutes[ch] == true) level = 0;
-      final half = _toFloat16(level.toDouble());
-      payload.addAll([half & 0xFF, half >> 8, 0x00]);
+      if (ch == null) {
+        payload.addAll([0, 0, 0]);
+        continue;
+      }
+      // Slowly pulsing levels (about -40 … -6 dBFS) with a little noise,
+      // different per channel, shifted by the channel gain; muted channels
+      // stay quiet.
+      final db = -23 + 15 * sin(t * (0.7 + i * 0.13) + i) + _random.nextDouble() * 3 + (state.gains[ch] ?? 0);
+      final level = state.mutes[ch] == true ? 0.0 : pow(10, db / 20).toDouble();
+      payload.addAll(_meterBytes(level));
+      final o = model.outputs.indexOf(ch);
+      if (o >= 0 && level > 0) {
+        final comp = state.compressors[ch]!;
+        if (comp.ratio != 0 && db > ProtocolService.thresholdRawToDb(comp.threshold)) dynamics |= 1 << o;
+        if (db > ProtocolService.thresholdRawToDb(state.limiters[ch]!.threshold)) dynamics |= 0x100 << o;
+      }
     }
-    return [...payload, 0x00, 0x00];
+    return [...payload, dynamics & 0xFF, dynamics >> 8];
   }
 
-  /// Encode a non-negative double as IEEE 754 half precision.
-  static int _toFloat16(double value) {
-    if (value <= 0) return 0;
-    var exponent = (log(value) / ln2).floor();
-    if (exponent < -14) return 0;
-    if (exponent > 15) return 0x7BFF;
-    final mantissa = ((value / pow(2, exponent) - 1.0) * 1024).round().clamp(0, 1023);
-    return ((exponent + 15) << 10) | mantissa;
+  /// The upper three bytes of [level] as float32, in the order the DSP
+  /// sends them (see ProtocolService.decodeMeterValue).
+  static List<int> _meterBytes(double level) {
+    final bits = (ByteData(4)..setFloat32(0, level)).getUint32(0);
+    return [(bits >> 16) & 0xFF, bits >> 24, (bits >> 8) & 0xFF];
   }
 }

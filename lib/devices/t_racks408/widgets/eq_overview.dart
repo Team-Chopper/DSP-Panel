@@ -50,6 +50,8 @@ class EqGroupGraph extends StatelessWidget {
       for (var i = 0; i < channels.length; i++)
         if (!hidden.contains(channels[i])) i,
     ];
+    // Settings read once per build, not for every point of every curve.
+    final eqs = {for (final i in visible) i: ChannelEq.of(device, channels[i])};
     return PanelCard(
       title: '$title · EQ',
       accent: accent,
@@ -65,7 +67,7 @@ class EqGroupGraph extends StatelessWidget {
                   String? best;
                   var bestDistance = double.infinity;
                   for (final i in visible) {
-                    final y = _dbToY(channelResponseDb(device, channels[i], hz), size.height);
+                    final y = _dbToY(eqs[i]!.db(hz), size.height);
                     final distance = (y - d.localPosition.dy).abs();
                     if (distance < bestDistance) {
                       bestDistance = distance;
@@ -78,7 +80,7 @@ class EqGroupGraph extends StatelessWidget {
                   size: size,
                   painter: _OverviewPainter(
                     curves: [
-                      for (final i in visible) (curveColor(i), (double hz) => channelResponseDb(device, channels[i], hz)),
+                      for (final i in visible) (curveColor(i), eqs[i]!.db),
                     ],
                   ),
                 ),

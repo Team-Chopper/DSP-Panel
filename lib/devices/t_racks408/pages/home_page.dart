@@ -23,7 +23,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  static const _groupGap = 20.0;
+  /// Gap between the four blocks (EQ and faders of inputs and outputs),
+  /// the same horizontally and vertically.
+  static const _groupGap = 12.0;
   static const _pagePadding = 12.0;
   static const _minFaderWidth = 84.0;
   static const _maxFaderWidth = 200.0;
@@ -103,7 +105,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: _groupGap),
                   Expanded(
                     child: pair(
                       FaderGroup(device: device, title: 'Inputs', color: AppColors.input, channels: inputs),
