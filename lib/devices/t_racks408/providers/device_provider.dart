@@ -52,11 +52,31 @@ class DeviceProvider extends ChangeNotifier {
   List<String> get inputs => model.inputs;
   List<String> get outputs => model.outputs;
 
+  /// A server preset in the offline editor (no device): linking and
+  /// copying change the state directly instead of running on the device.
+  bool get offline => dspId.startsWith(Msg.presetPrefix);
+
   // ─── Getters ───
 
   Map<int, String> get presets => Map.unmodifiable(_state.presets);
   String get currentPreset => _state.currentPreset;
   String get deviceName => _state.deviceName;
+
+  /// Used user preset slots (0-based) reported by the DSP; empty if unknown.
+  Set<int> get presetSlots => Set.unmodifiable(_state.presetSlots);
+
+  /// Current preset number reported by the DSP (n = Un, 0 = none), -1 if
+  /// unknown.
+  int get currentPresetNumber => _state.currentPresetNumber;
+
+  /// Whole PEQ of a channel bypassed (0x3C).
+  bool getEqBypass(String channel) => _state.eqBypass[channel] ?? false;
+
+  /// GEQ of an input bypassed (0x49).
+  bool getGeqBypass(String channel) => _state.geqBypass[channel] ?? false;
+
+  /// Delay display unit stored on the DSP: 0 = ms, 1 = m, 2 = ft.
+  int get delayUnit => _state.delayUnit;
 
   double getInputGain(String channel) => _state.gains[channel] ?? 0;
   double getOutputGain(String channel) => _state.gains[channel] ?? 0;
@@ -125,14 +145,20 @@ class DeviceProvider extends ChangeNotifier {
   void _change(String key, Map<String, Object?> op) {
     if (!_isReady()) return;
     if (DeviceOps.validate(op, model) != null) return;
-    // Linked channels follow locally right away; the server does the same
-    // expansion, so only the original op is sent.
+    // Linked channels follow locally right away (by the original editor's
+    // rule); the server does the same, so only the original op is sent.
     for (final expanded in DeviceOps.expandLinked(_state, op)) {
       DeviceOps.apply(_state, expanded);
     }
     notifyListeners();
     _outgoing[key] = op;
     _flushTimer ??= Timer(const Duration(milliseconds: 30), _flush);
+  }
+
+  /// Send queued changes now (before a link or copy job on the server).
+  void _flushNow() {
+    _flushTimer?.cancel();
+    _flush();
   }
 
   /// Key under which an op is coalesced before sending.
@@ -153,12 +179,20 @@ class DeviceProvider extends ChangeNotifier {
   /// Channels that can become slaves of [master].
   List<String> linkCandidates(String master) => DeviceOps.linkCandidates(_state, master);
 
-  /// Make [slaves] the slaves of [master] (empty = unlink its slaves);
-  /// newly linked slaves get the master's settings if [copySettings] is set.
-  void setLinkSlaves(String master, List<String> slaves, {bool copySettings = true}) {
-    for (final op in DeviceOps.linkSlaves(_state, master, slaves, copySettings: copySettings)) {
-      _change(_keyFor(op), op);
+  /// Make [slaves] the slaves of [master] (empty = unlink its slaves), like
+  /// the original editor: newly linked slaves get the master's settings.
+  /// On a DSP the server copies on the device (0x2A), sets the master's
+  /// mask (0x3B) and reads everything back.
+  void setLinkSlaves(String master, List<String> slaves) {
+    if (!_isReady()) return;
+    if (offline) {
+      for (final op in DeviceOps.linkSlaves(_state, master, slaves)) {
+        _change(_keyFor(op), op);
+      }
+      return;
     }
+    _flushNow();
+    _send({'t': Msg.link, 'dsp': dspId, 'master': master, 'slaves': slaves});
   }
 
   /// Set a raw link mask (used to lift a link for a measurement and restore
@@ -176,18 +210,24 @@ class DeviceProvider extends ChangeNotifier {
 
   /// Remove [channel] from its link group.
   void unlink(String channel) {
-    for (final op in DeviceOps.unlink(_state, channel)) {
-      _change(_keyFor(op), op);
-    }
+    final target = DeviceOps.unlinkTarget(_state, channel);
+    setLinkSlaves(target.master, target.slaves);
   }
 
-  /// Copy the settings of [from] to each of [targets] (same group).
+  /// Copy the settings of [from] to each of [targets] (same group). On a
+  /// DSP the device copies (0x2A) and the server reads the result back.
   void copyChannel(String from, List<String> targets) {
-    for (final to in targets) {
-      for (final op in DeviceOps.copyChannel(_state, from, to)) {
-        _change(_keyFor(op), op);
+    if (!_isReady()) return;
+    if (offline) {
+      for (final to in targets) {
+        for (final op in DeviceOps.copyChannel(_state, from, to)) {
+          _change(_keyFor(op), op);
+        }
       }
+      return;
     }
+    _flushNow();
+    _send({'t': Msg.copy, 'dsp': dspId, 'from': from, 'to': targets});
   }
 
   void _flush() {
@@ -251,11 +291,27 @@ class DeviceProvider extends ChangeNotifier {
     final b = bands[band].copy();
     if (gainDb != null) b.gainDb = gainDb.clamp(-12.0, 12.0);
     if (freqRaw != null) b.freqRaw = freqRaw.clamp(0, ProtocolService.freqRawMax);
-    if (qRaw != null) b.qRaw = qRaw.clamp(0, ProtocolService.qRawMax);
-    if (type != null) b.type = type;
+    if (qRaw != null) b.qRaw = qRaw;
+    if (type != null && type != b.type) {
+      b.type = type;
+      // Like the original editor: shelves and PEQ low/high-pass types start
+      // at Q 0.71.
+      if (ProtocolService.maxQRawForType(type) < ProtocolService.qRawMax) b.qRaw = ProtocolService.qRawTypeReset;
+    }
+    // Shelves and PEQ low/high-pass types go up to Q 3 only.
+    b.qRaw = b.qRaw.clamp(0, ProtocolService.maxQRawForType(b.type));
     if (bypass != null) b.bypass = bypass;
     _change('peq:$channel:$band', DeviceOps.peqBand(channel, band, b));
   }
+
+  /// Bypass the whole PEQ of a channel (0x3C).
+  void setEqBypass(String channel, bool on) => _change('eqBypass:$channel', DeviceOps.eqBypass(channel, on));
+
+  /// Bypass the GEQ of an input (0x49).
+  void setGeqBypass(String channel, bool on) => _change('geqBypass:$channel', DeviceOps.geqBypass(channel, on));
+
+  /// Delay display unit stored on the DSP (0x15): 0 = ms, 1 = m, 2 = ft.
+  void setDelayUnit(int unit) => _change('delayUnit', DeviceOps.delayUnit(unit));
 
   /// Set Hi Pass filter. [enabled] switches between bypass and the last
   /// active slope.
@@ -305,22 +361,24 @@ class DeviceProvider extends ChangeNotifier {
     }
   }
 
-  /// Signal generator of the DSP: type (0 = off, 1 = pink, 2 = white,
-  /// 3 = sine) and the sine frequency index.
+  /// Signal generator of the DSP: type (0 = analog input, i.e. off,
+  /// 1 = pink, 2 = white, 3 = sine) and the sine frequency index.
   int get testToneType => _state.testToneType;
   int get testToneParam => _state.testToneParam;
 
   void setTestTone(int type, [int? param]) =>
       _change('testTone', DeviceOps.testTone(type, param ?? _state.testToneParam));
 
+  // Values are kept in the original editor's ranges (older versions
+  // allowed longer times).
   void setGate(String channel, GateState gate) =>
-      _change('gate:$channel', DeviceOps.gate(channel, gate));
+      _change('gate:$channel', DeviceOps.gate(channel, DeviceOps.clampGate(gate)));
 
   void setCompressor(String channel, CompressorState compressor) =>
-      _change('comp:$channel', DeviceOps.compressor(channel, compressor));
+      _change('comp:$channel', DeviceOps.compressor(channel, DeviceOps.clampCompressor(compressor)));
 
   void setLimiter(String channel, LimiterState limiter) =>
-      _change('limit:$channel', DeviceOps.limiter(channel, limiter));
+      _change('limit:$channel', DeviceOps.limiter(channel, DeviceOps.clampLimiter(limiter)));
 
   /// Names are stored on the device: at most 8 ASCII characters.
   Future<void> loadAliases() async {}
@@ -400,10 +458,19 @@ class DeviceProvider extends ChangeNotifier {
       }
       // Indicators stay lit for a moment.
       if (db >= clipDb) _clipUntil[ch] = now.add(_indicatorHold);
+      // Like the original editor: the compressor LED only for a ratio other
+      // than 1:1, the limiter LED only for a threshold below +20 dB.
       final output = model.outputs.indexOf(ch);
       if (output >= 0) {
-        if (ProtocolService.compressorActive(dynamics, output)) _compUntil[ch] = now.add(_indicatorHold);
-        if (ProtocolService.limiterActive(dynamics, output)) _limitUntil[ch] = now.add(_indicatorHold);
+        final comp = _state.compressors[ch], limiter = _state.limiters[ch];
+        if (ProtocolService.compressorActive(dynamics, output) && comp != null && comp.ratio != 0) {
+          _compUntil[ch] = now.add(_indicatorHold);
+        }
+        if (ProtocolService.limiterActive(dynamics, output) &&
+            limiter != null &&
+            limiter.threshold < ProtocolService.thresholdRawMax) {
+          _limitUntil[ch] = now.add(_indicatorHold);
+        }
       }
       // Compare with what was shown last time, so an indicator that times
       // out between two frames goes dark.
@@ -429,8 +496,8 @@ class DeviceProvider extends ChangeNotifier {
   }
 
   /// Notifies when meter levels or indicators change. Kept apart from the
-  /// provider itself so meter updates (every 25–40 ms) only repaint the
-  /// meters, not whole pages with their EQ curves.
+  /// provider itself so meter updates (every 300 ms by default, faster if
+  /// set) only repaint the meters, not whole pages with their EQ curves.
   final MeterNotifier meters = MeterNotifier();
 
   final Set<String> _shownClip = {};

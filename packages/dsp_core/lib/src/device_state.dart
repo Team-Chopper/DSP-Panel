@@ -14,7 +14,7 @@ import 'device_model.dart';
 /// State for a single PEQ band
 class PeqBand {
   int freqRaw;   // 0-300, 20 Hz – 20 kHz
-  int qRaw;      // 0-100, Q 0.4 – 126
+  int qRaw;      // 0-100, Q 0.4 – 128
   double gainDb;  // -12.0 to +12.0 dB
   int type;      // 0-8 (Peak, Low Shelf, etc.)
   bool bypass;
@@ -132,26 +132,25 @@ class CompressorState {
   );
 }
 
-/// Limiter of an output. Raw protocol values like [CompressorState];
-/// [unknown] is a parameter whose meaning is not known yet (always 0).
+/// Limiter of an output. Raw protocol values like [CompressorState]; the
+/// knee (0 … 12 dB) is hidden in the original editor's UI.
 class LimiterState {
   int attack;
   int release;
-  int unknown;
+  int knee;
   int threshold;
 
-  LimiterState({this.attack = 49, this.release = 499, this.unknown = 0, this.threshold = 220});
+  LimiterState({this.attack = 49, this.release = 499, this.knee = 0, this.threshold = 220});
 
-  LimiterState copy() =>
-      LimiterState(attack: attack, release: release, unknown: unknown, threshold: threshold);
+  LimiterState copy() => LimiterState(attack: attack, release: release, knee: knee, threshold: threshold);
 
-  Map<String, Object?> toJson() =>
-      {'attack': attack, 'release': release, 'unknown': unknown, 'threshold': threshold};
+  Map<String, Object?> toJson() => {'attack': attack, 'release': release, 'knee': knee, 'threshold': threshold};
 
+  /// Older versions stored the knee as "unknown".
   factory LimiterState.fromJson(Map<String, Object?> json) => LimiterState(
     attack: (json['attack'] as num).toInt(),
     release: (json['release'] as num).toInt(),
-    unknown: (json['unknown'] as num).toInt(),
+    knee: ((json['knee'] ?? json['unknown'] ?? 0) as num).toInt(),
     threshold: (json['threshold'] as num).toInt(),
   );
 }
@@ -198,11 +197,29 @@ class DeviceState {
   /// its own bit and the bits of its slaves, a slave only its own bit.
   final Map<String, int> links;
 
-  /// Signal generator of the DSP (cmd 0x39): type (0 = off, 1 = pink,
-  /// 2 = white, 3 = sine) and parameter (sine frequency index). Not part of
-  /// the config dump: it is what the panel last set.
+  /// Whole PEQ of a channel bypassed (cmd 0x3C).
+  final Map<String, bool> eqBypass;
+
+  /// GEQ of an input bypassed (cmd 0x49).
+  final Map<String, bool> geqBypass;
+
+  /// Signal generator of the DSP (cmd 0x39, kept in the config dump): type
+  /// (0 = analog input, i.e. off, 1 = pink, 2 = white, 3 = sine) and
+  /// parameter (sine frequency index).
   int testToneType = 0;
   int testToneParam = 0;
+
+  /// Delay display unit stored on the device (cmd 0x15): 0 = ms, 1 = m,
+  /// 2 = ft.
+  int delayUnit = 0;
+
+  /// Used user preset slots by 0-based index (answer to 0x22); empty if
+  /// the device did not answer.
+  final Set<int> presetSlots = {};
+
+  /// Current preset number reported by the device (0x14; 0 = none/factory,
+  /// n = Un), or -1 if unknown.
+  int currentPresetNumber = -1;
 
   DeviceState._(
     this.model, {
@@ -224,6 +241,8 @@ class DeviceState {
     required this.limiters,
     required this.channelNames,
     required this.links,
+    required this.eqBypass,
+    required this.geqBypass,
   });
 
   /// Default state of [model] before anything has been read from the device.
@@ -261,6 +280,8 @@ class DeviceState {
         for (var i = 0; i < model.inputs.length; i++) model.inputs[i]: 1 << i,
         for (var i = 0; i < model.outputs.length; i++) model.outputs[i]: 1 << i,
       },
+      eqBypass: {for (final ch in channels) ch: false},
+      geqBypass: {for (final ch in model.inputs) ch: false},
     );
   }
 
@@ -287,7 +308,12 @@ class DeviceState {
     'limiters': {for (final e in limiters.entries) e.key: e.value.toJson()},
     'channelNames': channelNames,
     'links': links,
+    'eqBypass': eqBypass,
+    'geqBypass': geqBypass,
     'testTone': [testToneType, testToneParam],
+    'delayUnit': delayUnit,
+    'presetSlots': [...presetSlots]..sort(),
+    'currentPresetNumber': currentPresetNumber,
   };
 
   factory DeviceState.fromJson(Map<String, Object?> json) {
@@ -316,11 +342,16 @@ class DeviceState {
     map('limiters').forEach((k, v) => state.limiters[k] = LimiterState.fromJson(obj(v)));
     map('channelNames').forEach((k, v) => state.channelNames[k] = v as String);
     map('links').forEach((k, v) => state.links[k] = (v as num).toInt());
+    map('eqBypass').forEach((k, v) => state.eqBypass[k] = v as bool);
+    map('geqBypass').forEach((k, v) => state.geqBypass[k] = v as bool);
     final tone = json['testTone'];
     if (tone is List && tone.length == 2) {
       state.testToneType = (tone[0] as num).toInt();
       state.testToneParam = (tone[1] as num).toInt();
     }
+    state.delayUnit = (json['delayUnit'] as num? ?? 0).toInt();
+    state.presetSlots.addAll([for (final i in (json['presetSlots'] as List? ?? const [])) (i as num).toInt()]);
+    state.currentPresetNumber = (json['currentPresetNumber'] as num? ?? -1).toInt();
     return state;
   }
 }

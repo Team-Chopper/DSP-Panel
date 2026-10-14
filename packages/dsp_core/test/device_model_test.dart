@@ -2,11 +2,14 @@ import 'package:dsp_core/dsp_core.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('detects the model from the device info', () {
+  test('detects the model from the device info like the original editor', () {
     expect(DeviceModel.detect('DSP408 V0104P'), DeviceModel.dsp408);
-    expect(DeviceModel.detect('DSP 206 V0104P'), DeviceModel.dsp206);
-    expect(DeviceModel.detect('dsp-206'), DeviceModel.dsp206);
-    expect(DeviceModel.detect('Something else'), isNull);
+    expect(DeviceModel.detect('DSP206 V0102'), DeviceModel.dsp206);
+    expect(DeviceModel.detect('DSP 206 V0104P'), isNull, reason: 'the answer must start with "DSP206"');
+    expect(DeviceModel.detect('Something 408'), isNull);
+    expect(DeviceModel.dsp408.supportsVersion('DSP408 V0104P'), isTrue);
+    expect(DeviceModel.dsp408.supportsVersion('DSP408 V0201'), isFalse);
+    expect(DeviceModel.dsp206.supportsVersion('DSP408 V0104P'), isFalse);
   });
 
   test('channel bytes', () {

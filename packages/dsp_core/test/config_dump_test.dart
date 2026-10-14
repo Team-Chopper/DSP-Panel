@@ -73,6 +73,44 @@ void main() {
       });
     }
 
+    for (final dump in [dump408, dump206]) {
+      test('${dump.model.name}: test tone, delay unit, EQ and GEQ bypass at the end of the dump', () {
+        final model = dump.model;
+        final state = DeviceState(model)
+          ..testToneType = 3
+          ..testToneParam = 17
+          ..delayUnit = 2
+          ..eqBypass[model.inputs.last] = true
+          ..eqBypass[model.outputs.last] = true
+          ..geqBypass['In B'] = true;
+        state.limiters[model.outputs.first] = LimiterState(knee: 6);
+        final stream = dump.encode(state);
+        int u16(int at) => stream[at] | (stream[at + 1] << 8);
+        final base = dump.switchesLength;
+        expect(base, model == DeviceModel.dsp408 ? 0x59C : 0x394);
+        expect([u16(base), u16(base + 2), u16(base + 4)], [3, 17, 2]);
+        expect(u16(base + 6), 1 << (model.inputs.length - 1), reason: 'EQ bypass of the inputs');
+        expect(u16(base + 8), 1 << (model.outputs.length - 1), reason: 'EQ bypass of the outputs');
+        expect(u16(base + 10), 0x02, reason: 'GEQ bypass of In B');
+        final decoded = dump.decode(stream);
+        expect(decoded.restRead, isTrue);
+        expect(decoded.state.toJson(), state.toJson());
+      });
+    }
+
+    test('times of older panel versions are limited to the original ranges, knee above 12 is rejected', () {
+      final state = DeviceState(DeviceModel.dsp206);
+      state.gates['In A'] = GateState(attack: 2998, release: 2998, hold: 2998);
+      state.compressors['Out 1'] = CompressorState(attack: 4999, release: 4999);
+      final decoded = dump206.decode(dump206.encode(state));
+      expect(decoded.problems, isEmpty);
+      expect(decoded.state.gates['In A']!.toJson(), {'attack': 998, 'release': 2998, 'hold': 998, 'threshold': 0});
+      expect([decoded.state.compressors['Out 1']!.attack, decoded.state.compressors['Out 1']!.release], [998, 2999]);
+
+      state.limiters['Out 2'] = LimiterState(knee: 13);
+      expect(dump206.decode(dump206.encode(state)).problems.single, contains('limiter knee'));
+    });
+
     test('a dump that ends after the records leaves the switches off', () {
       final stream = dump206.encode(changed(DeviceModel.dsp206)).sublist(0, dump206.requiredLength);
       final result = dump206.decode(stream);
@@ -121,7 +159,7 @@ void main() {
     test('dynamics and links', () {
       final c = s.compressors['Out 4']!;
       expect(c.toJson(), {'ratio': 0, 'attack': 49, 'release': 499, 'knee': 0, 'threshold': 220});
-      expect(s.limiters['Out 8']!.toJson(), {'attack': 49, 'release': 499, 'unknown': 0, 'threshold': 220});
+      expect(s.limiters['Out 8']!.toJson(), {'attack': 49, 'release': 499, 'knee': 0, 'threshold': 220});
       expect(s.links['In C'], 4);
       expect(s.links['Out 8'], 0x80);
     });
@@ -149,13 +187,13 @@ void main() {
       expect(s.currentPreset, 'Test');
       expect([for (final o in ['Out 1', 'Out 2', 'Out 3']) s.matrixRouting[o]], [3, 3, 3]);
       expect(s.gains['Out 8'], -60.0);
-      expect(s.hiPass['Out 8']!.toJson(), {'freqRaw': 55, 'slope': 1}); // 71 Hz BW -6
+      expect(s.hiPass['Out 8']!.toJson(), {'freqRaw': 55, 'slope': 1}); // 70 Hz BW -6
       expect(s.loPass['Out 8']!.toJson(), {'freqRaw': 280, 'slope': 20}); // 12.6 kHz LK -48
       expect(s.loPass['In A']!.slope, 20);
       expect(s.peqBands['Out 8']![0].type, 7); // All Pass 1
       expect(s.peqBands['Out 8']![2].gainDb, closeTo(6.9, 1e-9));
       expect(s.peqBands['In A']![7].gainDb, 12.0);
-      expect(p.peqFreqToHz(s.hiPass['Out 8']!.freqRaw).round(), 71);
+      expect(p.peqFreqToHz(s.hiPass['Out 8']!.freqRaw).round(), 70);
     });
 
     test('re-encodes to the identical bytes', () {

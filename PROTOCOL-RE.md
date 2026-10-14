@@ -137,8 +137,9 @@ The editor computes its graphs with bilinear biquads in Zölzer's K-form
 (`K = tan(π·f/48000)`), not with the RBJ cookbook (observed):
 
 - Peak: boost `(1 + V·K/Q + K²)/(1 + K/Q + K²)`, cut = exact inverse with `V = 10^(|G|/20)`.
-  The RBJ peak used by the panel splits A over both polynomials, so the editor's
-  boosts look narrower and its cuts wider at the same Q.
+  This equals an RBJ peak with Q divided by `10^(|G|/40)`, so at the same Q both
+  boosts and cuts are wider than with the RBJ formula (corrected 2026-10-13; the
+  panel draws the editor's form since 0.9.0).
 - Shelves: 2nd order, the band's Q replaces 1/√2 (`… + √V·K/Q + …` over `… + K/Q + …`),
   cut = inverse of boost. This equals an RBJ shelf whose corner frequency is shifted
   by `√A = 10^(|G|/80)` (*inferred* by comparing the transfer functions).
@@ -176,10 +177,18 @@ Done (2026-10-10):
 - Meters decoded as truncated float32 → dBFS; the status word drives the limit
   LED on the gain page and live LEDs on the Comp/Limit pages.
 
-Open:
+Done (0.9.0, 2026-10-13) – the panel follows the original editor, see
+[ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md) section 15:
 
-1. Limiter knee (0…12) instead of "unknown"; comp knee validation max 12, not 60.
-2. Rename 0x2C to PTS/lock status and handle `locked`/PTS (at least show a message).
-3. Optional: 0x2A copy, 0x3C/0x49 bypass-all, 0x15 delay unit, Zölzer curves.
-4. Hardware checks still worth doing: 0x3C/0x49 flag meaning, meter dBFS
-   calibration, that the DSP mirrors linked changes, PTS counter units.
+- Exact frequency and Q formulas, Q display table, Q ≤ 3 / reset to 0.71 for
+  shelves and PEQ LP/HP; limiter knee; original time ranges; knee check 12.
+- 0x2C read as PTS/lock status with unlock by a stored password (0x2D); 0x22
+  and 0x14 answers used; strict model/version check; device ID; 0x11 on
+  disconnect; 0x12 heartbeat; meters every 300 ms; editor timeouts.
+- Linking with 0x2A + one 0x3B for the master + re-read, changes sent once;
+  copy with 0x2A + re-read; gain sent once.
+- 0x3C/0x49 bypass, 0x15 delay unit (ms/m/ft, 344 m/s), the dump end (test
+  tone, delay unit, bypass bits); LED gating; Zölzer curves at 48 kHz.
+
+Open: the hardware checks in [TODO.md](TODO.md) (flag meanings, meter dBFS
+calibration, that the DSP mirrors linked changes, PTS counter units).

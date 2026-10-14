@@ -15,11 +15,13 @@
 //                  | tail: gain phase delay link
 //   Output:        name(8) | routing mask | crossing gain × inputs
 //                  | filter (6) | PEQ 9 × 6 | compressor: ratio attack
-//                  release knee threshold | limiter: attack release ?
+//                  release knee threshold | limiter: attack release knee
 //                  threshold | tail: gain phase delay link
 //   Switches:      mute bits of the inputs | mute bits of the outputs
 //                  | PEQ bypass bits (bit = band), one word per channel byte
-//   Rest:          unknown(4) | delay display unit | unknown(6)
+//   Rest:          test tone type | sine index | delay display unit
+//                  | EQ bypass bits of the inputs | of the outputs
+//                  | GEQ bypass bits of the inputs
 //
 // DSP 408: records end at 0x580, total 0x5A8 bytes (29 chunks).
 // DSP 206: records end at 0x380, total 0x3A0 bytes (19 chunks).
@@ -55,8 +57,20 @@ class ConfigDump {
   /// Bytes needed to decode mute and PEQ bypass as well.
   int get switchesLength => peqBypassOffset + 2 * _channelSlots;
 
+  /// Test tone type and sine index (as in cmd 0x39).
+  int get testToneOffset => switchesLength;
+
+  /// Delay display unit (cmd 0x15).
+  int get delayUnitOffset => switchesLength + 4;
+
+  /// Whole-PEQ bypass bits (cmd 0x3C) of the inputs; the outputs follow at +2.
+  int get eqBypassOffset => switchesLength + 6;
+
+  /// GEQ bypass bits of the inputs (cmd 0x49).
+  int get geqBypassOffset => switchesLength + 10;
+
   /// Full dump length as the original editor reads it.
-  int get totalLength => switchesLength + 4 + 2 + 6;
+  int get totalLength => switchesLength + 12;
 
   /// Number of 0x27 requests needed to read [totalLength] bytes.
   int get chunkCount => (totalLength + chunkSize - 1) ~/ chunkSize;
@@ -81,6 +95,11 @@ class ConfigDump {
     const proto = ProtocolService();
     final r = _Reader(stream, problems);
 
+    // Times and thresholds are checked loosely (to recognise a dump that
+    // is not decoded right) and then limited to the original editor's
+    // ranges: older panel versions allowed longer times.
+    int time(int at, int min, int max, String what) => r.u16(at, max: 9999, what: what).clamp(min, max);
+    int threshold(int at, int max, String what) => r.u16(at, max: 400, what: what).clamp(0, max);
     final presetName = r.ascii(2, 14);
     if (presetName != null && presetName.isNotEmpty) state.currentPreset = presetName;
 
@@ -89,10 +108,10 @@ class ConfigDump {
       final o = inputOffset(i);
       _decodeName(r, state, ch, o);
       state.gates[ch] = GateState(
-        attack: r.u16(o + 8, max: 9999, what: '$ch gate attack'),
-        release: r.u16(o + 10, max: 9999, what: '$ch gate release'),
-        hold: r.u16(o + 12, max: 9999, what: '$ch gate hold'),
-        threshold: r.u16(o + 14, max: 400, what: '$ch gate threshold'),
+        attack: time(o + 8, 0, ProtocolService.attackRawMax, '$ch gate attack'),
+        release: time(o + 10, ProtocolService.releaseRawMin, ProtocolService.releaseRawMax, '$ch gate release'),
+        hold: time(o + 12, ProtocolService.holdRawMin, ProtocolService.holdRawMax, '$ch gate hold'),
+        threshold: threshold(o + 14, ProtocolService.gateThresholdRawMax, '$ch gate threshold'),
       );
       state.geqBands[ch] = [
         for (var b = 0; b < geqBandCount; b++)
@@ -120,17 +139,17 @@ class ConfigDump {
       final compBase = peqBase + 54;
       state.compressors[ch] = CompressorState(
         ratio: r.u16(compBase + o, max: ProtocolService.compressorRatioNames.length - 1, what: '$ch ratio'),
-        attack: r.u16(compBase + o + 2, max: 9999, what: '$ch comp attack'),
-        release: r.u16(compBase + o + 4, max: 9999, what: '$ch comp release'),
-        knee: r.u16(compBase + o + 6, max: 60, what: '$ch comp knee'),
-        threshold: r.u16(compBase + o + 8, max: 400, what: '$ch comp threshold'),
+        attack: time(compBase + o + 2, 0, ProtocolService.attackRawMax, '$ch comp attack'),
+        release: time(compBase + o + 4, ProtocolService.releaseRawMin, ProtocolService.releaseRawMax, '$ch comp release'),
+        knee: r.u16(compBase + o + 6, max: ProtocolService.kneeMax, what: '$ch comp knee'),
+        threshold: threshold(compBase + o + 8, ProtocolService.thresholdRawMax, '$ch comp threshold'),
       );
       final limBase = compBase + 10;
       state.limiters[ch] = LimiterState(
-        attack: r.u16(limBase + o, max: 9999, what: '$ch limiter attack'),
-        release: r.u16(limBase + o + 2, max: 9999, what: '$ch limiter release'),
-        unknown: r.u16(limBase + o + 4),
-        threshold: r.u16(limBase + o + 6, max: 400, what: '$ch limiter threshold'),
+        attack: time(limBase + o, 0, ProtocolService.attackRawMax, '$ch limiter attack'),
+        release: time(limBase + o + 2, ProtocolService.releaseRawMin, ProtocolService.releaseRawMax, '$ch limiter release'),
+        knee: r.u16(limBase + o + 4, max: ProtocolService.kneeMax, what: '$ch limiter knee'),
+        threshold: threshold(limBase + o + 6, ProtocolService.thresholdRawMax, '$ch limiter threshold'),
       );
       _decodeTail(r, state, ch, limBase + o + 8);
     }
@@ -155,7 +174,32 @@ class ConfigDump {
       }
     }
 
-    return ConfigDumpResult(state, problems, switchesRead: switchesRead);
+    // Test tone, delay unit and the EQ/GEQ bypass bits end the dump. Values
+    // out of range are ignored (left at their defaults) without rejecting
+    // the dump: they are not needed to recognise the layout.
+    final restRead = stream.length >= totalLength;
+    if (restRead) {
+      final type = r.u16(testToneOffset);
+      final index = r.u16(testToneOffset + 2);
+      if (type < ProtocolService.testToneTypeNames.length && index < geqBandCount) {
+        state.testToneType = type;
+        state.testToneParam = index;
+      }
+      final unit = r.u16(delayUnitOffset);
+      if (unit < ProtocolService.delayUnitNames.length) state.delayUnit = unit;
+      final inputBypass = r.u16(eqBypassOffset);
+      final outputBypass = r.u16(eqBypassOffset + 2);
+      final geqBypass = r.u16(geqBypassOffset);
+      for (var i = 0; i < model.inputs.length; i++) {
+        state.eqBypass[model.inputs[i]] = inputBypass & (1 << i) != 0;
+        state.geqBypass[model.inputs[i]] = geqBypass & (1 << i) != 0;
+      }
+      for (var j = 0; j < model.outputs.length; j++) {
+        state.eqBypass[model.outputs[j]] = outputBypass & (1 << j) != 0;
+      }
+    }
+
+    return ConfigDumpResult(state, problems, switchesRead: switchesRead, restRead: restRead);
   }
 
   void _decodeName(_Reader r, DeviceState state, String ch, int offset) {
@@ -168,7 +212,7 @@ class ConfigDump {
     return PeqBand(
       gainDb: proto.peqGainToDb(r.u16(o, max: 240, fallback: 120, what: '$what gain')),
       freqRaw: r.u16(o + 2, max: ProtocolService.freqRawMax, fallback: 150, what: '$what freq'),
-      qRaw: r.u8(o + 4, max: 255, fallback: 35, what: '$what Q'),
+      qRaw: r.u8(o + 4, max: 255, fallback: 35, what: '$what Q').clamp(0, ProtocolService.qRawMax),
       type: r.u8(o + 5, max: ProtocolService.peqTypeNames.length - 1, what: '$what type'),
     );
   }
@@ -195,9 +239,7 @@ class ConfigDump {
 
   // ─── Encode ───
 
-  /// Encode [state] as a dump stream of [totalLength] bytes. Fields that are
-  /// not decoded (limiter "?", the rest after the switches) are written as
-  /// zero.
+  /// Encode [state] as a dump stream of [totalLength] bytes.
   List<int> encode(DeviceState state) {
     const proto = ProtocolService();
     final out = List<int>.filled(totalLength, 0);
@@ -284,7 +326,7 @@ class ConfigDump {
       final l = state.limiters[ch]!;
       u16(compBase + 10, l.attack);
       u16(compBase + 12, l.release);
-      u16(compBase + 14, l.unknown);
+      u16(compBase + 14, l.knee);
       u16(compBase + 16, l.threshold);
       tail(compBase + 18, ch);
     }
@@ -294,6 +336,12 @@ class ConfigDump {
     for (final ch in model.channels) {
       u16(peqBypassOffset + 2 * model.channelByte(ch)!, bits(state.peqBands[ch]!.map((b) => b.bypass)));
     }
+    u16(testToneOffset, state.testToneType);
+    u16(testToneOffset + 2, state.testToneParam);
+    u16(delayUnitOffset, state.delayUnit);
+    u16(eqBypassOffset, bits(model.inputs.map((ch) => state.eqBypass[ch] ?? false)));
+    u16(eqBypassOffset + 2, bits(model.outputs.map((ch) => state.eqBypass[ch] ?? false)));
+    u16(geqBypassOffset, bits(model.inputs.map((ch) => state.geqBypass[ch] ?? false)));
     return out;
   }
 
@@ -313,7 +361,11 @@ class ConfigDumpResult {
   /// False if the dump ended before the mute and PEQ bypass bits.
   final bool switchesRead;
 
-  ConfigDumpResult(this.state, this.problems, {this.switchesRead = false});
+  /// False if the dump ended before the test tone, delay unit and EQ/GEQ
+  /// bypass bits.
+  final bool restRead;
+
+  ConfigDumpResult(this.state, this.problems, {this.switchesRead = false, this.restRead = false});
 
   bool get isPlausible => problems.isEmpty;
 }

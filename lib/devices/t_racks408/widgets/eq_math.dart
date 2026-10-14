@@ -1,11 +1,14 @@
 // EQ response math shared by the EQ overview and the EQ graphs.
 //
-// Magnitudes of the analog prototypes the DSP filters are designed from:
-// PEQ types as RBJ "Audio EQ Cookbook" biquads (peak, shelves, 2nd-order
-// pass filters with the band's Q) and 1st-order pass filters; the HPF/LPF
-// crossover slopes as Butterworth (-3 dB at the cut-off), Linkwitz-Riley
-// (-6 dB) and Bessel (-3 dB) filters of the slope's order. At 96 kHz the
-// digital filters follow these curves closely over the audio range.
+// PEQ bands are drawn like the original editor draws them: bilinear biquads
+// in Zölzer's K form at 48 kHz (K = tan(π·f/48000)). A peak boost is
+// (s² + V·s/Q + 1) / (s² + s/Q + 1) with V = 10^(|G|/20), a cut its exact
+// inverse; shelves are 2nd order with the band's Q in place of 1/√2, a cut
+// the inverse of the boost; LP/HP -6 are 1st order, LP/HP -12 2nd order with
+// Q. The digital response is the analog prototype at the pre-warped
+// frequency tan(π·f/fs) / tan(π·fc/fs). The HPF/LPF crossover slopes are
+// drawn as Butterworth (-3 dB at the cut-off), Linkwitz-Riley (-6 dB) and
+// Bessel (-3 dB) filters of the slope's order.
 
 import 'dart:math' as math;
 
@@ -116,24 +119,35 @@ double filterResponseDb(double freq, double cutoffHz, int slope, bool isHighPass
 
 // ─── PEQ band ───
 
+/// Sample rate the original editor draws its EQ curves with.
+const eqDrawSampleRate = 48000.0;
+
+/// Frequency of the analog prototype for [freq] when the digital filter is
+/// tuned to [centerFreq] (bilinear transform with pre-warping).
+double _warped(double freq, double centerFreq) {
+  const limit = eqDrawSampleRate / 2 * 0.999;
+  double k(double f) => math.tan(math.pi * math.min(f, limit) / eqDrawSampleRate);
+  return k(freq) / k(centerFreq);
+}
+
 /// Response of one PEQ band in dB at [freq].
 double peqResponseDb(double freq, double centerFreq, double q, double gainDb, int type) {
   if (centerFreq <= 0) return 0.0;
   q = q.clamp(0.05, 200.0);
-  final w = freq / centerFreq;
-  final a = math.pow(10, gainDb / 40).toDouble();
+  final w = _warped(freq, centerFreq);
+  final v = math.pow(10, gainDb.abs() / 20).toDouble();
+  // Cuts are the exact inverse of the boost with the same |gain|.
+  double boostOrCut(double boostDb) => gainDb >= 0 ? boostDb : -boostDb;
   switch (type) {
-    case 0: // Peak: (s² + s·A/Q + 1) / (s² + s/(A·Q) + 1)
+    case 0: // Peak: (s² + V·s/Q + 1) / (s² + s/Q + 1)
       if (gainDb.abs() < 0.01) return 0.0;
-      return _biquadDb(1, a / q, 1, 1, 1 / (a * q), 1, w);
-    case 1: // Low shelf: A·(s² + √A/Q·s + A) / (A·s² + √A/Q·s + 1)
+      return boostOrCut(_biquadDb(1, v / q, 1, 1, 1 / q, 1, w));
+    case 1: // Low shelf: (V + √V·s/Q + s²) / (1 + s/Q + s²)
       if (gainDb.abs() < 0.01) return 0.0;
-      final r = math.sqrt(a) / q;
-      return gainDb / 2 + _biquadDb(a, r, 1, 1, r, a, w);
-    case 2: // High shelf: A·(A·s² + √A/Q·s + 1) / (s² + √A/Q·s + A)
+      return boostOrCut(_biquadDb(v, math.sqrt(v) / q, 1, 1, 1 / q, 1, w));
+    case 2: // High shelf: (1 + √V·s/Q + V·s²) / (1 + s/Q + s²)
       if (gainDb.abs() < 0.01) return 0.0;
-      final r = math.sqrt(a) / q;
-      return gainDb / 2 + _biquadDb(1, r, a, a, r, 1, w);
+      return boostOrCut(_biquadDb(1, math.sqrt(v) / q, v, 1, 1 / q, 1, w));
     case 3: // LP -6 dB: 1 / (1 + s)
       return _biquadDb(1, 0, 0, 1, 1, 0, w);
     case 4: // LP -12 dB: 1 / (s² + s/Q + 1)
@@ -235,17 +249,18 @@ class ChannelEq {
     final lp = device.getLoPass(channel);
     return ChannelEq._(
       [
-        for (final b in device.getPeqBands(channel))
-          if (peqBandAudible(b)) (_proto.peqFreqToHz(b.freqRaw), _proto.peqRawToQ(b.qRaw), b.gainDb, b.type),
+        if (!device.getEqBypass(channel))
+          for (final b in device.getPeqBands(channel))
+            if (peqBandAudible(b)) (_proto.peqFreqToHz(b.freqRaw), _proto.peqRawToQ(b.qRaw), b.gainDb, b.type),
       ],
       hp.enabled ? (_proto.peqFreqToHz(hp.freqRaw), hp.slope) : null,
       lp.enabled ? (_proto.peqFreqToHz(lp.freqRaw), lp.slope) : null,
-      device.inputs.contains(channel) ? device.getGeqBands(channel) : null,
+      device.inputs.contains(channel) && !device.getGeqBypass(channel) ? device.getGeqBands(channel) : null,
     );
   }
 
   /// Total response in dB at [freq]: PEQ bands (not bypassed), HPF/LPF and,
-  /// for inputs, the GEQ.
+  /// for inputs, the GEQ (unless the PEQ or GEQ of the channel is bypassed).
   double db(double freq) {
     var db = 0.0;
     for (final (hz, q, gain, type) in _bands) {

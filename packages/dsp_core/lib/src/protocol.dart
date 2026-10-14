@@ -14,8 +14,8 @@ class TRacksProto {
   // - Command that is send immediately after connection.
   static const List<int> handshakeCommand = [0x10, 0x02, 0x00, 0x01, 0x01, 0x10, 0x10, 0x03, 0x11];
 
-  // - Command that initiates the requests for all presets.
-  static const List<int> requestAllPresetsCommand = [0x10, 0x02, 0x00, 0x01, 0x01, 0x2c, 0x10, 0x03, 0x2d];
+  // - PTS / lock status (0x2C); answered with ptsOn limit count locked.
+  static const List<int> requestLockStatus = [0x10, 0x02, 0x00, 0x01, 0x01, 0x2c, 0x10, 0x03, 0x2d];
 
   // - Command that requests device information.
   static const List<int> requestDeviceInfo = [0x10, 0x02, 0x00, 0x01, 0x01, 0x13, 0x10, 0x03, 0x12];
@@ -82,16 +82,18 @@ class TRacksProto {
     [0x10, 0x02, 0x00, 0x01, 0x02, 0x27, 0x1c, 0x10, 0x03, 0x39],
   ];
 
-  // - Status queries sent after config dump completes
+  // - Heartbeats (0x12) sent after the config dump completes (twice in a
+  //   capture of the original editor).
   static const List<List<int>> statusQueryCommands = [
     [0x10, 0x02, 0x00, 0x01, 0x01, 0x12, 0x10, 0x03, 0x13],
     [0x10, 0x02, 0x00, 0x01, 0x01, 0x12, 0x10, 0x03, 0x13],
   ];
 
-  // - Unknown commands the original editor sends during startup.
-  //   TODO: Figure these out.
-  static const List<int> unknownStartup22 = [0x10, 0x02, 0x00, 0x01, 0x01, 0x22, 0x10, 0x03, 0x23];
-  static const List<int> unknownStartup14 = [0x10, 0x02, 0x00, 0x01, 0x01, 0x14, 0x10, 0x03, 0x15];
+  // - Preset slot table (0x22): 20 bytes, 0xFF = slot used.
+  static const List<int> requestPresetSlots = [0x10, 0x02, 0x00, 0x01, 0x01, 0x22, 0x10, 0x03, 0x23];
+
+  // - Current preset number (0x14).
+  static const List<int> requestCurrentPreset = [0x10, 0x02, 0x00, 0x01, 0x01, 0x14, 0x10, 0x03, 0x15];
 
   /// Number of user presets (U01–U20).
   static int get presetCount => loadAllPresetsCommands.length;
@@ -100,11 +102,12 @@ class TRacksProto {
   /// depends on the model, see ConfigDump.chunkCount.
   static List<int> configDumpCommand(int subIndex) => ProtocolService.buildFrame(0x27, [subIndex]);
 
-  /// Command sequence for storing the current settings to a preset slot:
-  /// store name (0x26), store to slot (0x21), status queries (0x12).
+  /// Command sequence for storing the current settings to a preset slot
+  /// like the original editor: store name (0x26), store to slot (0x21),
+  /// heartbeat (0x12).
   static List<List<int>> storePresetSequence(int presetIndex, String name) => [
         const ProtocolService().buildStorePresetNameCommand(name),
         const ProtocolService().buildStorePresetSlotCommand(presetIndex),
-        ...statusQueryCommands,
+        ProtocolService.buildHeartbeatCommand(),
       ];
 }

@@ -46,37 +46,42 @@ directly.
 - **Gain:** EQ overview of all channels above the faders (each EQ block exactly as wide as its fader block;
   every curve can be hidden with a checkbox, remembered per browser), faders with dB scale, mute and phase –
   inputs left, outputs right. Segmented level meters in dBFS (dim until the signal lights them up) with peak
-  hold, clip indicator and the limiter status reported by the DSP, updated every 40 ms
+  hold, clip indicator and the limiter status reported by the DSP, polled every 300 ms like the original editor
+  (adjustable) while the DSP is shown
 - **EQ:** channel selection In A … Out 8, PEQ graph over the full width (drag the points, scroll for Q),
   table of all bands (8 per input, 9 per output) with Freq/Q/Gain faders for the selected band, HPF and LPF
-  (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct) with bypass, and the channel gain. The curves are the
-  real filter responses (biquad PEQ types, Butterworth/Bessel/Linkwitz-Riley crossovers); bypassed bands
-  show a dashed preview
-- **GEQ** (31 bands, inputs): curve with one fader per band right below its point, RTA overlay and
+  (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct) with bypass, EQ bypass for the whole channel, and the
+  channel gain. Frequency, Q and their limits follow the original editor; the PEQ curves are drawn with the same
+  formulas as the original editor (biquads at 48 kHz); bypassed bands show a dashed preview
+- **GEQ** (31 bands, inputs): curve with one fader per band right below its point, bypass, RTA overlay and
   **Auto-EQ** (measure pink noise with a microphone, review the proposed correction, apply it). The EQ page has
   an Auto-EQ for every channel (e.g. per output for subs and tops) that uses the free PEQ bands; the other
   channels are muted while measuring, linked channels are measured together or alone
 - **Gate** (inputs), **Compressor** and **Limiter** (outputs): transfer curve over the whole page,
-  horizontal faders and a live indicator while the DSP reduces the gain
+  horizontal faders (value ranges and limiter knee like the original editor) and a live indicator while the DSP
+  reduces the gain
 - **Matrix:** routing diagram (inputs → outputs) next to the crossing grid; the gain of every crossing
   (−60 … 0 dB) is typed into its cell
-- **Delay:** drag a speaker per channel (inputs left, outputs right), fine-tune with faders, ms or metres,
-  zoomable range
+- **Delay:** drag a speaker per channel (inputs left, outputs right), fine-tune with faders, ms, m or ft
+  (stored on the DSP), zoomable range
 - **RTA:** browser microphone, 1/24 octave, 16k FFT at 48 kHz, averaging Off/Fast/Slow/Long, peak hold;
   signal generator in the browser (sine, pink/white noise) and the DSP's own generator
 - Every fader can be moved with the arrow keys after clicking it (Shift: 10 steps, Page Up/Down: 10 %)
 - Channel menu (tap a channel name): rename (stored on the DSP, max. 8 characters), copy settings to other
-  channels, link channels like the original editor: a master with one or more slaves (stored on the DSP).
-  A change on any linked channel applies to the whole group – except the matrix routing, so left/right pairs
-  keep their inputs. Linked channels are highlighted together on every page
+  channels (the DSP copies, the panel reads the result back), link channels like the original editor: a master
+  with one or more slaves that first get the master's settings (stored on the DSP). A change is sent once and
+  the DSP applies it to the linked channels – the matrix routing stays per channel, so left/right pairs keep
+  their inputs. Linked channels are highlighted together on every page
 - **Presets:** the 20 presets stored on the DSP (load/store), plus a preset library on the server: save the
   current settings, edit a preset offline (without a DSP) in its own tab and load it onto any DSP of the
   same model
-- Connection status per DSP, disconnect/connect without logging out of the panel
+- Connection status per DSP, disconnect/connect without logging out of the panel. Device ID and the password of a
+  DSP locked with the original editor are set per DSP
 
 When connecting, the panel reads the complete configuration from the DSP before it shows it, including
-mute, phase, delay, PEQ bypass and the matrix crossing gains. Open protocol questions are collected in
-[TODO.md](TODO.md).
+mute, phase, delay, PEQ/EQ/GEQ bypass, the delay unit, the test tone and the matrix crossing gains. How the original
+software works and what the panel does the same way is described in [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md);
+open hardware checks are collected in [TODO.md](TODO.md).
 
 ## Installing the panel on an Ubuntu server
 

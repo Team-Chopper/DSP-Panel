@@ -26,6 +26,10 @@ void main() {
         DeviceOps.limiter('Out 5', LimiterState(threshold: 200)),
         DeviceOps.channelName('Out 1', 'Sub L'),
         DeviceOps.channelName('Out 1', null),
+        DeviceOps.eqBypass('Out 3', true),
+        DeviceOps.geqBypass('In D', true),
+        DeviceOps.delayUnit(2),
+        DeviceOps.limiter('Out 6', LimiterState(knee: 12)),
       ];
       for (final op in ops) {
         // Round-trip through JSON as it would over the WebSocket.
@@ -54,6 +58,14 @@ void main() {
         {'op': 'compressor', 'ch': 'In A', ...CompressorState().toJson()},
         {'op': 'compressor', 'ch': 'Out 1', ...CompressorState(ratio: 16).toJson()},
         {'op': 'limiter', 'ch': 'Out 1', 'attack': 0, 'release': 0, 'threshold': 221},
+        {'op': 'limiter', 'ch': 'Out 1', ...LimiterState(knee: 13).toJson()},
+        {'op': 'limiter', 'ch': 'Out 1', 'attack': 49, 'release': 499, 'threshold': 220},
+        {'op': 'gate', 'ch': 'In A', ...GateState(attack: 999).toJson()},
+        {'op': 'gate', 'ch': 'In A', ...GateState(release: 8).toJson()},
+        {'op': 'gate', 'ch': 'In A', ...GateState(hold: 999).toJson()},
+        {'op': 'compressor', 'ch': 'Out 1', ...CompressorState(release: 3000).toJson()},
+        {'op': 'geqBypass', 'ch': 'Out 1', 'on': true},
+        {'op': 'delayUnit', 'unit': 3},
         {'op': 'channelName', 'ch': 'In A', 'name': 'too long name'},
         {'op': 'channelName', 'ch': 'In A', 'name': 'Bässe'},
         {'op': 'matrixGain', 'out': 'In A', 'in': 'In A', 'db': 0},
@@ -77,14 +89,14 @@ void main() {
   });
 
   group('apply and commands', () {
-    test('gain is clamped, quantized and sent twice', () {
+    test('gain is clamped, quantized and sent once', () {
       final state = DeviceState();
       final op = DeviceOps.gain('Out 2', -33.3);
       DeviceOps.apply(state, op);
       expect(state.gains['Out 2'], -33.5);
       final cmds = DeviceOps.commands(state, op);
       expect(cmds.keys, ['gain:Out 2']);
-      expect(cmds['gain:Out 2']!.length, 2);
+      expect(cmds['gain:Out 2']!.length, 1);
 
       DeviceOps.apply(state, DeviceOps.gain('Out 2', 50));
       expect(state.gains['Out 2'], 12.0);
@@ -133,12 +145,36 @@ void main() {
       expect(DeviceOps.expandLinked(linked, DeviceOps.matrixGain('Out 1', 'In A', -3)).length, 1);
     });
 
-    test('limiter keeps the unknown parameter', () {
+    test('limiter sends its knee (0x3F attack release knee threshold)', () {
       final state = DeviceState();
-      state.limiters['Out 1']!.unknown = 7;
-      DeviceOps.apply(state, DeviceOps.limiter('Out 1', LimiterState(threshold: 200)));
-      expect(state.limiters['Out 1']!.unknown, 7);
-      expect(state.limiters['Out 1']!.threshold, 200);
+      final op = DeviceOps.limiter('Out 1', LimiterState(threshold: 200, knee: 7));
+      DeviceOps.apply(state, op);
+      expect(state.limiters['Out 1']!.knee, 7);
+      expect(DeviceOps.commands(state, op)['limit:Out 1']!.single,
+          const ProtocolService().buildLimiterCommand('Out 1', attack: 49, release: 499, knee: 7, threshold: 200));
+      // Older presets stored the knee as "unknown".
+      expect(LimiterState.fromJson({'attack': 1, 'release': 9, 'unknown': 3, 'threshold': 0}).knee, 3);
+    });
+
+    test('values of older versions are limited to the original ranges', () {
+      final gate = DeviceOps.clampGate(GateState(attack: 2998, release: 0, hold: 2000, threshold: 200));
+      expect(gate.toJson(), {'attack': 998, 'release': 9, 'hold': 998, 'threshold': 180});
+      final comp = DeviceOps.clampCompressor(CompressorState(attack: 4999, release: 4999, knee: 40));
+      expect([comp.attack, comp.release, comp.knee], [998, 2999, 12]);
+    });
+
+    test('EQ bypass, GEQ bypass and delay unit', () {
+      final state = DeviceState(m206);
+      for (final (op, key, frame) in [
+        (DeviceOps.eqBypass('Out 2', true), 'eqBypass:Out 2', ProtocolService.buildFrame(0x3C, [0x03, 1])),
+        (DeviceOps.geqBypass('In B', true), 'geqBypass:In B', ProtocolService.buildFrame(0x49, [0x01, 1])),
+        (DeviceOps.delayUnit(1), 'delayUnit', ProtocolService.buildFrame(0x15, [1])),
+      ]) {
+        expect(DeviceOps.validate(op, m206), isNull);
+        DeviceOps.apply(state, op);
+        expect(DeviceOps.commands(state, op)[key]!.single, frame);
+      }
+      expect([state.eqBypass['Out 2'], state.geqBypass['In B'], state.delayUnit], [true, true, 1]);
     });
 
     test('channel name; empty restores the default device name', () {
@@ -170,7 +206,7 @@ void main() {
       expect(DeviceOps.validate(DeviceOps.link('Out 6', 0x30), m206), isNull);
     });
 
-    test('master/slave as read from the device: a link 1 → 2 also moves 1 when 2 changes', () {
+    test('master/slave as read from the device, group rule of the original editor', () {
       // DSP 206 dump: Out 1 lists Out 2, Out 2 only itself.
       final state = DeviceState(m206)
         ..links['Out 1'] = 0x03
@@ -178,10 +214,29 @@ void main() {
       expect(DeviceOps.masterOf(state, 'Out 2'), 'Out 1');
       expect(DeviceOps.masterOf(state, 'Out 1'), isNull);
       expect(DeviceOps.slavesOf(state, 'Out 1'), ['Out 2']);
-      expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 2', -3)),
-          [DeviceOps.gain('Out 2', -3), DeviceOps.gain('Out 1', -3)]);
+      // A change of the master moves its slaves.
       expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 1', -3)),
           [DeviceOps.gain('Out 1', -3), DeviceOps.gain('Out 2', -3)]);
+      // A slave whose own mask holds its bit is its own group …
+      expect(DeviceOps.editGroupOf(state, 'Out 2'), ['Out 2']);
+      expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 2', -3)), [DeviceOps.gain('Out 2', -3)]);
+      // … one without it belongs to the first lower channel that lists it.
+      state.links['Out 2'] = 0;
+      expect(DeviceOps.editGroupOf(state, 'Out 2'), ['Out 1', 'Out 2']);
+      expect(DeviceOps.expandLinked(state, DeviceOps.gain('Out 2', -3)),
+          [DeviceOps.gain('Out 2', -3), DeviceOps.gain('Out 1', -3)]);
+      expect(DeviceOps.editGroupOf(state, 'Out 3'), ['Out 3']);
+    });
+
+    test('linkChange: new slaves, mask and masks of older versions to reset', () {
+      final state = DeviceState(m408)
+        ..links['Out 1'] = 0x07
+        ..links['Out 2'] = 0x07 // symmetric mask of an older version
+        ..links['Out 3'] = 0x04;
+      final change = DeviceOps.linkChange(state, 'Out 1', ['Out 3', 'Out 5']);
+      expect(change.mask, 0x15);
+      expect(change.added, ['Out 5']);
+      expect(change.reset, ['Out 2']);
     });
 
     test('symmetric masks of older versions form one group with the first channel as master', () {
@@ -196,7 +251,7 @@ void main() {
 
     test('linkSlaves: master keeps the mask, slaves only their own bit', () {
       final state = DeviceState(m408);
-      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2'], copySettings: false));
+      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2']));
       expect(state.links['Out 1'], 0x03);
       expect(state.links['Out 2'], 0x02);
 
@@ -207,7 +262,7 @@ void main() {
       expect(DeviceOps.linkCandidates(state, 'Out 3'), isNot(contains('Out 1')), reason: 'Out 1 is a master');
 
       // More channels are added to the master.
-      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2', 'Out 4'], copySettings: false));
+      applyAll(state, DeviceOps.linkSlaves(state, 'Out 1', ['Out 2', 'Out 4']));
       expect(state.links['Out 1'], 0x0B);
       expect(DeviceOps.linkedWith(state, 'Out 4'), ['Out 1', 'Out 2']);
 
@@ -270,7 +325,7 @@ void main() {
   });
 
   group('copyChannel', () {
-    test('copies everything except name, mute, link and routing', () {
+    test('copies everything except name, link and routing, like the original offline copy', () {
       final state = DeviceState(m408);
       final edits = [
         DeviceOps.gain('Out 1', -4),
@@ -297,7 +352,7 @@ void main() {
       expect(state.hiPass['Out 6']!.slope, 8);
       expect(state.matrixRouting['Out 6'], DeviceState(m408).matrixRouting['Out 6'], reason: 'routing is not copied');
       expect(state.compressors['Out 6']!.ratio, 7);
-      expect(state.mutes['Out 6'], isFalse);
+      expect(state.mutes['Out 6'], isTrue);
       expect(state.channelNames['Out 6'], 'Out6');
     });
 

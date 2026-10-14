@@ -178,7 +178,13 @@ class _DevicePresets extends StatelessWidget {
           _PresetRow(
             leading: presetSlot(e.key),
             title: e.value,
-            current: e.value == device.currentPreset,
+            // The slot table (0x22) tells which slots hold a stored preset.
+            subtitle: device.presetSlots.isNotEmpty && !device.presetSlots.contains(e.key) ? 'empty' : null,
+            // The DSP reports the current preset number (0x14); older
+            // states only have the name from the dump.
+            current: device.currentPresetNumber > 0
+                ? device.currentPresetNumber == e.key + 1
+                : e.value == device.currentPreset,
             actions: [
               TextButton.icon(
                 icon: const Icon(Icons.download_outlined, size: 16),

@@ -100,7 +100,7 @@ class _PeqGraphState extends State<PeqGraph> {
             final band = nearestBand(e.localPosition);
             final step = (e as PointerScrollEvent).scrollDelta.dy < 0 ? 1 : -1;
             widget.onSelect(band);
-            widget.onQ(band, (bands[band].qRaw + step).clamp(0, ProtocolService.qRawMax));
+            widget.onQ(band, (bands[band].qRaw + step).clamp(0, ProtocolService.maxQRawForType(bands[band].type)));
           });
         },
         child: GestureDetector(

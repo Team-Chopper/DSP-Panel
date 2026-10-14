@@ -2,8 +2,8 @@
 // channel selection, transfer curve (input level → output level) and the
 // parameters as horizontal faders below.
 //
-// The value ranges are sensible guesses and not yet verified against the
-// original editor (see TODO.md).
+// The value ranges are those of the original editor: attack 1 … 999 ms,
+// release 10 … 3000 ms, gate hold 10 … 999 ms, knee 0 … 12 dB.
 
 import 'dart:math' as math;
 
@@ -24,10 +24,15 @@ List<double> _thresholdMarks(double max) => [for (var db = -90.0; db <= max; db 
 
 String _timeLabel(double ms) => ms >= 1000 ? '${(ms / 1000).round()}s' : '${ms.round()}';
 
-List<double> _timeMarks(int max) => [
+List<double> _timeMarks(int min, int max) => [
       for (final ms in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0])
-        if (ms <= max) ms,
+        if (ms >= min && ms <= max) ms,
     ];
+
+// Times in ms (raw + 1) of the original editor.
+const _attackMs = (1, 999);
+const _releaseMs = (10, 3000);
+const _holdMs = (10, 999);
 
 // ─── Pages ───
 
@@ -57,9 +62,9 @@ class GatePage extends StatelessWidget {
             ],
             params: [
               _thresholdParam(g.threshold, 0, defaults.threshold, color, (v) => set((g) => g.threshold = v)),
-              _timeParam('Attack', g.attack, 2999, defaults.attack, color, (v) => set((g) => g.attack = v)),
-              _timeParam('Hold', g.hold, 2999, defaults.hold, color, (v) => set((g) => g.hold = v)),
-              _timeParam('Release', g.release, 2999, defaults.release, color, (v) => set((g) => g.release = v)),
+              _timeParam('Attack', g.attack, _attackMs, defaults.attack, color, (v) => set((g) => g.attack = v)),
+              _timeParam('Hold', g.hold, _holdMs, defaults.hold, color, (v) => set((g) => g.hold = v)),
+              _timeParam('Release', g.release, _releaseMs, defaults.release, color, (v) => set((g) => g.release = v)),
             ],
           );
         },
@@ -137,29 +142,9 @@ class CompressorPage extends StatelessWidget {
             ],
             params: [
               _thresholdParam(c.threshold, 20, defaults.threshold, color, (v) => set((c) => c.threshold = v)),
-              _timeParam('Attack', c.attack, 5000, defaults.attack, color, (v) => set((c) => c.attack = v)),
-              _timeParam('Release', c.release, 5000, defaults.release, color, (v) => set((c) => c.release = v)),
-              _Param(
-                label: 'Knee',
-                fader: ConsoleFader(
-                  axis: Axis.horizontal,
-                  value: knee,
-                  taper: const LinearTaper(0, 12),
-                  marks: [for (var k = 0.0; k <= 12; k++) k],
-                  markLabel: (k) => k % 3 == 0 ? '${k.round()}' : '',
-                  color: color,
-                  wheelStep: 1,
-                  resetValue: defaults.knee.toDouble(),
-                  onChanged: (v) => set((c) => c.knee = v.round().clamp(0, 12)),
-                ),
-                text: '${c.knee} dB',
-                onSubmitted: (input) {
-                  final v = parseNumber(input);
-                  if (v == null) return false;
-                  set((c) => c.knee = v.round().clamp(0, 12));
-                  return true;
-                },
-              ),
+              _timeParam('Attack', c.attack, _attackMs, defaults.attack, color, (v) => set((c) => c.attack = v)),
+              _timeParam('Release', c.release, _releaseMs, defaults.release, color, (v) => set((c) => c.release = v)),
+              _kneeParam(c.knee, defaults.knee, color, (v) => set((c) => c.knee = v)),
             ],
           );
         },
@@ -179,23 +164,32 @@ class LimiterPage extends StatelessWidget {
           final l = device.getLimiter(ch);
           final defaults = LimiterState();
           final thresholdDb = ProtocolService.thresholdRawToDb(l.threshold);
+          final knee = l.knee.toDouble();
           void set(void Function(LimiterState l) change) => device.setLimiter(ch, l..let(change));
+          double response(double x) {
+            final over = x - thresholdDb;
+            // Soft knee: quadratic transition into the limit
+            if (knee > 0 && over.abs() <= knee / 2) return x - math.pow(over + knee / 2, 2) / (2 * knee);
+            return math.min(x, thresholdDb);
+          }
+
           return _DynamicsContent(
             title: 'Limiter · ${device.getAlias(ch)}',
             color: color,
-            curve: (x) => math.min(x, thresholdDb),
+            curve: response,
             thresholdDb: thresholdDb,
             side: [
               _StateBadge(active: thresholdDb < 20, color: color),
               const SizedBox(height: 10),
               _ActivityLed(device: device, channel: ch, limiter: true),
               const SizedBox(height: 12),
-              const _Hint('+20 dB means the limiter never engages.'),
+              const _Hint('+20 dB means the limiter never engages. The knee is hidden in the original editor.'),
             ],
             params: [
               _thresholdParam(l.threshold, 20, defaults.threshold, color, (v) => set((l) => l.threshold = v)),
-              _timeParam('Attack', l.attack, 5000, defaults.attack, color, (v) => set((l) => l.attack = v)),
-              _timeParam('Release', l.release, 5000, defaults.release, color, (v) => set((l) => l.release = v)),
+              _timeParam('Attack', l.attack, _attackMs, defaults.attack, color, (v) => set((l) => l.attack = v)),
+              _timeParam('Release', l.release, _releaseMs, defaults.release, color, (v) => set((l) => l.release = v)),
+              _kneeParam(l.knee, defaults.knee, color, (v) => set((l) => l.knee = v)),
             ],
           );
         },
@@ -235,26 +229,53 @@ _Param _thresholdParam(int raw, double maxDb, int defaultRaw, Color color, Value
   );
 }
 
-_Param _timeParam(String label, int raw, int maxMs, int defaultRaw, Color color, ValueChanged<int> onChanged) {
+_Param _timeParam(String label, int raw, (int, int) rangeMs, int defaultRaw, Color color, ValueChanged<int> onChanged) {
+  final (minMs, maxMs) = rangeMs;
   final ms = ProtocolService.timeRawToMs(raw);
   return _Param(
     label: label,
     fader: ConsoleFader(
       axis: Axis.horizontal,
-      value: ms.toDouble(),
-      taper: LogTaper(1, maxMs.toDouble()),
-      marks: _timeMarks(maxMs),
+      value: ms.clamp(minMs, maxMs).toDouble(),
+      taper: LogTaper(minMs.toDouble(), maxMs.toDouble()),
+      marks: _timeMarks(minMs, maxMs),
       markLabel: _timeLabel,
       color: color,
       resetValue: ProtocolService.timeRawToMs(defaultRaw).toDouble(),
-      onChanged: (v) => onChanged(ProtocolService.timeMsToRaw(v.round().clamp(1, maxMs))),
+      onChanged: (v) => onChanged(ProtocolService.timeMsToRaw(v.round().clamp(minMs, maxMs))),
     ),
     text: _formatMs(ms),
     onSubmitted: (input) {
       final v = parseNumber(input);
       if (v == null) return false;
       final inSeconds = RegExp(r'\d\s*s\b').hasMatch(input) && !input.contains('ms');
-      onChanged(ProtocolService.timeMsToRaw((inSeconds ? v * 1000 : v).round().clamp(1, maxMs)));
+      onChanged(ProtocolService.timeMsToRaw((inSeconds ? v * 1000 : v).round().clamp(minMs, maxMs)));
+      return true;
+    },
+  );
+}
+
+/// Knee of the compressor or limiter, 0 … 12 dB.
+_Param _kneeParam(int knee, int defaultKnee, Color color, ValueChanged<int> onChanged) {
+  const max = ProtocolService.kneeMax;
+  return _Param(
+    label: 'Knee',
+    fader: ConsoleFader(
+      axis: Axis.horizontal,
+      value: knee.toDouble(),
+      taper: LinearTaper(0, max.toDouble()),
+      marks: [for (var k = 0.0; k <= max; k++) k],
+      markLabel: (k) => k % 3 == 0 ? '${k.round()}' : '',
+      color: color,
+      wheelStep: 1,
+      resetValue: defaultKnee.toDouble(),
+      onChanged: (v) => onChanged(v.round().clamp(0, max)),
+    ),
+    text: '$knee dB',
+    onSubmitted: (input) {
+      final v = parseNumber(input);
+      if (v == null) return false;
+      onChanged(v.round().clamp(0, max));
       return true;
     },
   );

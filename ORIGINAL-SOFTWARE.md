@@ -697,8 +697,8 @@ forms.
 - **Peak:**
   - Boost: `(1 + V·K/Q + K²) / (1 + K/Q + K²)` with `V = 10^(|G|/20)`.
   - Cut: the exact inverse.
-  - Compared with the RBJ peak at the same Q, a boost looks narrower and a cut
-    wider.
+  - This equals an RBJ peak whose Q is divided by `10^(|G|/40)`, so at the same
+    Q both boosts and cuts are wider than with the RBJ formula.
 - **Shelves:**
   - Second order; the band's Q replaces 1/√2.
   - Boost: `√V·K/Q` in the numerator over `K/Q` in the denominator.
@@ -821,7 +821,9 @@ Everything else is the same in both:
 
 ## 15. Status in this project
 
-The table below compares the original software with this project.
+Version 0.9.0 of this project follows the original software in everything a
+DSP sees on the network (except where 15.2 says otherwise). The table shows
+since when each part is used.
 
 **Version column:**
 
@@ -841,67 +843,64 @@ The table below compares the original software with this project.
 | Topic | Since | Note |
 |---|---|---|
 | TCP port 9761, frame format, XOR checksum | upstream | The project writes the checksum as "seed 01, XOR from src to the last data byte". That is the same value (section 6). |
-| Connect order `10 → 13 → 2C → 22 → 14 → 29 × 20 → 27 × n → 12` | ≤ 0.4.0 | The frames come from upstream; 29 chunks since upstream. 206 with 19 chunks since 0.8.0 (0.4.0 – 0.7.x read 18). The project sends `0x12` twice, as seen in a capture of the original software. |
-| Gain encoding (two ranges, 0 … 400) | upstream | |
+| Device ID as the address byte (1 … 250) | 0.9.0 | Set per DSP; before, the address was fixed to 1. |
+| Connect order `10 → 13 → 2C → 22 → 14 → 29 × 20 → 27 × n → 12` | ≤ 0.4.0 | 29 chunks since upstream; the DSP 206 with 19 chunks since 0.8.0 (0.4.0 – 0.7.x read 18). |
+| Model and version check (`DSP408` / `DSP206`, `V010`); wrong device → `0x11` | 0.9.0 | Before, "408"/"206" anywhere in the answer was accepted. |
+| Lock/PTS status `0x2C`, password check `0x2D` | 0.9.0 | The password is stored with the DSP's settings in the panel. Before, the answer was read as a "preset count". |
+| Slot table `0x22`, current preset `0x14` | 0.9.0 | Sent since ≤ 0.4.0, answers used since 0.9.0. |
+| Timeouts: 4 s and 3 attempts for the handshake, 1 s and one retry afterwards, then "link broken"; store 10 s, recall 50 s | 0.9.0 | Before: 500 ms, 3 attempts for required steps, 5 timeouts in a row. |
+| Heartbeat `0x12` when idle; disconnect `0x11` | 0.9.0 | |
+| Meters `0x40` every 300 ms | 0.9.0 | Default interval; 40 ms in 0.7.0 – 0.8.x. |
+| Gain encoding (two ranges, 0 … 400), one `0x34` per change | upstream / 0.9.0 | The gain was sent twice up to 0.8.x. |
 | PEQ/GEQ gain `10·dB + 120`, PEQ type list, GEQ 31 bands | upstream | |
 | Mute `0x35`, routing `0x3A` | upstream | |
-| Frequency 0 … 300, Q 0 … 100, slope table with 0 = bypass | 0.4.0 | Upstream used other scales: frequency 0 … 1000, Q 0 … 255, and a high-pass "enable" byte. The original software confirms the 0.4.0 tables for **both** models. See 15.2 for the formulas. |
+| Frequency `1000·2^((i−170)/30)`, Q `2^((raw−16)/12)` with the display table | 0.9.0 | Scales 0 … 300 and 0 … 100 since 0.4.0, approximated by `20·1000^(i/300)` and `10^((raw−16)/40)` until 0.8.x; upstream used 0 … 1000 and 0 … 255. |
+| Q ≤ 3 for shelves and PEQ LP/HP, Q 0.71 when a band changes to such a type | 0.9.0 | |
+| Slope table with 0 = bypass | 0.4.0 | |
 | Phase `0x36`, delay `0x38` (96 per ms, max. 680 ms) | ≤ 0.4.0 | |
-| Gate `0x3E`, compressor `0x30` and the ratio table, thresholds `2·dB + 180`, compressor knee 0 … 12 | ≤ 0.4.0 | |
+| Delay unit `0x15` (ms/m/ft, 344 m/s), stored on the DSP | 0.9.0 | Before: a browser setting, ms/m, 343 m/s. |
+| Gate `0x3E`, compressor `0x30`, ratio table, thresholds `2·dB + 180`, compressor knee 0 … 12 | ≤ 0.4.0 | |
+| Limiter `0x3F` with its knee (0 … 12) | 0.9.0 | Before, the third value was "unknown" and not editable. |
+| Time ranges: attack 0 … 998, release 9 … 2999, hold 9 … 998 | 0.9.0 | Before: up to 2998 / 4999; such values are limited when read. |
 | Channel names `0x3D` (8 bytes, NUL-padded) | 0.4.0 | The project only allows printable ASCII. |
-| Recall `0x20` (1 … 20 = U01 … U20), store `0x26 → 0x21 → 0x12`, names `0x29` | ≤ 0.4.0 | |
-| Link word `0x3B` | 0.5.0 | Symmetric masks in 0.5.0 – 0.6.x; master/slave like the original software since 0.7.0. |
-| Test signal `0x39`, 31 ISO sine frequencies | 0.7.0 | The index assumption is confirmed. |
+| Recall `0x20` (1 … 20 = U01 … U20), names `0x29` | ≤ 0.4.0 | |
+| Store `0x26 → 0x21 → 0x12` | 0.9.0 | One `0x12`; two up to 0.8.x. |
+| Linking: `0x2A` copy to each new slave, one `0x3B` for the master, read everything again | 0.9.0 | Symmetric masks in 0.5.0 – 0.6.x; master/slave since 0.7.0, but up to 0.8.x with `0x3B` for every slave and the changes sent to every member. |
+| A change of a linked channel is sent once; the other members follow by the group rule of the original software (8.3) | 0.9.0 | |
+| Channel copy `0x2A`, then read everything again | 0.9.0 | Up to 0.8.x by single commands, without mute. |
+| EQ bypass `0x3C`, GEQ bypass `0x49` | 0.9.0 | |
+| Test signal `0x39` (type 0 = analog input), 31 ISO sine frequencies | 0.7.0 | Read back from the dump since 0.9.0. |
 | DSP 206 meter slots (outputs from slot 4) | 0.7.0 | |
-| Dump: channel tail `[gain, phase, delay, link]`, mute words, PEQ-bypass words, totals `0x5A8` / `0x3A0` | 0.8.0 | 0.6.0 – 0.7.x kept mute/phase/delay/bypass on the server instead. |
+| Dump: channel tail, mute words, PEQ-bypass words, totals `0x5A8` / `0x3A0` | 0.8.0 | |
+| Dump end: test signal, delay unit, EQ/GEQ bypass bits | 0.9.0 | |
 | Matrix crossing gain `0x41` (0 … 280) | 0.8.0 | Shown read-only in 0.6.0 – 0.7.x. |
-| Meters: float32 from 3 bytes, status word (compressor/limiter bits) | 0.8.0 | Upstream – 0.7.x read the slots as float16 (0.5 … 2.0). |
+| Meters: float32 from 3 bytes, status word | 0.8.0 | Upstream – 0.7.x read the slots as float16 (0.5 … 2.0). |
+| Compressor LED only for a ratio other than 1:1, limiter LED only below +20 dB | 0.9.0 | |
+| EQ curves: Zölzer K form at 48 kHz | 0.9.0 | RBJ cookbook forms up to 0.8.x. |
+| Loading a stored preset: name `0x26`, every value as a single command in the order of a preset file, then `0x12` | 0.9.0 | The order is that of section 8.8. |
 
-### 15.2 Differences
+### 15.2 Remaining differences
 
 | Topic | Original software | This project |
 |---|---|---|
-| Frequency formula | `1000·2^((i−170)/30)` | `20·1000^(i/300)`, up to about 1.6 % off at the low end |
-| Q formula | `2^((raw−16)/12)` plus a display table | `10^((raw−16)/40)`, up to about 1.6 % off at the high end |
-| Q limits | Q ≤ 3 for shelves and PEQ LP/HP; reset to 0.71 when the type changes | No limits per type |
-| Limiter knee | 3rd value of `0x3F`, 0 … 12 (hidden in the UI) | Called "unknown"; not editable; the stored value is kept |
-| Knee check when decoding the dump | 0 … 12 | Accepts up to 60 |
-| Times | attack 0 … 998, release 9 … 2999, hold 9 … 998 | Gate 0 … 2998, compressor/limiter 0 … 4999 |
-| `0x2C` | PTS/lock status | Called "preset count"; the answer is ignored |
-| `0x22`, `0x14` | Slot table and current preset | Sent; answers ignored. The current name comes from the dump header. |
-| Keep-alive | `0x12` when idle; meters every 300 ms | `0x40` meter poll as keep-alive, default every 40 ms (5 … 300 ms); `0x12` only after a dump or a store |
-| Disconnect | Sends `0x11` | Closes the socket without `0x11` |
-| Timeouts | 1 s, one retry (TCP) | 500 ms; 3 attempts for required steps; 5 timeouts in a row = connection lost |
-| Device ID | 1 … 250, configurable | Fixed 1 (`00 01` / `01 00`) |
-| Model check | Exact prefix `DSP408` / `DSP206` and version `V010` | Looks for "408" or "206" anywhere in the text |
-| Gain frames | One `0x34` per change | `0x34` sent twice (inherited from upstream); harmless |
-| Test signal type 0 | "Analog input" (generator off) | Called "Off" (same effect) |
-| Delay unit | `0x15`; ms, m, ft; 344 m/s | Unit switch only in the browser; ms and m only; 343 m/s; the dump word is not read and is written as 0 by the encoder and the fake DSP |
-| Linking | Copy master → slave with `0x2A`, one `0x3B` for the master, re-read; a change is sent once, for the edited channel | `0x3B` for the master **and** each slave (own bit); copies the values with single commands; no re-read; every change is sent to all group members |
-| Group rule | Own word if it contains the own bit, otherwise the first lower channel containing it | First channel whose mask contains this channel's bit |
-| Copy | `0x2A` (the device copies), then re-read | Single values within the group. Name, mute, link and routing are not copied. |
-| Meter display | LED thresholds in 10.8; compressor/limit LED only for ratio ≠ 1:1 or threshold < +20 dB | Own segmented dBFS meter; clip at −0.5 dBFS; LEDs straight from the status bits |
-| EQ graph | Zölzer K form at 48 kHz | RBJ cookbook forms (the code comment says 96 kHz) |
-| Fake DSP `0x22` answer | 20 bytes | 24 bytes |
+| Interfaces | TCP, USB HID, serial, UDP discovery | TCP only |
+| Meter polling | Always while connected | Only while a browser shows the DSP; otherwise the heartbeat keeps the link alive. The interval can be set (5 … 300 ms). |
+| Meter display | 9 / 8 LED segments with the thresholds of 10.8 | Segmented meter in dBFS, clip at −0.5 dBFS |
+| Unanswered `0x2C`, `0x22`, `0x14` or dump chunk | Link broken | Tolerated (a chunk that is not answered ends the dump) |
+| `0x12` after the dump | Once | Twice, as seen in a capture of the original software |
+| Stored presets of the panel | Preset files (`.prs`) | A preset library on the server. Loading one also sends the EQ/GEQ bypass and the delay unit, which a preset file does not hold. |
+| Linking and copying without a DSP | Done in the editor's model | The same, for presets in the panel's offline editor |
+| Crossover curves | Drawn by a routine not covered here | Butterworth, Bessel and Linkwitz-Riley responses |
 
 ### 15.3 Not used by this project
 
-- **Commands:** `0x04`, `0x11`, `0x15`, `0x19`, `0x1A`, `0x23` (factory reset),
-  `0x24` (sent), `0x25`, `0x28`, `0x2A`, `0x2D`, `0x2E`, `0x2F`, `0x3C`, `0x49`.
-- **Dump fields:** the test-signal state, the delay unit, and the EQ/GEQ
-  bypass-all bits in the switches block.
-- **Interfaces:** USB HID, serial and UDP discovery. The project only uses TCP.
-- **Files:** `.prs` and `.unt`. The project has its own preset library on the
-  server. Like the original software when it loads a `.prs`, it sends a library
-  preset as single commands.
-- **Locking:** lock and PTS handling. A locked device would probably not work
-  with the project *(inferred)*.
+- **Commands:** `0x04`, `0x19`, `0x1A`, `0x23` (factory reset), `0x24` (sent),
+  `0x25`, `0x28` (whole-device backup), `0x2E` (PTS setup), `0x2F` (lock setup).
+  Setting up a lock or a PTS limit and the factory reset are left to the
+  original software.
+- **Interfaces:** USB HID, serial and UDP discovery.
+- **Files:** `.prs` and `.unt`.
 - **RS232:** the remote-control protocol.
-
-### 15.4 Notes on other documents
-
-`TODO.md` still names the copy and lock commands the wrong way round. Copy is
-`0x2A`; `0x2D` / `0x2E` / `0x2F` are password check, PTS setup and lock setup.
 
 ## 16. Open points (hardware needed)
 
@@ -917,7 +916,8 @@ The table below compares the original software with this project.
 6. **Flag value 0 of `0x49`.** Assumed to mean active, as for `0x3C`.
 7. **Meter calibration.** Is 1.0 really 0 dBFS?
 8. **Linked channels.** Does the DSP apply a change to linked channels itself
-   when only one channel is addressed?
+   when only one channel is addressed? Since version 0.9.0 this project relies
+   on it, like the original software.
 9. **Limiter knee.** Does the device use it, given that the UI hides it?
 10. **RS232 protocol.** The step size of the gain command `0x41`, and the
     preset numbering of `0x43` / `0x4A`.

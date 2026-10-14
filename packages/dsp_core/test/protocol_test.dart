@@ -51,7 +51,10 @@ void main() {
       }
       expect(ProtocolService.buildFrame(0x10), TRacksProto.handshakeCommand);
       expect(ProtocolService.buildFrame(0x13), TRacksProto.requestDeviceInfo);
-      expect(ProtocolService.buildFrame(0x2c), TRacksProto.requestAllPresetsCommand);
+      expect(ProtocolService.buildFrame(0x2c), TRacksProto.requestLockStatus);
+      expect(ProtocolService.buildFrame(0x22), TRacksProto.requestPresetSlots);
+      expect(ProtocolService.buildFrame(0x14), TRacksProto.requestCurrentPreset);
+      expect(ProtocolService.buildHeartbeatCommand(), TRacksProto.statusQueryCommands.first);
       expect(ProtocolService.buildFrame(0x12), TRacksProto.statusQueryCommands.first);
     });
 
@@ -119,8 +122,8 @@ void main() {
         frame([0x3E, 0x00, 0, 0, 99, 0, 99, 0, 0, 0]),
       );
       expect(
-        p206.buildLimiterCommand('Out 2', attack: 49, release: 499, unknown: 0, threshold: 220),
-        frame([0x3F, 0x03, 49, 0, 0xF3, 0x01, 0, 0, 220, 0]),
+        p206.buildLimiterCommand('Out 2', attack: 49, release: 499, knee: 6, threshold: 220),
+        frame([0x3F, 0x03, 49, 0, 0xF3, 0x01, 6, 0, 220, 0]),
       );
       expect(p206.buildChannelNameCommand('Out 1', 'Sub L'),
           frame([0x3D, 0x02, ...'Sub L'.codeUnits, 0, 0, 0]));
@@ -153,10 +156,11 @@ void main() {
       expect(p.gainValueToDb(280), 0.0);
     });
 
-    test('frequency: 20 Hz – 20 kHz in 300 log steps', () {
-      expect(p.peqFreqToHz(0), closeTo(20, 1e-9));
-      expect(p.peqFreqToHz(100), closeTo(200, 1e-9));
-      expect(p.peqFreqToHz(300), closeTo(20000, 1e-6));
+    test('frequency: 1000 * 2^((raw - 170) / 30), 19.7 Hz – 20.16 kHz', () {
+      expect(p.peqFreqToHz(0), closeTo(19.69, 0.01));
+      expect(p.peqFreqToHz(140), closeTo(500, 1e-9));
+      expect(p.peqFreqToHz(170), closeTo(1000, 1e-9));
+      expect(p.peqFreqToHz(300), closeTo(20159, 1));
       expect(p.peqHzToFreq(1000), 170);
       expect(p.peqHzToFreq(5), 0);
       expect(p.peqHzToFreq(50000), 300);
@@ -165,13 +169,21 @@ void main() {
       }
     });
 
-    test('Q: 10^((raw - 16) / 40)', () {
+    test('Q: 2^((raw - 16) / 12) and the display table of the original editor', () {
       expect(p.peqRawToQ(16), closeTo(1.0, 1e-9));
-      expect(p.peqRawToQ(56), closeTo(10.0, 1e-9));
+      expect(p.peqRawToQ(0), closeTo(0.397, 0.001));
+      expect(p.peqRawToQ(100), closeTo(128, 1e-9));
       expect(p.peqQToRaw(1.0), 16);
       for (var raw = 0; raw <= ProtocolService.qRawMax; raw++) {
         expect(p.peqQToRaw(p.peqRawToQ(raw)), raw);
+        // The table rounds the formula (to 2–3 significant digits).
+        final shown = double.parse(ProtocolService.formatQ(raw));
+        expect((shown - p.peqRawToQ(raw)).abs() / p.peqRawToQ(raw), lessThan(0.045), reason: 'raw $raw');
       }
+      expect([0, 10, 16, 35, 56, 100].map(ProtocolService.formatQ), ['0.40', '0.71', '1.00', '3.0', '10.1', '128']);
+      // Shelves and PEQ low/high-pass types are limited to Q 3.
+      expect([for (var t = 0; t < 9; t++) ProtocolService.maxQRawForType(t)], [100, 35, 35, 35, 35, 35, 35, 100, 100]);
+      expect(p.peqRawToQ(ProtocolService.qRawTypeReset), closeTo(0.71, 0.01));
     });
 
     test('delay, threshold, times', () {
@@ -262,6 +274,57 @@ void main() {
     test('requests (host → device) are not decoded', () {
       expect(p408.decode(TRacksProto.handshakeCommand), isNull);
     });
+
+    test('lock status, preset slots, current preset and password result', () {
+      // Captured answer of a DSP 408: PTS off, limit 9999, count 0, not locked.
+      final lock = p408.decode(response(0x2c, [0x00, 0x27, 0x0f, 0x00, 0x00, 0x00])) as LockStatusMessage;
+      expect([lock.ptsOn, lock.limit, lock.count, lock.locked, lock.ptsExpired], [false, 9999, 0, false, false]);
+      final expired = p408.decode(response(0x2c, [0x01, 0x00, 0x0A, 0x00, 0x0A, 0x01])) as LockStatusMessage;
+      expect([expired.ptsExpired, expired.locked], [true, true]);
+
+      final slots = p408.decode(response(0x22, [0xff, 0xff, 0xff, 0xff, ...List.filled(14, 0), 0xff, 0xff]));
+      expect((slots as PresetSlotsMessage).used.where((u) => u).length, 6);
+      expect(slots.used.length, 20);
+      expect((p408.decode(response(0x14, [0x14])) as CurrentPresetMessage).number, 20);
+      final password = p408.decode(response(0x2d, [0x00, 0x01])) as PasswordResultMessage;
+      expect([password.mode, password.ok], [0, true]);
+    });
+
+    test('answers of another device ID are ignored', () {
+      List<int> from(int id) {
+        final dataBytes = [id, 0x00, 0x02, 0x14, 0x03];
+        return [0x10, 0x02, ...dataBytes, 0x10, 0x03, ProtocolService.calculateChecksum(dataBytes)];
+      }
+      expect(p408.decode(from(1)), isA<CurrentPresetMessage>());
+      expect(p408.decode(from(7)), isNull);
+      expect(const ProtocolService(DeviceModel.dsp408, 7).decode(from(7)), isA<CurrentPresetMessage>());
+    });
+  });
+
+  group('original editor commands', () {
+    test('device ID addressing keeps the checksum valid', () {
+      final frame = ProtocolService.withDeviceId(p408.buildKeepaliveCommand(), 0x21);
+      expect(frame, [0x10, 0x02, 0x00, 0x21, 0x01, 0x40, 0x10, 0x03, 0x01 ^ 0x21 ^ 0x01 ^ 0x40]);
+      // XOR over the whole frame from 10 02 to 10 03 gives the same checksum.
+      expect(frame.sublist(0, frame.length - 1).fold<int>(0, (x, b) => x ^ b), frame.last);
+      expect(ProtocolService.withDeviceId(p408.buildKeepaliveCommand(), 1), p408.buildKeepaliveCommand());
+    });
+
+    test('copy, bypass, delay unit, password, disconnect', () {
+      expect(p408.buildCopyChannelCommand('Out 1', 'Out 3'), frame([0x2A, 0x04, 0x06]));
+      expect(p206.buildCopyChannelCommand('In A', 'In B'), frame([0x2A, 0x00, 0x01]));
+      expect(() => p408.buildCopyChannelCommand('In A', 'Out 1'), throwsArgumentError);
+      expect(p206.buildEqBypassCommand('Out 6', true), frame([0x3C, 0x07, 0x01]));
+      expect(p408.buildGeqBypassCommand('In D', false), frame([0x49, 0x03, 0x00]));
+      expect(() => p408.buildGeqBypassCommand('Out 1', true), throwsArgumentError);
+      expect(p408.buildDelayUnitCommand(2), frame([0x15, 0x02]));
+      expect(p408.buildPasswordCommand(1, 'ab12'), frame([0x2D, 0x01, ...'AB12'.codeUnits]));
+      expect(ProtocolService.buildDisconnectCommand(), frame([0x11]));
+      expect(PacketDescriber.describe(p408.buildCopyChannelCommand('Out 1', 'Out 3')), 'COPY CHANNEL Out 1 → Out 3');
+      expect(PacketDescriber.describe(p206.buildEqBypassCommand('Out 6', true), DeviceModel.dsp206),
+          'SET EQ BYPASS Out 6 → BYPASS');
+      expect(PacketDescriber.describe(p408.buildLoadPresetCommand(19)), 'LOAD PRESET U20');
+    });
   });
 
   test('packet describer', () {
@@ -269,7 +332,7 @@ void main() {
     expect(PacketDescriber.describe(p206.buildGainCommand('Out 3', -6), DeviceModel.dsp206),
         'SET GAIN Out 3 → -6.0 dB');
     expect(PacketDescriber.describe(p408.buildHiPassCommand('In A', 100, 0)), 'SET HPF In A → BYPASS');
-    expect(PacketDescriber.describe(p408.buildLoPassCommand('In A', 100, 9)), 'SET LPF In A → 200 Hz BL -24');
+    expect(PacketDescriber.describe(p408.buildLoPassCommand('In A', 100, 9)), 'SET LPF In A → 198 Hz BL -24');
     expect(PacketDescriber.describe(p408.buildMatrixRoutingCommand('Out 1', 0x05)),
         'SET MATRIX Out 1 ← In A + In C');
     expect(PacketDescriber.describe(p408.buildDelayCommand('Out 2', 960)), 'SET DELAY Out 2 → 10.00 ms');

@@ -124,7 +124,7 @@ class ChannelFader extends StatelessWidget {
             const SizedBox(height: 2),
           ],
           Expanded(
-            // Only the fader listens to the meters (updated every 25–40 ms), on
+            // Only the fader listens to the meters (updated every 300 ms by default), on
             // its own layer so the rest of the page is not repainted.
             child: RepaintBoundary(
               child: ListenableBuilder(

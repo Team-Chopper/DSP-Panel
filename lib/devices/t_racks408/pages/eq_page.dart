@@ -32,10 +32,8 @@ String _freqLabel(double raw) {
   final hz = i >= 0 ? _freqMarkHz[i] : _proto.peqFreqToHz(raw.round());
   return hz >= 1000 ? '${(hz / 1000).round()}k' : '${hz.round()}';
 }
-String _qText(int raw) {
-  final q = _proto.peqRawToQ(raw);
-  return q >= 10 ? q.toStringAsFixed(1) : q.toStringAsFixed(2);
-}
+/// Q as the original editor shows it.
+String _qText(int raw) => ProtocolService.formatQ(raw);
 
 String _qLabel(double raw) {
   final q = _proto.peqRawToQ(raw.round());
@@ -103,6 +101,19 @@ class _EqPageState extends State<EqPage> {
                     trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                       Text('${bands.length} bands', style: const TextStyle(fontSize: 11, color: AppColors.muted)),
                       const SizedBox(width: 8),
+                      Tooltip(
+                        message: 'Bypass the whole PEQ of this channel (like "EQ Bypass" in the original editor)',
+                        child: SizedBox(
+                          width: 72,
+                          child: _SmallToggle(
+                            label: 'EQ Bypass',
+                            active: device.getEqBypass(_channel),
+                            color: AppColors.danger,
+                            onTap: () => device.setEqBypass(_channel, !device.getEqBypass(_channel)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
                       TextButton.icon(
                         style: TextButton.styleFrom(
                           visualDensity: VisualDensity.compact,
@@ -195,7 +206,8 @@ class _EqPageState extends State<EqPage> {
                 child: SizedBox(
                   height: graphHeight,
                   child: PeqGraph(
-                    bands: bands,
+                    // EQ Bypass: the bands are drawn like bypassed bands.
+                    bands: device.getEqBypass(_channel) ? [for (final b in bands) b.copy()..bypass = true] : bands,
                     hiPass: device.getHiPass(_channel),
                     loPass: device.getLoPass(_channel),
                     selectedBand: _band,
@@ -446,10 +458,11 @@ class _BandFaders extends StatelessWidget {
           ),
           _FaderColumn(
             title: 'Q',
+            // Shelves and PEQ low/high-pass types go up to Q 3 only.
             fader: ConsoleFader(
-              value: b.qRaw.toDouble(),
-              taper: LinearTaper(0, ProtocolService.qRawMax.toDouble()),
-              marks: _qMarks,
+              value: b.qRaw.clamp(0, ProtocolService.maxQRawForType(b.type)).toDouble(),
+              taper: LinearTaper(0, ProtocolService.maxQRawForType(b.type).toDouble()),
+              marks: [for (final m in _qMarks) if (m <= ProtocolService.maxQRawForType(b.type)) m],
               markLabel: _qLabel,
               color: color,
               wheelStep: 1,

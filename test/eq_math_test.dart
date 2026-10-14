@@ -12,9 +12,27 @@ void main() {
     expect(peqResponseDb(20000, 1000, 0.7, -9, 1), closeTo(0, 0.1));
     expect(peqResponseDb(20000, 1000, 0.7, 4, 2), closeTo(4, 0.1), reason: 'high shelf above');
     expect(peqResponseDb(1000, 1000, 1, 0, 3), closeTo(-3.01, 0.01), reason: 'LP -6 at cut-off');
-    expect(peqResponseDb(4000, 1000, 0.707, 0, 4), closeTo(-24.1, 0.2), reason: 'LP -12 two octaves up');
-    expect(peqResponseDb(250, 1000, 0.707, 0, 6), closeTo(-24.1, 0.2), reason: 'HP -12 two octaves down');
+    // Bilinear at 48 kHz: the frequency axis is pre-warped.
+    expect(peqResponseDb(4000, 1000, 0.707, 0, 4), closeTo(-24.48, 0.05), reason: 'LP -12 two octaves up');
+    expect(peqResponseDb(250, 1000, 0.707, 0, 6), closeTo(-24.12, 0.05), reason: 'HP -12 two octaves down');
     expect(peqResponseDb(300, 1000, 1, 0, 7), 0, reason: 'all pass');
+  });
+
+  test('peaks and shelves like the original editor (Zölzer K form)', () {
+    // A cut is the exact inverse of the boost.
+    for (final f in [100.0, 700.0, 1000.0, 1400.0, 8000.0]) {
+      for (final type in [0, 1, 2]) {
+        expect(peqResponseDb(f, 1000, 2, -6, type), closeTo(-peqResponseDb(f, 1000, 2, 6, type), 1e-9));
+      }
+    }
+    // At the same Q the K form is an RBJ peak with Q / 10^(|G|/40), i.e.
+    // wider: half an octave from the centre a +12 dB, Q 1 band has about
+    // 10.4 dB (RBJ: 7.75 dB), a -12 dB band the mirror image.
+    expect(peqResponseDb(1414, 1000, 1, 12, 0), closeTo(10.37, 0.05));
+    expect(peqResponseDb(1414, 1000, 1, -12, 0), closeTo(-10.37, 0.05));
+    // Shelves reach the full gain far from the corner.
+    expect(peqResponseDb(20, 2000, 0.71, 6, 1), closeTo(6, 0.05));
+    expect(peqResponseDb(20000, 200, 0.71, -6, 2), closeTo(-6, 0.05));
   });
 
   test('PEQ fit puts corrections into free bands only', () {

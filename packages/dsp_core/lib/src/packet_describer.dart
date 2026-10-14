@@ -24,9 +24,12 @@ class PacketDescriber {
   static String _slope(int s) =>
       s < ProtocolService.crossoverSlopeNames.length ? ProtocolService.crossoverSlopeNames[s] : '$s';
 
+  /// Preset number as shown by the original editor: 0 = F00, n = Un.
+  static String _slot(int n) => n == 0 ? 'F00' : 'U${n.toString().padLeft(2, '0')}';
+
   /// Decode an Rx frame using the parsed ProtocolMessage for richer output
-  static String describeRx(List<int> data, [DeviceModel model = DeviceModel.dsp408]) {
-    final message = ProtocolService(model).decode(data);
+  static String describeRx(List<int> data, [DeviceModel model = DeviceModel.dsp408, int deviceId = 1]) {
+    final message = ProtocolService(model, deviceId).decode(data);
     if (message is PresetMessage) {
       final label = 'U${(message.index + 1).toString().padLeft(2, '0')}';
       return 'PRESET $label: "${message.name}"';
@@ -53,8 +56,19 @@ class PacketDescriber {
       return 'METERS dBFS ${parts.isEmpty ? "(silence)" : parts.join(" ")}'
           '${dynamics.isEmpty ? '' : ' ${dynamics.join(' ')}'}';
     }
-    if (message is PresetCountMessage) {
-      return 'PRESET COUNT: ${message.count}';
+    if (message is LockStatusMessage) {
+      return 'LOCK STATUS: ${message.locked ? 'locked' : 'not locked'}, '
+          'PTS ${message.ptsOn ? 'on' : 'off'} (count ${message.count} of ${message.limit})';
+    }
+    if (message is PresetSlotsMessage) {
+      final used = [for (var i = 0; i < message.used.length; i++) if (message.used[i]) _slot(i + 1)];
+      return 'PRESET SLOTS used: ${used.isEmpty ? 'none' : used.join(' ')}';
+    }
+    if (message is CurrentPresetMessage) {
+      return 'CURRENT PRESET: ${_slot(message.number)}';
+    }
+    if (message is PasswordResultMessage) {
+      return 'PASSWORD (${message.mode == 1 ? 'PTS' : 'unlock'}): ${message.ok ? 'correct' : 'wrong'}';
     }
     if (data.length > 5 && data[5] == 0x01) return 'ACK';
     // Fallback to generic decode
@@ -76,18 +90,38 @@ class PacketDescriber {
       case 0x10: // Handshake
         return 'HANDSHAKE';
       case 0x40:
-        return 'KEEPALIVE → request meter levels';
+        return 'METERS → request meter levels';
+      case 0x11:
+        return 'DISCONNECT';
       case 0x12:
-        return 'STATUS QUERY';
+        return 'HEARTBEAT';
       case 0x13:
         return 'GET DEVICE INFO';
+      case 0x14:
+        return 'GET CURRENT PRESET';
+      case 0x15:
+        if (data.length > 6) {
+          final unit = data[6] < ProtocolService.delayUnitNames.length ? ProtocolService.delayUnitNames[data[6]] : '?';
+          return 'SET DELAY UNIT → $unit';
+        }
+        return 'SET DELAY UNIT';
+      case 0x22:
+        return 'GET PRESET SLOTS';
       case 0x2c:
-        return 'GET PRESET COUNT';
+        return 'GET LOCK STATUS';
+      case 0x2d:
+        if (data.length > 6) return 'CHECK ${data[6] == 1 ? 'PTS' : 'UNLOCK'} PASSWORD';
+        return 'CHECK PASSWORD';
+      case 0x2a:
+        if (data.length > 7) {
+          return 'COPY CHANNEL ${ch()} → ${model.channelForByte(data[7]) ?? 'ch 0x${data[7].toRadixString(16)}'}';
+        }
+        return 'COPY CHANNEL';
       case 0x20:
-        if (data.length > 6) return 'LOAD PRESET U${data[6].toString().padLeft(2, '0')}';
+        if (data.length > 6) return 'LOAD PRESET ${_slot(data[6])}';
         return 'LOAD PRESET';
       case 0x21:
-        if (data.length > 6) return 'STORE PRESET → U${data[6].toString().padLeft(2, '0')}';
+        if (data.length > 6) return 'STORE PRESET → ${_slot(data[6])}';
         return 'STORE PRESET';
       case 0x26:
         return 'STORE PRESET NAME';
@@ -119,9 +153,15 @@ class PacketDescriber {
         if (data.length > 8) {
           final band = data[7];
           final freq = band < _geqFreqs.length ? _geqFreqs[band] : '#$band';
-          return 'SET GEQ ${ch()} ${freq}Hz → ${_db(proto.geqValueToDb(data[8]))} dB';
+          return 'SET GEQ ${ch()} ${freq}Hz → ${_db(proto.geqValueToDb(_u16(data, 8)))} dB';
         }
         return 'SET GEQ';
+      case 0x3C: // EQ bypass: ch flag
+        if (data.length > 7) return 'SET EQ BYPASS ${ch()} → ${data[7] == 1 ? 'BYPASS' : 'ACTIVE'}';
+        return 'SET EQ BYPASS';
+      case 0x49: // GEQ bypass: ch flag
+        if (data.length > 7) return 'SET GEQ BYPASS ${ch()} → ${data[7] == 1 ? 'BYPASS' : 'ACTIVE'}';
+        return 'SET GEQ BYPASS';
       case 0x33: // PEQ: ch band gain(2) freq(2) Q type bypass
         if (data.length > 14) {
           final type = data[13] < ProtocolService.peqTypeNames.length
@@ -162,10 +202,11 @@ class PacketDescriber {
               '${ProtocolService.timeRawToMs(_u16(data, 9))}/${ProtocolService.timeRawToMs(_u16(data, 11))} ms';
         }
         return 'SET GATE';
-      case 0x3F: // Limiter: ch attack release ? threshold
+      case 0x3F: // Limiter: ch attack release knee threshold
         if (data.length > 14) {
           return 'SET LIMITER ${ch()} → ${_db(ProtocolService.thresholdRawToDb(_u16(data, 13)))} dB, '
-              '${ProtocolService.timeRawToMs(_u16(data, 7))}/${ProtocolService.timeRawToMs(_u16(data, 9))} ms';
+              '${ProtocolService.timeRawToMs(_u16(data, 7))}/${ProtocolService.timeRawToMs(_u16(data, 9))} ms, '
+              'knee ${_u16(data, 11)} dB';
         }
         return 'SET LIMITER';
       case 0x39: // Test tone: type param

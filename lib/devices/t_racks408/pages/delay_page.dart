@@ -1,23 +1,20 @@
 // Delay: on top one window for the inputs (left) and one for the outputs
 // (right) with a speaker per channel that is dragged to the right to delay
-// it; below vertical faders to fine-tune. Values are shown in ms or metres
-// (remembered per browser). The range of each side can be zoomed; the
-// faders use the same range, so a small range gives a fine adjustment.
+// it; below vertical faders to fine-tune. Values are shown in ms, m or ft;
+// like in the original editor the unit is stored on the DSP (0x15) and the
+// distance uses 344 m/s. The range of each side can be zoomed; the faders
+// use the same range, so a small range gives a fine adjustment.
 
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../../../services/local_settings.dart';
 import '../../../theme/app_colors.dart';
 import '../../../theme/app_theme.dart';
 import '../providers/device_provider.dart';
 import '../widgets/console_fader.dart';
 import '../widgets/ui_common.dart';
 import '../widgets/value_field.dart';
-
-/// Speed of sound at 20 °C in m/ms.
-const _metersPerMs = 0.343;
 
 final _maxMs = ProtocolService.delayRawToMs(ProtocolService.delayRawMax);
 
@@ -34,18 +31,9 @@ class DelayPage extends StatefulWidget {
 }
 
 class _DelayPageState extends State<DelayPage> {
-  static const _unitKey = 'delayUnit';
-
-  bool _meters = LocalSettings.getString(_unitKey) == 'm';
-
   /// Chosen range per side in ms; null = automatic.
   double? _inputRange;
   double? _outputRange;
-
-  void _setUnit(bool meters) {
-    setState(() => _meters = meters);
-    LocalSettings.setString(_unitKey, meters ? 'm' : 'ms');
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -57,7 +45,7 @@ class _DelayPageState extends State<DelayPage> {
         final outputs = device.outputs;
         final inFlex = math.max(inputs.length, 3);
         final outFlex = math.max(outputs.length, 3);
-        final unit = _DelayUnit(_meters);
+        final unit = _DelayUnit(device.delayUnit);
 
         Widget side(List<String> channels, bool isInput, Widget Function(double rangeMs, Color color) child) {
           final chosen = isInput ? _inputRange : _outputRange;
@@ -72,12 +60,12 @@ class _DelayPageState extends State<DelayPage> {
             child: Row(children: [
               const Text('Unit', style: TextStyle(fontSize: 12, color: AppColors.muted)),
               const SizedBox(width: 8),
-              SegmentedButton<bool>(
-                segments: const [
-                  ButtonSegment(value: false, label: Text('ms')),
-                  ButtonSegment(value: true, label: Text('m')),
+              SegmentedButton<int>(
+                segments: [
+                  for (var u = 0; u < ProtocolService.delayUnitNames.length; u++)
+                    ButtonSegment(value: u, label: Text(ProtocolService.delayUnitNames[u])),
                 ],
-                selected: {_meters},
+                selected: {unit.unit},
                 showSelectedIcon: false,
                 style: SegmentedButton.styleFrom(
                   visualDensity: VisualDensity.compact,
@@ -85,7 +73,7 @@ class _DelayPageState extends State<DelayPage> {
                   selectedForegroundColor: AppColors.accent,
                   side: const BorderSide(color: AppColors.border),
                 ),
-                onSelectionChanged: (s) => _setUnit(s.first),
+                onSelectionChanged: (s) => device.setDelayUnit(s.first),
               ),
               const SizedBox(width: 16),
               const Expanded(
@@ -163,16 +151,23 @@ class _DelayPageState extends State<DelayPage> {
   }
 }
 
-/// Display unit: ms or metres.
+/// Display unit: 0 = ms, 1 = m, 2 = ft (as stored on the DSP).
 class _DelayUnit {
-  final bool meters;
+  final int unit;
 
-  const _DelayUnit(this.meters);
+  const _DelayUnit(int unit) : unit = unit < 0 || unit > 2 ? 0 : unit;
 
-  String get suffix => meters ? 'm' : 'ms';
+  String get suffix => ProtocolService.delayUnitNames[unit];
 
-  double fromMs(double ms) => meters ? ms * _metersPerMs : ms;
-  double toMs(double value) => meters ? value / _metersPerMs : value;
+  /// Length of one ms of delay in this unit (1 for ms).
+  double get _perMs => switch (unit) {
+        1 => ProtocolService.metersPerMs,
+        2 => ProtocolService.metersPerMs * ProtocolService.feetPerMeter,
+        _ => 1.0,
+      };
+
+  double fromMs(double ms) => ms * _perMs;
+  double toMs(double value) => value / _perMs;
 
   String format(double ms) {
     final v = fromMs(ms);
@@ -384,7 +379,7 @@ class _StageGridPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _StageGridPainter old) =>
-      old.rangeMs != rangeMs || old.unit.meters != unit.meters || old.width != width;
+      old.rangeMs != rangeMs || old.unit.unit != unit.unit || old.width != width;
 }
 
 class _RangeMenu extends StatelessWidget {
@@ -483,8 +478,15 @@ class _Faders extends StatelessWidget {
                     onSubmitted: (input) {
                       final v = parseNumber(input);
                       if (v == null || v < 0) return false;
-                      final inMeters = unit.meters ? !input.contains('ms') : RegExp(r'\d\s*m(?!s)').hasMatch(input);
-                      device.setDelayMs(ch, (inMeters ? v / _metersPerMs : v).clamp(0.0, _maxMs));
+                      // A typed unit wins over the shown one ("3 m", "10 ms", "8 ft").
+                      final typed = RegExp(r'\d\s*ms').hasMatch(input)
+                          ? 0
+                          : RegExp(r'\d\s*ft').hasMatch(input)
+                              ? 2
+                              : RegExp(r'\d\s*m').hasMatch(input)
+                                  ? 1
+                                  : unit.unit;
+                      device.setDelayMs(ch, _DelayUnit(typed).toMs(v).clamp(0.0, _maxMs));
                       return true;
                     },
                   ),

@@ -6,10 +6,14 @@
 // Client → server
 //   {t: subscribe,   dsp}                 full state + log, then live updates
 //   {t: unsubscribe, dsp}
-//   {t: addDsp,      name, host, port, model}     model: auto|dsp408|dsp206
-//   {t: updateDsp,   id, name?, host?, port?, enabled?, model?}
+//   {t: addDsp,      name, host, port, model, deviceId?, password?}
+//                    model: auto|dsp408|dsp206
+//   {t: updateDsp,   id, name?, host?, port?, enabled?, model?, deviceId?, password?}
 //   {t: removeDsp,   id}
 //   {t: op,          dsp, op}             see device_ops.dart
+//   {t: link,        dsp, master, slaves} link like the original editor
+//                                         (0x2A copy, 0x3B, re-read)
+//   {t: copy,        dsp, from, to: [..]} copy on the device (0x2A, re-read)
 //   {t: loadPreset,  dsp, index}
 //   {t: savePreset,  dsp, index, name}
 //   {t: setRefresh,  dsp, ms}
@@ -42,6 +46,8 @@ class Msg {
   static const updateDsp = 'updateDsp';
   static const removeDsp = 'removeDsp';
   static const op = 'op';
+  static const link = 'link';
+  static const copy = 'copy';
   static const loadPreset = 'loadPreset';
   static const savePreset = 'savePreset';
   static const setRefresh = 'setRefresh';
@@ -109,8 +115,9 @@ enum DspStatus {
   error,
 }
 
-/// Default keepalive/meter polling interval in ms (allowed: 5–300).
-const int defaultRefreshMs = 40;
+/// Default meter polling interval in ms (allowed: 5–300), the interval of
+/// the original editor.
+const int defaultRefreshMs = 300;
 
 /// Public description of one configured DSP and its connection.
 class DspInfo {
@@ -139,6 +146,13 @@ class DspInfo {
   /// then shows default values and a warning.
   final bool configReadable;
 
+  /// Device ID the DSP answers from (1 … 250).
+  final int deviceId;
+
+  /// A password for a locked DSP is stored (the password itself is not
+  /// sent to clients).
+  final bool hasPassword;
+
   const DspInfo({
     required this.id,
     required this.name,
@@ -154,6 +168,8 @@ class DspInfo {
     this.model = 'dsp408',
     this.modelSetting = 'auto',
     this.configReadable = true,
+    this.deviceId = 1,
+    this.hasPassword = false,
   });
 
   Map<String, Object?> toJson() => {
@@ -171,6 +187,8 @@ class DspInfo {
     'model': model,
     'modelSetting': modelSetting,
     'configReadable': configReadable,
+    'deviceId': deviceId,
+    'hasPassword': hasPassword,
   };
 
   factory DspInfo.fromJson(Map<String, Object?> json) => DspInfo(
@@ -189,6 +207,8 @@ class DspInfo {
     model: json['model'] as String? ?? 'dsp408',
     modelSetting: json['modelSetting'] as String? ?? 'auto',
     configReadable: json['configReadable'] as bool? ?? true,
+    deviceId: (json['deviceId'] as num? ?? 1).toInt(),
+    hasPassword: json['hasPassword'] as bool? ?? false,
   );
 }
 

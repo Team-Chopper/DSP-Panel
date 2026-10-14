@@ -60,11 +60,29 @@ class PanelProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// [model]: 'auto' (detect from the device), 'dsp408' or 'dsp206'.
-  void addDsp({required String name, required String host, required int port, String model = 'auto'}) =>
-      server.send({'t': Msg.addDsp, 'name': name, 'host': host, 'port': port, 'model': model});
+  /// [model]: 'auto' (detect from the device), 'dsp408' or 'dsp206';
+  /// [deviceId]: the DSP's ID (1–250); [password]: of a locked DSP.
+  void addDsp({
+    required String name,
+    required String host,
+    required int port,
+    String model = 'auto',
+    int deviceId = 1,
+    String password = '',
+  }) =>
+      server.send({
+        't': Msg.addDsp,
+        'name': name,
+        'host': host,
+        'port': port,
+        'model': model,
+        'deviceId': deviceId,
+        'password': password,
+      });
 
-  void updateDsp(String id, {String? name, String? host, int? port, bool? enabled, String? model}) =>
+  /// [password]: null keeps the stored one, '' removes it.
+  void updateDsp(String id,
+          {String? name, String? host, int? port, bool? enabled, String? model, int? deviceId, String? password}) =>
       server.send({
         't': Msg.updateDsp,
         'id': id,
@@ -73,6 +91,8 @@ class PanelProvider extends ChangeNotifier {
         'port': ?port,
         'enabled': ?enabled,
         'model': ?model,
+        'deviceId': ?deviceId,
+        'password': ?password,
       });
 
   void removeDsp(String id) => server.send({'t': Msg.removeDsp, 'id': id});

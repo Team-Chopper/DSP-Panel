@@ -50,13 +50,27 @@ class DeviceModel {
 
   static bool isKnownId(String id) => all.any((m) => m.id == id);
 
+  /// Start of the device info answer (0x13) of this model, "DSP408".
+  String get infoPrefix => name.replaceAll(' ', '');
+
+  /// Protocol version the original editor requires after the prefix.
+  static const infoVersion = 'V010';
+
   /// Recognise the model from the device info string (e.g. "DSP408 V0104P").
+  /// Like the original editor, the answer must start with "DSP408" or
+  /// "DSP206".
   static DeviceModel? detect(String deviceInfo) {
-    final compact = deviceInfo.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
-    if (compact.contains('206')) return dsp206;
-    if (compact.contains('408')) return dsp408;
+    final info = deviceInfo.trim().toUpperCase();
+    for (final model in all) {
+      if (info.startsWith(model.infoPrefix)) return model;
+    }
     return null;
   }
+
+  /// The device info reports the protocol version the original editor
+  /// accepts ("DSP408 V010…").
+  bool supportsVersion(String deviceInfo) =>
+      deviceInfo.trim().toUpperCase().startsWith('$infoPrefix $infoVersion');
 
   /// All channels in protocol and meter order: inputs, then outputs.
   List<String> get channels => [...inputs, ...outputs];

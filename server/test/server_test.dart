@@ -179,6 +179,15 @@ void main() {
     final saved = DeviceRegistry(File('${dataDir.path}/devices.json')).load();
     expect(saved.single.port, fake.port);
     expect(saved.single.model, 'auto');
+    expect(saved.single.deviceId, 1);
+
+    // Linking runs on the server like the original editor and ends with a
+    // new state for every client.
+    a.send({'t': Msg.link, 'dsp': id, 'master': 'Out 1', 'slaves': ['Out 2']});
+    await b.waitFor((m) => m['t'] == Msg.state && (((m['state'] as Map)['links'] as Map)['Out 1']) == 3);
+    expect(fake.receivedSetCommands, containsAllInOrder(['COPY CHANNEL Out 1 → Out 2', 'SET LINK Out 1 → Out 1 + Out 2']));
+    a.send({'t': Msg.copy, 'dsp': id, 'from': 'Out 3', 'to': ['Out 4']});
+    await b.waitFor((m) => m['t'] == Msg.state && (((m['state'] as Map)['gains'] as Map)['Out 4']) == -12);
 
     a.send({'t': Msg.removeDsp, 'id': id});
     await b.waitFor((m) => m['t'] == Msg.dspRemoved);
@@ -244,8 +253,10 @@ void main() {
     client.send({'t': Msg.addDsp, 'name': '', 'host': '1.2.3.4', 'port': 9761});
     client.send({'t': Msg.addDsp, 'name': 'X', 'host': 'a b', 'port': 9761});
     client.send({'t': Msg.addDsp, 'name': 'X', 'host': '1.2.3.4', 'port': 70000});
+    client.send({'t': Msg.addDsp, 'name': 'X', 'host': '1.2.3.4', 'port': 9761, 'deviceId': 251});
+    client.send({'t': Msg.addDsp, 'name': 'X', 'host': '1.2.3.4', 'port': 9761, 'password': 'abc'});
     client.send({'t': 'bogus'});
-    await client.waitFor((_) => client.ofType(Msg.error).length == 4);
+    await client.waitFor((_) => client.ofType(Msg.error).length == 6);
     expect(hub.sessions, isEmpty);
     await client.close();
   });

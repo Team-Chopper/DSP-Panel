@@ -87,7 +87,7 @@ packages:
       path: "../packages/dsp_core"
       relative: true
     source: path
-    version: "0.8.0"
+    version: "0.9.0"
   file:
     dependency: transitive
     description:

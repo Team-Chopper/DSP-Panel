@@ -1,16 +1,21 @@
 // DSP Session
 //
 // One instance per configured DSP. Owns the TCP connection, the request
-// scheduler and the authoritative DeviceState.
+// scheduler and the authoritative DeviceState. The protocol flow follows
+// the original editor (ORIGINAL-SOFTWARE.md).
 //
 // Scheduling rules:
-// - Exactly one request is in flight at a time; every request has a timeout.
-// - Init, preset load and preset save run as exclusive sequences.
+// - Exactly one request is in flight at a time; every request has a timeout
+//   and is sent once more if it is not answered. A request that stays
+//   unanswered breaks the link (like the original editor); the session then
+//   reconnects with backoff.
+// - Init, preset load/save, linking and copying run as exclusive sequences.
 // - Value changes are coalesced per key (e.g. "gain:In A"): only the newest
 //   value that has not been sent yet goes to the device.
-// - Keepalive (meter polling) is just another request, sent only when idle,
-//   so its response can never be mistaken for the response to a command.
-// - After a connection failure the session reconnects with backoff.
+// - Meter polling is just another request, sent only when idle, so its
+//   response can never be mistaken for the response to a command. While no
+//   client shows the DSP, the session sends the idle heartbeat (0x12)
+//   instead.
 
 import 'dart:async';
 import 'dart:collection';
@@ -86,10 +91,15 @@ class _StepCounter {
 class _Request {
   final List<int> frame;
   final bool keepalive;
+  final Duration timeout;
+
+  /// Unanswered request: the link is broken (else the caller gets null).
+  final bool fatal;
+  int retriesLeft;
   final Completer<List<int>?> done = Completer();
   Timer? timer;
 
-  _Request(this.frame, this.keepalive);
+  _Request(this.frame, this.keepalive, this.timeout, this.retriesLeft, this.fatal);
 }
 
 class DspSession {
@@ -97,7 +107,20 @@ class DspSession {
 
   DspConfig _config;
   final SocketConnector _connector;
+
+  /// Answer timeout of a request (the original editor: 1 s on TCP); an
+  /// unanswered request is sent once more.
   final Duration requestTimeout;
+
+  /// Answer timeout of the handshake and device info (4 s, 3 attempts).
+  final Duration handshakeTimeout;
+
+  /// Answer timeouts of a preset store and recall.
+  final Duration storeTimeout;
+  final Duration recallTimeout;
+
+  /// Idle time after which the heartbeat (0x12) is sent.
+  final Duration heartbeatIdle;
   final Duration sequenceGap;
   final List<Duration> reconnectDelays;
   final Duration meterInterval;
@@ -105,7 +128,11 @@ class DspSession {
   DspSession(
     this._config, {
     SocketConnector? connector,
-    this.requestTimeout = const Duration(milliseconds: 500),
+    this.requestTimeout = const Duration(seconds: 1),
+    this.handshakeTimeout = const Duration(seconds: 4),
+    this.storeTimeout = const Duration(seconds: 10),
+    this.recallTimeout = const Duration(seconds: 50),
+    this.heartbeatIdle = const Duration(seconds: 2),
     this.sequenceGap = const Duration(milliseconds: 50),
     this.reconnectDelays = const [
       Duration(seconds: 1),
@@ -162,13 +189,15 @@ class DspSession {
         model: model.id,
         modelSetting: _config.model,
         configReadable: configReadable,
+        deviceId: _config.deviceId,
+        hasPassword: _config.password.isNotEmpty,
       );
 
   /// Model set explicitly in the configuration, or null for auto-detection.
   DeviceModel? get _configuredModel =>
       _config.model == 'auto' ? null : DeviceModel.byId(_config.model);
 
-  ProtocolService get _proto => ProtocolService(model);
+  ProtocolService get _proto => ProtocolService(model, _config.deviceId);
 
   List<LogEntry> get logEntries => List.of(_log);
 
@@ -185,14 +214,13 @@ class DspSession {
   final _stopwatch = Stopwatch();
 
   _Request? _inFlight;
-  int _consecutiveTimeouts = 0;
   bool _exclusive = false;
   final List<Completer<void>> _idleWaiters = [];
 
   /// Coalesced value changes waiting to be sent, in first-queued order.
   final LinkedHashMap<String, List<List<int>>> _pendingOps = LinkedHashMap();
 
-  /// Frames of the op currently being sent (e.g. gain is sent twice).
+  /// Frames of the op currently being sent.
   final List<List<int>> _batch = [];
 
   /// Config chunks collected while a dump is being read.
@@ -203,6 +231,13 @@ class DspSession {
   final Queue<LogEntry> _log = Queue();
   final List<LogEntry> _logPending = [];
 
+  /// Poll the meters (a client shows this DSP); otherwise only the
+  /// heartbeat keeps the link alive.
+  bool _metersWanted = true;
+
+  /// Last time a request was sent or answered.
+  DateTime _lastActivity = DateTime.now();
+
   // ─── Lifecycle ───
 
   /// Start connecting (if enabled). Reconnects automatically until [stop].
@@ -212,25 +247,42 @@ class DspSession {
     unawaited(_connectLoop(++_generation));
   }
 
-  /// Disconnect and stop reconnecting.
+  /// Disconnect (with 0x11, like the original editor) and stop reconnecting.
   Future<void> stop() async {
     final wasRunning = _running;
     _running = false;
     _generation++;
     _wakeUp?.complete();
     _wakeUp = null;
-    await _closeSocket(wasRunning ? 'Disconnected' : null);
+    await _closeSocket(wasRunning ? 'Disconnected' : null, sayGoodbye: true);
     _setStatus(DspStatus.disconnected, progress: 0.0, message: null);
   }
 
-  /// Apply new settings; reconnects if the address, model or enabled flag
-  /// changed.
-  Future<void> updateConfig({String? name, String? host, int? port, bool? enabled, String? model}) async {
+  /// Apply new settings; reconnects if the address, model, device ID,
+  /// password or enabled flag changed.
+  Future<void> updateConfig({
+    String? name,
+    String? host,
+    int? port,
+    bool? enabled,
+    String? model,
+    int? deviceId,
+    String? password,
+  }) async {
     final reconnect = (host != null && host != _config.host) ||
         (port != null && port != _config.port) ||
         (enabled != null && enabled != _config.enabled) ||
-        (model != null && model != _config.model);
-    _config = _config.copyWith(name: name, host: host, port: port, enabled: enabled, model: model);
+        (model != null && model != _config.model) ||
+        (deviceId != null && deviceId != _config.deviceId) ||
+        (password != null && password.toUpperCase() != _config.password);
+    _config = _config.copyWith(
+        name: name,
+        host: host,
+        port: port,
+        enabled: enabled,
+        model: model,
+        deviceId: deviceId,
+        password: password?.toUpperCase());
     _events.add(const ConfigChanged());
     if (reconnect) {
       await stop();
@@ -297,7 +349,6 @@ class DspSession {
     _addStatusLog('Connecting to ${_config.host}:${_config.port} …');
     packetsSent = 0;
     packetsReceived = 0;
-    _consecutiveTimeouts = 0;
     _decoder.reset();
 
     final socket = await _connector(_config.host, _config.port, const Duration(seconds: 5));
@@ -327,9 +378,12 @@ class DspSession {
     if (closed != null && !closed.isCompleted) closed.complete();
   }
 
-  Future<void> _closeSocket(String? reason) async {
+  /// Close the connection. [sayGoodbye]: send the disconnect command (0x11)
+  /// first, like the original editor when it ends a session.
+  Future<void> _closeSocket(String? reason, {bool sayGoodbye = false}) async {
     _stopKeepalive();
     final socket = _socket;
+    if (sayGoodbye && socket != null) await _sendDisconnect(socket);
     _socket = null;
     await _subscription?.cancel();
     _subscription = null;
@@ -350,65 +404,124 @@ class DspSession {
     if (reason != null) _addStatusLog(reason);
   }
 
+  /// Send 0x11 (no answer expected).
+  Future<void> _sendDisconnect(Socket socket) async {
+    try {
+      socket.add(ProtocolService.withDeviceId(ProtocolService.buildDisconnectCommand(), _config.deviceId));
+      packetsSent++;
+      await socket.flush().timeout(const Duration(milliseconds: 500));
+    } catch (_) {
+      // The connection is going away anyway.
+    }
+  }
+
   // ─── Init ───
 
-  /// Handshake, device info (→ model), preset names and the full config
-  /// dump. The state is only published once everything has been read.
+  /// Like the original editor: handshake, device info (model and version
+  /// check), lock/PTS status (with the stored password if the DSP is
+  /// locked), then everything [_readAll] reads. The state is only published
+  /// once everything has been read.
   Future<void> _runInit() async {
     _setStatus(DspStatus.initializing, progress: 0.0);
-    final steps = _StepCounter(5 + TRacksProto.presetCount + ConfigDump(model).chunkCount + 2,
-        (p) => _setStatus(DspStatus.initializing, progress: p));
+    final steps = _StepCounter(3 + _readAllSteps, (p) => _setStatus(DspStatus.initializing, progress: p));
     final socket = _socket;
 
     _exclusive = true;
     try {
-      await _require(socket, TRacksProto.handshakeCommand);
+      await _handshake(socket, TRacksProto.handshakeCommand);
       steps.next();
 
-      final info = await _require(socket, TRacksProto.requestDeviceInfo);
-      final deviceName = (ProtocolService().decode(info) as DeviceInfoMessage?)?.deviceName ?? '';
+      final info = await _handshake(socket, TRacksProto.requestDeviceInfo);
+      final deviceName =
+          (ProtocolService(DeviceModel.dsp408, _config.deviceId).decode(info) as DeviceInfoMessage?)?.deviceName ?? '';
       steps.next();
-      final detected = DeviceModel.detect(deviceName);
-      final model = _configuredModel ?? detected ?? DeviceModel.dsp408;
-      if (_configuredModel != null && detected != null && detected != _configuredModel) {
-        _addStatusLog('Device reports "$deviceName" but is configured as ${_configuredModel!.name}');
-      } else if (detected == null) {
-        _addStatusLog('Unknown device "$deviceName" – using ${model.name}');
-      }
+      final model = await _checkDevice(socket, deviceName);
       _addStatusLog('Device: $deviceName (${model.name})');
-      // Collect preset names into a fresh state of the right model; it is
-      // published after the config dump.
+      // Collect slots and preset names into a fresh state of the right
+      // model; it is published after the config dump.
       state = DeviceState(model)..deviceName = deviceName;
       meters = List.filled(model.meterCount, 0.0);
       dynamics = 0;
 
-      // The original editor sends these; their meaning is unknown and a
-      // missing answer is not an error.
-      for (final cmd in [
-        TRacksProto.requestAllPresetsCommand,
-        TRacksProto.unknownStartup22,
-        TRacksProto.unknownStartup14,
-      ]) {
-        await _optional(socket, cmd);
-        steps.next();
-      }
-      for (final cmd in TRacksProto.loadAllPresetsCommands) {
-        await _require(socket, cmd);
-        steps.next();
-      }
-
-      final stream = await _readConfig(socket, steps.next);
-      _applyDump(stream);
-
-      for (final cmd in TRacksProto.statusQueryCommands) {
-        await _optional(socket, cmd);
-        steps.next();
-      }
+      await _checkLock(socket);
+      steps.next();
+      await _readAll(socket, steps.next);
     } finally {
       _exclusive = false;
       _chunks = null;
     }
     _events.add(const StateReplaced());
+  }
+
+  /// The model of the device; like the original editor, a device that does
+  /// not report itself as a DSP 408/206 with protocol version V010 (or not
+  /// as the configured model) is refused.
+  Future<DeviceModel> _checkDevice(Socket? socket, String deviceName) async {
+    final detected = DeviceModel.detect(deviceName);
+    final configured = _configuredModel;
+    String? wrong;
+    if (detected == null) {
+      wrong = 'Wrong device: the DSP reports "$deviceName"';
+    } else if (configured != null && configured != detected) {
+      wrong = 'Wrong device: the DSP reports "$deviceName", configured as ${configured.name}';
+    } else if (!detected.supportsVersion(deviceName)) {
+      wrong = 'Wrong device version: "$deviceName"';
+    }
+    if (wrong != null) {
+      if (socket != null) await _sendDisconnect(socket);
+      throw SessionFailure(wrong);
+    }
+    return detected!;
+  }
+
+  /// Ask for the lock/PTS status (0x2C). A locked DSP, or one whose PTS
+  /// limit is reached, needs its password (0x2D); without a stored
+  /// password, or with a wrong one, the session ends like the original
+  /// editor's Cancel (0x11).
+  Future<void> _checkLock(Socket? socket) async {
+    final answer = await _optional(socket, TRacksProto.requestLockStatus);
+    final lock = answer == null ? null : _proto.decode(answer);
+    if (lock is! LockStatusMessage || !(lock.ptsExpired || lock.locked)) return;
+
+    final mode = lock.ptsExpired ? 1 : 0;
+    final what = mode == 1 ? 'The PTS limit of the DSP is reached' : 'The DSP is locked';
+    _addStatusLog('$what – checking the password');
+    Future<Never> refuse(String reason) async {
+      if (socket != null) await _sendDisconnect(socket);
+      throw SessionFailure('$what – $reason');
+    }
+
+    if (_config.password.isEmpty) await refuse('enter its password in the DSP settings');
+    final check = await _request(_proto.buildPasswordCommand(mode, _config.password),
+        timeout: const Duration(milliseconds: 3100), retries: 0, fatal: false);
+    final reply = check == null ? null : _proto.decode(check);
+    if (reply is! PasswordResultMessage) await refuse('the password check was not answered');
+    if (!reply.ok) await refuse('wrong password');
+    _addStatusLog('Password accepted');
+    await Future<void>.delayed(sequenceGap);
+  }
+
+  /// Requests of [_readAll].
+  int get _readAllSteps => 2 + TRacksProto.presetCount + ConfigDump(model).chunkCount + 2;
+
+  /// Preset slot table (0x22), current preset (0x14), preset names (0x29),
+  /// the config dump (0x27) and the heartbeats (0x12) – what the original
+  /// editor reads when it connects and after linking or copying.
+  Future<void> _readAll(Socket? socket, void Function() step) async {
+    await _optional(socket, TRacksProto.requestPresetSlots);
+    step();
+    await _optional(socket, TRacksProto.requestCurrentPreset);
+    step();
+    for (final cmd in TRacksProto.loadAllPresetsCommands) {
+      await _require(socket, cmd);
+      step();
+    }
+    final stream = await _readConfig(socket, step);
+    _applyDump(stream);
+    for (final cmd in TRacksProto.statusQueryCommands) {
+      await _optional(socket, cmd);
+      step();
+    }
   }
 
   /// Read the config dump: as many chunks as the model's layout needs. A
@@ -417,10 +530,10 @@ class DspSession {
     final dump = ConfigDump(model);
     final chunks = _chunks = {};
     for (var i = 0; i < dump.chunkCount; i++) {
-      final response = await _requestWithRetries(socket, TRacksProto.configDumpCommand(i));
+      final response = await _request(TRacksProto.configDumpCommand(i), fatal: false);
       step();
       if (response == null) {
-        if (!identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
+        if (socket == null || !identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
         _addStatusLog('Config chunk $i not answered – dump ends here');
         break;
       }
@@ -430,12 +543,15 @@ class DspSession {
     return [for (var i = 0; chunks.containsKey(i); i++) ...chunks[i]!];
   }
 
-  /// Decode [stream] into the state. Keeps preset names and device name.
+  /// Decode [stream] into the state. Keeps the device name and what was
+  /// read before the dump (preset names, slots, current preset).
   void _applyDump(List<int> stream) {
     final result = ConfigDump(model).decode(stream);
     configReadable = result.isPlausible;
     final next = configReadable ? result.state : DeviceState(model);
     next.presets.addAll(state.presets);
+    next.presetSlots.addAll(state.presetSlots);
+    next.currentPresetNumber = state.currentPresetNumber;
     next.deviceName = state.deviceName;
     state = next;
     if (configReadable) {
@@ -451,9 +567,10 @@ class DspSession {
     _emitInfo();
   }
 
-  /// Request that must be answered (with retries), else the step fails.
-  Future<List<int>> _require(Socket? socket, List<int> frame) async {
-    final response = await _requestWithRetries(socket, frame);
+  /// Handshake request: 4 s timeout, 3 attempts, else the init fails.
+  Future<List<int>> _handshake(Socket? socket, List<int> frame) async {
+    if (socket == null || !identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
+    final response = await _request(frame, timeout: handshakeTimeout, retries: 2, fatal: false);
     if (response != null) {
       await Future<void>.delayed(sequenceGap);
       return response;
@@ -463,42 +580,44 @@ class DspSession {
         : 'Initialization failed: DSP is not responding');
   }
 
-  /// Request whose answer is optional (single attempt).
-  Future<void> _optional(Socket? socket, List<int> frame) async {
-    if (!identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
-    if (await _request(frame) == null) {
-      _consecutiveTimeouts = 0; // an unanswered optional request is fine
+  /// Request that must be answered, else the link is broken.
+  Future<List<int>> _require(Socket? socket, List<int> frame, {Duration? timeout}) async {
+    if (socket == null || !identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
+    final response = await _request(frame, timeout: timeout);
+    if (response != null) {
+      await Future<void>.delayed(sequenceGap);
+      return response;
+    }
+    throw SessionFailure(message ?? 'DSP is not responding');
+  }
+
+  /// Request whose answer is optional (a device that does not answer it is
+  /// tolerated). Returns the answer or null.
+  Future<List<int>?> _optional(Socket? socket, List<int> frame) async {
+    if (socket == null || !identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
+    final response = await _request(frame, fatal: false);
+    if (response == null) {
+      if (!identical(_socket, socket)) throw SessionFailure(message ?? 'Connection lost');
       logDebug('[${_config.name}] no answer to optional ${PacketDescriber.describe(frame)}');
     }
     await Future<void>.delayed(sequenceGap);
+    return response;
   }
 
-  Future<List<int>?> _requestWithRetries(Socket? socket, List<int> frame, {int retries = 2}) async {
-    for (var attempt = 0; attempt <= retries; attempt++) {
-      if (socket == null || !identical(_socket, socket)) return null;
-      final response = await _request(frame);
-      if (response != null) return response;
-    }
-    return null;
-  }
-
-  /// Send [frames] one by one, each after the previous response (with
-  /// retries). Returns false if the device stopped answering.
+  /// Send [frames] one by one, each after the previous answer. Returns
+  /// false if the device stopped answering.
   Future<bool> _runSequence(
     List<List<int>> frames, {
     required void Function(int done, int total) onProgress,
-    int retries = 2,
+    Duration? Function(List<int> frame)? timeoutFor,
   }) async {
     // Abort if the connection is replaced while the sequence is running.
     final socket = _socket;
     bool connected() => socket != null && identical(_socket, socket);
 
     for (var i = 0; i < frames.length; i++) {
-      List<int>? response;
-      for (var attempt = 0; attempt <= retries && response == null; attempt++) {
-        if (!connected()) return false;
-        response = await _request(frames[i]);
-      }
+      if (!connected()) return false;
+      final response = await _request(frames[i], timeout: timeoutFor?.call(frames[i]));
       if (response == null) return false;
       onProgress(i + 1, frames.length);
       await Future<void>.delayed(sequenceGap);
@@ -508,14 +627,26 @@ class DspSession {
 
   // ─── Requests ───
 
-  Future<List<int>?> _request(List<int> frame, {bool keepalive = false}) {
+  /// Send [frame] (addressed to the device ID) and wait for the answer.
+  /// An unanswered request is sent [retries] more times; after that it
+  /// returns null and, if [fatal], the link counts as broken.
+  Future<List<int>?> _request(List<int> frame,
+      {bool keepalive = false, Duration? timeout, int retries = 1, bool fatal = true}) {
     final socket = _socket;
     if (socket == null || _inFlight != null) return Future.value(null);
 
-    final request = _Request(frame, keepalive);
+    final request = _Request(
+        ProtocolService.withDeviceId(frame, _config.deviceId), keepalive, timeout ?? requestTimeout, retries, fatal);
     _inFlight = request;
+    _send(socket, request);
+    return request.done.future;
+  }
+
+  void _send(Socket socket, _Request request) {
+    final frame = request.frame;
     socket.add(frame);
     packetsSent++;
+    _lastActivity = DateTime.now();
     if (logTx) {
       _addLog(LogEntry.packet(
         rawHex: 'Tx: ${_proto.formatAsHex(frame)} → ${_proto.formatAsAscii(frame)}',
@@ -523,18 +654,19 @@ class DspSession {
         timestamp: _elapsed,
       ));
     }
-    request.timer = Timer(requestTimeout, () {
+    request.timer = Timer(request.timeout, () {
       if (!identical(_inFlight, request)) return;
+      logDebug('[${_config.name}] timeout for ${PacketDescriber.describe(frame, model)}');
+      if (request.retriesLeft > 0 && identical(_socket, socket)) {
+        request.retriesLeft--;
+        _send(socket, request);
+        return;
+      }
       _inFlight = null;
       request.done.complete(null);
-      _consecutiveTimeouts++;
-      logDebug('[${_config.name}] timeout for ${PacketDescriber.describe(frame, model)}');
-      if (_consecutiveTimeouts >= 5) {
-        _connectionLost(socket, 'DSP is not responding');
-      }
+      if (request.fatal) _connectionLost(socket, 'DSP is not responding (link broken)');
       _afterRequest();
     });
-    return request.done.future;
   }
 
   void _afterRequest() {
@@ -566,12 +698,12 @@ class DspSession {
   void _onFrame(List<int> frame) {
     packetsReceived++;
     final message = _proto.decode(frame);
-    if (message == null) return; // not a device response
+    if (message == null) return; // not an answer of our device
 
     if (logRx) {
       _addLog(LogEntry.packet(
         rawHex: 'Rx: ${_proto.formatAsHex(frame)} → ${_proto.formatAsAscii(frame)}',
-        decoded: 'Rx: ${PacketDescriber.describeRx(frame, model)}',
+        decoded: 'Rx: ${PacketDescriber.describeRx(frame, model, _config.deviceId)}',
         timestamp: _elapsed,
       ));
     }
@@ -584,19 +716,25 @@ class DspSession {
       case PresetMessage(:final index, :final name):
         state.presets[index] = name;
         if (status == DspStatus.ready) _events.add(const StateReplaced());
+      case PresetSlotsMessage(:final used):
+        state.presetSlots
+          ..clear()
+          ..addAll([for (var i = 0; i < used.length; i++) if (used[i]) i]);
+      case CurrentPresetMessage(:final number):
+        state.currentPresetNumber = number;
       case ChannelConfigMessage(:final subIndex, :final chunkData):
         _chunks?[subIndex] = chunkData;
       default:
         break;
     }
 
-    // Meter frames only answer keepalives; any other response answers the
-    // command in flight.
+    // Meter frames only answer meter requests; any other response answers
+    // the command in flight.
     final request = _inFlight;
     if (request != null && request.keepalive == (message.command == 0x40)) {
       request.timer?.cancel();
       _inFlight = null;
-      _consecutiveTimeouts = 0;
+      _lastActivity = DateTime.now();
       request.done.complete(frame);
       _afterRequest();
     }
@@ -619,13 +757,20 @@ class DspSession {
   bool get _isIdle =>
       _inFlight == null && _batch.isEmpty && _pendingOps.isEmpty && !_exclusive;
 
-  // ─── Keepalive & meters ───
+  // ─── Meters & heartbeat ───
+
+  /// Poll the meters only while a client shows this DSP; otherwise the
+  /// idle heartbeat (0x12) keeps the link alive, like the original editor.
+  void setMetersWanted(bool wanted) => _metersWanted = wanted;
 
   void _startKeepalive() {
     _stopKeepalive();
     _keepaliveTimer = Timer.periodic(Duration(milliseconds: _config.refreshMs), (_) {
-      if (status == DspStatus.ready && _isIdle) {
+      if (status != DspStatus.ready || !_isIdle) return;
+      if (_metersWanted) {
         unawaited(_request(_proto.buildKeepaliveCommand(), keepalive: true));
+      } else if (DateTime.now().difference(_lastActivity) >= heartbeatIdle) {
+        unawaited(_request(ProtocolService.buildHeartbeatCommand()));
       }
     });
   }
@@ -642,7 +787,7 @@ class DspSession {
     });
   }
 
-  /// Change the keepalive/meter polling interval (5–300 ms).
+  /// Change the meter polling interval (5–300 ms).
   void setRefreshInterval(int ms) {
     _config = _config.copyWith(refreshMs: ms.clamp(5, 300));
     if (_keepaliveTimer != null) _startKeepalive();
@@ -660,22 +805,80 @@ class DspSession {
       return status == DspStatus.busy ? 'DSP is busy' : 'DSP is not connected';
     }
 
-    // Linked channels get the same change. The DSP probably mirrors linked
-    // channels itself (the original editor sends a change only once), but
-    // that is not verified; sending the values explicitly is correct either
-    // way.
+    // Like the original editor: the change goes to the device once, for
+    // the edited channel; linked channels follow in the state (the DSP is
+    // expected to apply the change to them itself).
     for (final expanded in DeviceOps.expandLinked(state, op)) {
       DeviceOps.apply(state, expanded);
-      // A newer value for a key replaces the queued one but keeps its place.
-      DeviceOps.commands(state, expanded).forEach((key, frames) => _pendingOps[key] = frames);
       _events.add(OpApplied(expanded, origin));
     }
+    // A newer value for a key replaces the queued one but keeps its place.
+    DeviceOps.commands(state, op).forEach((key, frames) => _pendingOps[key] = frames);
     _pump();
     return null;
   }
 
+  /// Link [slaves] to [master] like the original editor's link dialog:
+  /// every newly linked slave gets the master's settings on the device
+  /// (0x2A), the master gets its new mask (0x3B), then everything is read
+  /// again. An empty list unlinks [master]. Returns an error or null.
+  String? linkChannels(String master, List<String> slaves) {
+    if (status != DspStatus.ready) return 'DSP is not ready';
+    final ({int mask, List<String> added, List<String> reset}) change;
+    try {
+      change = DeviceOps.linkChange(state, master, slaves);
+    } on ArgumentError catch (e) {
+      return '${e.message}';
+    }
+    final proto = _proto;
+    final frames = [
+      for (final s in change.added) proto.buildCopyChannelCommand(master, s),
+      proto.buildLinkCommand(master, change.mask),
+      // Masks of older panel versions that still list other channels.
+      for (final s in change.reset) proto.buildLinkCommand(s, model.linkBit(s)),
+    ];
+    final label = slaves.isEmpty ? 'Unlinking $master …' : 'Linking ${[master, ...slaves].join(' + ')} …';
+    _deviceJob(label, frames, 'Link ${slaves.isEmpty ? 'released' : 'set'}: ${[master, ...slaves].join(' + ')}');
+    return null;
+  }
+
+  /// Copy [from] to every channel of [targets] on the device (0x2A), then
+  /// read everything again, like the original editor. Returns an error or
+  /// null.
+  String? copyChannels(String from, List<String> targets) {
+    if (status != DspStatus.ready) return 'DSP is not ready';
+    if (targets.isEmpty) return 'No channel to copy to';
+    if (targets.contains(from)) return '$from cannot be copied to itself';
+    final List<List<int>> frames;
+    try {
+      frames = [for (final to in targets) _proto.buildCopyChannelCommand(from, to)];
+    } on ArgumentError catch (e) {
+      return '${e.message}';
+    }
+    _deviceJob('Copying $from …', frames, 'Copied $from to ${targets.join(', ')}');
+    return null;
+  }
+
+  /// Send [frames] exclusively (after the queued value changes), then read
+  /// everything again.
+  void _deviceJob(String label, List<List<int>> frames, String doneLog) {
+    unawaited(_exclusiveJob(label, () async {
+      final socket = _socket;
+      final steps = _StepCounter(frames.length + _readAllSteps, (p) => _setStatus(DspStatus.busy, progress: p));
+      for (final frame in frames) {
+        await _require(socket, frame);
+        steps.next();
+      }
+      await _readAll(socket, steps.next);
+      _events.add(const StateReplaced());
+      _addStatusLog(doneLog);
+    }, drainFirst: true));
+  }
+
   /// Send every value of [target] to the device (loading a preset stored on
-  /// the server). Returns an error message or null.
+  /// the server), like the original editor loads a preset file: the name
+  /// (0x26), every value as a single command, then the heartbeat. Returns
+  /// an error message or null.
   String? applyFullState(DeviceState target, String label) {
     if (status != DspStatus.ready) return 'DSP is not ready';
     if (target.model != model) {
@@ -686,18 +889,20 @@ class DspSession {
     _batch.clear();
     unawaited(_exclusiveJob('Loading "$label" …', () async {
       final socket = _socket;
-      final steps = _StepCounter(ops.length, (p) => _setStatus(DspStatus.busy, progress: p));
+      final steps = _StepCounter(ops.length + 2, (p) => _setStatus(DspStatus.busy, progress: p));
+      await _require(socket, _proto.buildStorePresetNameCommand(label));
+      steps.next();
       for (final op in ops) {
         DeviceOps.apply(state, op);
         for (final frames in DeviceOps.commands(state, op).values) {
           for (final frame in frames) {
-            if (await _requestWithRetries(socket, frame) == null) {
-              throw SessionFailure('DSP stopped answering while loading "$label"');
-            }
+            await _require(socket, frame);
           }
         }
         steps.next();
       }
+      await _optional(socket, ProtocolService.buildHeartbeatCommand());
+      steps.next();
       state.currentPreset = label;
       _events.add(const StateReplaced());
       _addStatusLog('Server preset "$label" loaded (${ops.length} settings)');
@@ -718,8 +923,9 @@ class DspSession {
       final steps = _StepCounter(1 + ConfigDump(model).chunkCount + 2,
           (p) => _setStatus(DspStatus.busy, progress: p));
       try {
-        await _require(socket, _proto.buildLoadPresetCommand(index));
+        await _require(socket, _proto.buildLoadPresetCommand(index), timeout: recallTimeout);
         steps.next();
+        state.currentPresetNumber = index + 1;
         final stream = await _readConfig(socket, steps.next);
         _applyDump(stream);
         for (final cmd in TRacksProto.statusQueryCommands) {
@@ -747,12 +953,15 @@ class DspSession {
     final label = 'U${(index + 1).toString().padLeft(2, '0')}';
     unawaited(_exclusiveJob('Saving preset $label …', () async {
       final ok = await _runSequence(TRacksProto.storePresetSequence(index, trimmed),
-          onProgress: (done, total) => _setStatus(DspStatus.busy, progress: done / total));
+          onProgress: (done, total) => _setStatus(DspStatus.busy, progress: done / total),
+          timeoutFor: (frame) => frame[5] == 0x21 ? storeTimeout : null);
       if (ok) {
         // Same sanitising as the name command
         final stored = String.fromCharCodes(
             _proto.buildStorePresetNameCommand(trimmed).sublist(6, 20)).trim();
         state.presets[index] = stored;
+        state.presetSlots.add(index);
+        state.currentPresetNumber = index + 1;
         state.currentPreset = stored;
         _events.add(const StateReplaced());
         _addStatusLog('Preset $label saved: "$stored"');
@@ -768,7 +977,7 @@ class DspSession {
     _setStatus(DspStatus.busy, progress: 0.0, message: label);
     _addStatusLog(label);
     if (drainFirst) {
-      // Let queued value changes reach the device before saving.
+      // Let queued value changes reach the device first.
       while (_socket != null && !_isIdle) {
         await _waitForIdle();
         await Future<void>.delayed(Duration.zero);

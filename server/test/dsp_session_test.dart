@@ -6,13 +6,14 @@ import 'package:dsp_server/src/dsp_session.dart';
 import 'package:dsp_server/src/fake_dsp.dart';
 import 'package:test/test.dart';
 
-/// Frames the session sends while initializing a device of [model].
+/// Frames the session sends while initializing a device of [model], in the
+/// order of the original editor.
 List<List<int>> initSequence(DeviceModel model) => [
       TRacksProto.handshakeCommand,
       TRacksProto.requestDeviceInfo,
-      TRacksProto.requestAllPresetsCommand,
-      TRacksProto.unknownStartup22,
-      TRacksProto.unknownStartup14,
+      TRacksProto.requestLockStatus,
+      TRacksProto.requestPresetSlots,
+      TRacksProto.requestCurrentPreset,
       ...TRacksProto.loadAllPresetsCommands,
       for (var i = 0; i < ConfigDump(model).chunkCount; i++) TRacksProto.configDumpCommand(i),
       ...TRacksProto.statusQueryCommands,
@@ -258,20 +259,61 @@ void main() {
       expect([for (final b in s.peqBands['In B']!) b.bypass], [false, false, false, true, false, false, false, false]);
     });
 
-    test('linked channels get every change', () async {
+    test('links like the original editor: copy, master mask, read back; changes go out once', () async {
       session = createSession(refreshMs: 300);
       session.start();
       await waitFor(() => session.status == DspStatus.ready);
-      for (final op in DeviceOps.linkSlaves(session.state, 'Out 1', ['Out 2'], copySettings: false)) {
-        expect(session.applyOp(op), isNull);
-      }
+      expect(session.applyOp(DeviceOps.gain('Out 1', -4)), isNull);
+      fake.received.clear();
+
+      expect(session.linkChannels('Out 1', ['Out 2']), isNull);
+      expect(session.status, DspStatus.busy);
+      await waitFor(() => session.status == DspStatus.ready);
+      final sent = fake.received.where((f) => f[5] != 0x40).toList();
+      final proto = const ProtocolService(DeviceModel.dsp206);
+      expect(sent.take(3).toList(), [
+        proto.buildGainCommand('Out 1', -4), // queued before the link
+        proto.buildCopyChannelCommand('Out 1', 'Out 2'),
+        proto.buildLinkCommand('Out 1', 0x03),
+      ]);
+      // Then everything is read again.
+      expect(sent.skip(3).first, TRacksProto.requestPresetSlots);
+      expect(sent.where((f) => f[5] == 0x27).length, ConfigDump(DeviceModel.dsp206).chunkCount);
+      expect(session.state.links['Out 1'], 3);
+      expect(session.state.links['Out 2'], 2, reason: 'the slave keeps its own bit');
+      expect(session.state.gains['Out 2'], -4, reason: 'the device copied the master');
+      expect(DeviceOps.linkedWith(session.state, 'Out 2'), ['Out 1']);
+
+      // A change of the master is sent once; the DSP applies it to the slave.
+      fake.received.clear();
       expect(session.applyOp(DeviceOps.gain('Out 1', -9)), isNull);
-      expect(session.applyOp(DeviceOps.hiPass('Out 2', FilterState(freqRaw: 61, slope: 8))), isNull);
-      await waitFor(() => fake.state.hiPass['Out 1']!.slope == 8);
-      expect(fake.state.gains['Out 2'], -9.0);
-      expect(fake.state.links['Out 1'], 3);
-      expect(fake.receivedSetCommands, contains('SET LINK Out 1 → Out 1 + Out 2'));
       expect(session.state.gains['Out 2'], -9.0);
+      await waitFor(() => fake.state.gains['Out 2'] == -9.0);
+      expect(fake.receivedSetCommands, ['SET GAIN Out 1 → -9.0 dB']);
+
+      // Unlinking sends the master's own bit.
+      expect(session.linkChannels('Out 1', []), isNull);
+      await waitFor(() => session.status == DspStatus.ready);
+      expect(fake.state.links['Out 1'], 1);
+      expect(DeviceOps.linkedWith(session.state, 'Out 2'), isEmpty);
+      expect(session.linkChannels('Out 1', ['In A']), isNotNull);
+    });
+
+    test('copies channels on the device (0x2A) and reads the result back', () async {
+      session = createSession(refreshMs: 300);
+      session.start();
+      await waitFor(() => session.status == DspStatus.ready);
+      fake.state.gains['Out 3'] = -12;
+      fake.state.mutes['Out 3'] = true;
+      fake.state.channelNames['Out 3'] = 'Fill';
+      expect(session.copyChannels('Out 3', ['Out 4', 'Out 5']), isNull);
+      await waitFor(() => session.status == DspStatus.ready);
+      expect(fake.receivedSetCommands, containsAllInOrder(['COPY CHANNEL Out 3 → Out 4', 'COPY CHANNEL Out 3 → Out 5']));
+      expect(session.state.gains['Out 5'], -12);
+      expect(session.state.mutes['Out 4'], isTrue);
+      expect(session.state.channelNames['Out 4'], 'Out4', reason: 'names are not copied');
+      expect(session.copyChannels('Out 3', ['In A']), isNotNull);
+      expect(session.copyChannels('Out 3', ['Out 3']), isNotNull);
     });
 
     test('a complete state from a server preset is sent to the device', () async {
@@ -302,14 +344,104 @@ void main() {
       expect(session.state.currentPreset, 'Club');
     });
 
-    test('a wrong configured model is reported, not shown', () async {
+    test('a wrong configured model is refused like the original editor does', () async {
       session = createSession(model: 'dsp408');
       session.start();
+      await waitFor(() => session.status == DspStatus.error);
+      expect(session.message, contains('configured as DSP 408'));
+      expect(fake.received.map((f) => f[5]), containsAllInOrder([0x10, 0x13, 0x11]));
+      expect(fake.received.any((f) => f[5] == 0x27), isFalse);
+    });
+  });
+
+  group('original editor behaviour', () {
+    test('slot table and current preset are read', () async {
+      fake.clearPreset(5);
+      fake.currentPreset = 3;
+      session = createSession();
+      session.start();
       await waitFor(() => session.status == DspStatus.ready);
-      expect(session.model, DeviceModel.dsp408);
-      expect(session.configReadable, isFalse);
-      expect(session.info.configReadable, isFalse);
-      expect(session.logEntries.map((e) => e.text).join('\n'), contains('configured as DSP 408'));
+      expect(session.state.presetSlots, isNot(contains(5)));
+      expect(session.state.presetSlots, contains(4));
+      expect(session.state.currentPresetNumber, 3);
+    });
+
+    test('a device with an unknown protocol version is refused', () async {
+      fake.deviceInfo = 'DSP408 V0201';
+      session = createSession();
+      session.start();
+      await waitFor(() => session.status == DspStatus.error);
+      expect(session.message, contains('Wrong device version'));
+    });
+
+    test('a locked DSP needs its password', () async {
+      fake.locked = true;
+      session = createSession();
+      session.start();
+      await waitFor(() => session.status == DspStatus.error);
+      expect(session.message, contains('locked'));
+      expect(fake.received.any((f) => f[5] == 0x22), isFalse, reason: 'nothing is read from a locked DSP');
+      await session.stop();
+
+      session = DspSession(
+        DspConfig(id: 'test', name: 'Test', host: '127.0.0.1', port: fake.port, password: '1234'),
+        requestTimeout: const Duration(milliseconds: 200),
+        sequenceGap: Duration.zero,
+        reconnectDelays: const [Duration(milliseconds: 100)],
+      );
+      session.start();
+      await waitFor(() => session.status == DspStatus.ready);
+      expect(fake.received.where((f) => f[5] == 0x2D).last, const ProtocolService().buildPasswordCommand(0, '1234'));
+    });
+
+    test('device ID addresses the frames', () async {
+      await fake.stop();
+      fake = FakeDsp(deviceId: 7);
+      await fake.start();
+      session = DspSession(
+        DspConfig(id: 'test', name: 'Test', host: '127.0.0.1', port: fake.port, deviceId: 7),
+        requestTimeout: const Duration(milliseconds: 200),
+        sequenceGap: Duration.zero,
+      );
+      session.start();
+      await waitFor(() => session.status == DspStatus.ready);
+      expect(fake.received.first, ProtocolService.withDeviceId(TRacksProto.handshakeCommand, 7));
+      expect(session.info.deviceId, 7);
+    });
+
+    test('heartbeat instead of meters while nobody watches; 0x11 when stopping', () async {
+      session = DspSession(
+        DspConfig(id: 'test', name: 'Test', host: '127.0.0.1', port: fake.port, refreshMs: 20),
+        requestTimeout: const Duration(milliseconds: 200),
+        sequenceGap: Duration.zero,
+        heartbeatIdle: const Duration(milliseconds: 100),
+      )..setMetersWanted(false);
+      session.start();
+      await waitFor(() => session.status == DspStatus.ready);
+      fake.received.clear();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(fake.received.where((f) => f[5] == 0x40), isEmpty);
+      expect(fake.received.where((f) => f[5] == 0x12), isNotEmpty);
+      session.setMetersWanted(true);
+      await waitFor(() => fake.received.any((f) => f[5] == 0x40));
+
+      await session.stop();
+      await waitFor(() => fake.received.last[5] == 0x11);
+      expect(fake.received.last, ProtocolService.buildDisconnectCommand());
+    });
+
+    test('a server preset is loaded like a preset file: name, values, heartbeat', () async {
+      session = createSession();
+      session.start();
+      await waitFor(() => session.status == DspStatus.ready);
+      fake.received.clear();
+      expect(session.applyFullState(DeviceState(), 'Hall'), isNull);
+      await waitFor(() => session.status == DspStatus.ready, timeout: const Duration(seconds: 30));
+      final sent = fake.received.where((f) => f[5] != 0x40).toList();
+      expect(sent.first, const ProtocolService().buildStorePresetNameCommand('Hall'));
+      expect(sent[1][5], 0x3D, reason: 'In A name first');
+      expect(sent.last, ProtocolService.buildHeartbeatCommand());
+      expect(sent.where((f) => f[5] == 0x34).length, 12, reason: 'gain once per channel');
     });
   });
 

@@ -6,14 +6,15 @@
 //
 // Frame layout (verified against captured traffic):
 //   10 02 [src] [dst] [len] [cmd] [len-1 payload bytes] 10 03 [checksum]
-// Total frame length is len + 8. The checksum is 0x01 XOR every byte from
-// [src] up to the last payload byte. Payload bytes are NOT escaped, so a
-// payload may contain 10 03 — always use [len] to find the end of a frame.
+// Total frame length is len + 8. The host is address 0, the device answers
+// from its device ID (1 by default). The checksum is 0x01 XOR every byte
+// from [src] up to the last payload byte (the same as XOR over the whole
+// frame from 10 02 to 10 03). Payload bytes are NOT escaped, so a payload
+// may contain 10 03 — always use [len] to find the end of a frame.
 //
-// Value encodings are shared by both models. Frequency, Q, slope, delay and
-// dynamics encodings follow the FlexiFlizz project, verified on a DSP 206 with
-// captures of the original editor; the config dumps captured from a DSP 408
-// in this repository use the same scales (see TODO.md for what is open).
+// Value encodings are shared by both models and follow the original editor
+// (ORIGINAL-SOFTWARE.md): exact frequency and Q formulas, its value ranges
+// and its display tables.
 
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -25,7 +26,10 @@ enum MessageType {
   deviceInfo,
   preset,
   channelConfig,
-  presetCount,
+  lockStatus,
+  presetSlots,
+  currentPreset,
+  passwordResult,
   keepalive,
   unknown,
 }
@@ -67,12 +71,46 @@ class DeviceInfoMessage extends ProtocolMessage {
       : super(MessageType.deviceInfo, rawData);
 }
 
-/// Preset count message
-class PresetCountMessage extends ProtocolMessage {
+/// PTS / lock status (answer to 0x2C):
+/// `ptsOn limit(u16 BE) count(u16 BE) locked`.
+class LockStatusMessage extends ProtocolMessage {
+  /// The PTS limit is switched on.
+  final bool ptsOn;
+  final int limit;
   final int count;
 
-  PresetCountMessage(this.count, List<int> rawData)
-      : super(MessageType.presetCount, rawData);
+  /// The device is locked with a password.
+  final bool locked;
+
+  LockStatusMessage(this.ptsOn, this.limit, this.count, this.locked, List<int> rawData)
+      : super(MessageType.lockStatus, rawData);
+
+  /// The PTS limit is reached: the original editor asks for the PTS password.
+  bool get ptsExpired => ptsOn && limit <= count;
+}
+
+/// Preset slot table (answer to 0x22): one byte per user slot, 0xFF = used.
+class PresetSlotsMessage extends ProtocolMessage {
+  /// Used slots by 0-based index (0 = U01).
+  final List<bool> used;
+
+  PresetSlotsMessage(this.used, List<int> rawData) : super(MessageType.presetSlots, rawData);
+}
+
+/// Current preset number (answer to 0x14).
+class CurrentPresetMessage extends ProtocolMessage {
+  final int number;
+
+  CurrentPresetMessage(this.number, List<int> rawData) : super(MessageType.currentPreset, rawData);
+}
+
+/// Result of a password check (answer to 0x2D): `mode result`.
+class PasswordResultMessage extends ProtocolMessage {
+  /// 0 = unlock password, 1 = PTS password.
+  final int mode;
+  final bool ok;
+
+  PasswordResultMessage(this.mode, this.ok, List<int> rawData) : super(MessageType.passwordResult, rawData);
 }
 
 /// Keepalive/meter message (cmd 0x40 response with one level per channel)
@@ -98,7 +136,15 @@ class ProtocolService {
   /// Model whose channel bytes the command builders use.
   final DeviceModel model;
 
-  const ProtocolService([this.model = DeviceModel.dsp408]);
+  /// Device ID: the address the device answers from (1 … 250). Command
+  /// builders address ID 1; see [withDeviceId].
+  final int deviceId;
+
+  const ProtocolService([this.model = DeviceModel.dsp408, this.deviceId = 1]);
+
+  /// Device IDs the original editor can address.
+  static const int minDeviceId = 1;
+  static const int maxDeviceId = 250;
 
   // ─── Meters ───
 
@@ -183,6 +229,14 @@ class ProtocolService {
     return [0x10, 0x02, ...dataBytes, 0x10, 0x03, calculateChecksum(dataBytes)];
   }
 
+  /// [frame] addressed to device [id] (destination byte and checksum).
+  static List<int> withDeviceId(List<int> frame, int id) {
+    if (frame.length < 8 || frame[3] == id) return frame;
+    final out = List.of(frame)..[3] = id;
+    out[out.length - 1] = calculateChecksum(out.sublist(2, out.length - 3));
+    return out;
+  }
+
   static List<int> _u16(int value) => [value & 0xFF, (value >> 8) & 0xFF];
 
   int _requireChannel(String channel, {bool inputsOnly = false, bool outputsOnly = false}) {
@@ -243,32 +297,63 @@ class ProtocolService {
 
   // ─── Frequency (PEQ, HPF, LPF) ───
 
-  /// Frequency encoding: log scale from 20 Hz (raw 0) to 20 kHz (raw 300),
-  /// 100 steps per decade: Hz = 20 * 1000^(raw/300).
+  /// Frequency encoding of the original editor: 1/30-octave steps around
+  /// 1 kHz (raw 170), Hz = 1000 * 2^((raw - 170) / 30): raw 0 = 19.7 Hz,
+  /// raw 300 = 20.16 kHz.
   static const int freqRawMax = 300;
-  static const double _freqMinHz = 20.0;
+  static const int _freqRaw1k = 170;
 
   /// Convert raw frequency value to Hz
   double peqFreqToHz(int raw) =>
-      _freqMinHz * math.pow(1000.0, raw.clamp(0, freqRawMax) / freqRawMax);
+      1000.0 * math.pow(2.0, (raw.clamp(0, freqRawMax) - _freqRaw1k) / 30.0);
 
   /// Convert Hz to raw frequency value
   int peqHzToFreq(double hz) {
-    if (hz <= _freqMinHz) return 0;
-    return (100 * math.log(hz / _freqMinHz) / math.ln10).round().clamp(0, freqRawMax);
+    if (hz <= 0) return 0;
+    return (_freqRaw1k + 30 * math.log(hz / 1000) / math.ln2).round().clamp(0, freqRawMax);
   }
 
   // ─── Q ───
 
-  /// Q encoding: Q = 10^((raw - 16) / 40); raw 0 ≈ 0.40, raw 100 ≈ 126.
+  /// Q encoding of the original editor: 12 steps per doubling,
+  /// Q = 2^((raw - 16) / 12); raw 0 = 0.40, 16 = 1.0, 100 = 128.
   static const int qRawMax = 100;
 
-  double peqRawToQ(int raw) => math.pow(10.0, (raw.clamp(0, qRawMax) - 16) / 40.0).toDouble();
+  double peqRawToQ(int raw) => math.pow(2.0, (raw.clamp(0, qRawMax) - 16) / 12.0).toDouble();
 
   int peqQToRaw(double q) {
     if (q <= 0) return 0;
-    return (40 * math.log(q) / math.ln10 + 16).round().clamp(0, qRawMax);
+    return (12 * math.log(q) / math.ln2 + 16).round().clamp(0, qRawMax);
   }
+
+  /// Q as the original editor shows it (its display table rounds the
+  /// formula to two or three significant digits).
+  static String formatQ(int raw) => _qDisplay[raw.clamp(0, qRawMax)];
+
+  static const _qDisplay = [
+    '0.40', '0.42', '0.45', '0.47', '0.50', '0.53', '0.56', '0.59', '0.63', '0.67', //
+    '0.71', '0.75', '0.79', '0.84', '0.89', '0.94', '1.00', '1.06', '1.12', '1.19', //
+    '1.26', '1.3', '1.4', '1.5', '1.6', '1.7', '1.8', '1.9', '2.0', '2.1', //
+    '2.2', '2.4', '2.5', '2.7', '2.8', '3.0', '3.2', '3.4', '3.6', '3.8', //
+    '4.0', '4.2', '4.5', '4.8', '5.0', '5.3', '5.7', '6.0', '6.3', '6.7', //
+    '7.1', '7.6', '8.0', '8.5', '9.0', '9.5', '10.1', '10.7', '11.3', '12', //
+    '12.7', '13.5', '14', '15', '16', '17', '18', '19', '20', '21', //
+    '23', '24', '25', '27', '29', '30', '32', '34', '36', '38', //
+    '40', '43', '45', '48', '51', '54', '57', '60', '64', '68', //
+    '72', '76', '81', '85', '91', '96', '102', '108', '114', '121', //
+    '128',
+  ];
+
+  /// Highest Q (raw) of a PEQ type: shelves and the PEQ low/high-pass types
+  /// are limited to Q 3.0 by the original editor, peak and all-pass use the
+  /// full range.
+  static int maxQRawForType(int type) => (type >= 1 && type <= 6) ? qRawLimited : qRawMax;
+
+  /// Q 3.0, the limit of shelves and PEQ low/high-pass types.
+  static const int qRawLimited = 35;
+
+  /// Q 0.71, set by the original editor when a band changes to a limited type.
+  static const int qRawTypeReset = 10;
 
   // ─── Delay and dynamics ───
 
@@ -277,6 +362,13 @@ class ProtocolService {
   static double delayRawToMs(int raw) => raw / 96.0;
   static int delayMsToRaw(double ms) => (ms * 96).round().clamp(0, delayRawMax);
 
+  /// Delay display units (cmd 0x15, stored in the config dump).
+  static const delayUnitNames = ['ms', 'm', 'ft'];
+
+  /// Speed of sound the original editor uses for the distance display.
+  static const double metersPerMs = 0.344;
+  static const double feetPerMeter = 1 / 0.3048;
+
   /// Threshold (gate, compressor, limiter): raw = dB * 2 + 180.
   static double thresholdRawToDb(int raw) => (raw - 180) / 2.0;
   static int thresholdDbToRaw(double dB) => (dB * 2 + 180).round().clamp(0, 0xFFFF);
@@ -284,6 +376,21 @@ class ProtocolService {
   /// Attack, release and hold times: raw = ms - 1.
   static int timeRawToMs(int raw) => raw + 1;
   static int timeMsToRaw(int ms) => (ms - 1).clamp(0, 0xFFFF);
+
+  /// Ranges of the original editor (raw): attack 0 … 998 (1 … 999 ms),
+  /// release 9 … 2999 (10 … 3000 ms), gate hold 9 … 998 (10 … 999 ms).
+  static const int attackRawMax = 998;
+  static const int releaseRawMin = 9;
+  static const int releaseRawMax = 2999;
+  static const int holdRawMin = 9;
+  static const int holdRawMax = 998;
+
+  /// Thresholds: gate −90 … 0 dB, compressor and limiter −90 … +20 dB.
+  static const int gateThresholdRawMax = 180;
+  static const int thresholdRawMax = 220;
+
+  /// Knee of the compressor and the limiter in dB.
+  static const int kneeMax = 12;
 
   /// PEQ filter types
   static const peqTypeNames = [
@@ -435,35 +542,72 @@ class ProtocolService {
     ]);
   }
 
-  /// Limiter (0x3F): `ch attack(2B) release(2B) unknown(2B) threshold(2B)`
+  /// Limiter (0x3F): `ch attack(2B) release(2B) knee(2B) threshold(2B)`
   List<int> buildLimiterCommand(String channel, {
     required int attack,
     required int release,
-    required int unknown,
+    required int knee,
     required int threshold,
   }) {
     final ch = _requireChannel(channel);
     return buildFrame(0x3F, [
-      ch, ..._u16(attack), ..._u16(release), ..._u16(unknown), ..._u16(threshold),
+      ch, ..._u16(attack), ..._u16(release), ..._u16(knee), ..._u16(threshold),
     ]);
   }
 
-  /// Channel link (0x3B): `ch mask` — mask of the linked channels of the
-  /// same group, including the channel itself. Seen in captures of the
-  /// original editor (FlexiFlizz) but not verified on a device yet.
+  /// Channel link (0x3B): `ch mask` — one byte, bits relative to the
+  /// channel's group (In A = bit 0, Out 1 = bit 0). The original editor
+  /// sends it for the master only: own bit + slaves.
   List<int> buildLinkCommand(String channel, int mask) {
     final ch = _requireChannel(channel);
     return buildFrame(0x3B, [ch, mask & 0xFF]);
   }
 
-  /// Signal generator types of the test tone command (index = type byte).
-  static const testToneTypeNames = ['Off', 'Pink noise', 'White noise', 'Sine'];
+  /// Copy channel (0x2A): `src dst` (absolute channel bytes, same group).
+  /// The device copies the settings itself; the original editor reads the
+  /// whole configuration afterwards.
+  List<int> buildCopyChannelCommand(String from, String to) {
+    final src = _requireChannel(from);
+    final dst = _requireChannel(to);
+    if (model.isInput(from) != model.isInput(to)) {
+      throw ArgumentError('Only inputs or only outputs can be copied');
+    }
+    return buildFrame(0x2A, [src, dst]);
+  }
 
-  /// Test tone (0x39): `type param` — type 0 = off, 1 = pink noise,
-  /// 2 = white noise, 3 = sine with param = frequency index. From a capture
-  /// of the original editor (FlexiFlizz), not verified on a device; the
-  /// frequency index is assumed to count the ISO 1/3-octave frequencies
-  /// (0 = 20 Hz … 30 = 20 kHz).
+  /// Bypass the whole PEQ of a channel (0x3C): `ch 1|0`.
+  List<int> buildEqBypassCommand(String channel, bool bypass) =>
+      buildFrame(0x3C, [_requireChannel(channel), bypass ? 1 : 0]);
+
+  /// Bypass the GEQ of an input (0x49): `ch 1|0`.
+  List<int> buildGeqBypassCommand(String channel, bool bypass) =>
+      buildFrame(0x49, [_requireChannel(channel, inputsOnly: true), bypass ? 1 : 0]);
+
+  /// Delay display unit (0x15): 0 = ms, 1 = m, 2 = ft.
+  List<int> buildDelayUnitCommand(int unit) => buildFrame(0x15, [unit & 0xFF]);
+
+  /// Password check (0x2D): `mode password(4 ASCII)`, mode 0 = unlock,
+  /// 1 = PTS. The original editor converts the password to upper case.
+  List<int> buildPasswordCommand(int mode, String password) {
+    final text = password.toUpperCase().padRight(4).substring(0, 4);
+    return buildFrame(0x2D, [mode & 0xFF, ...text.codeUnits.map((c) => c & 0x7F)]);
+  }
+
+  /// Disconnect (0x11): sent by the original editor when it ends a session.
+  static List<int> buildDisconnectCommand() => buildFrame(0x11);
+
+  /// Heartbeat (0x12): sent by the original editor while the link is idle,
+  /// and after a dump or a store.
+  static List<int> buildHeartbeatCommand() => buildFrame(0x12);
+
+  /// Signal generator types of the test tone command (index = type byte);
+  /// "Analog input" switches the generator off.
+  static const testToneTypeNames = ['Analog input', 'Pink noise', 'White noise', 'Sine'];
+
+  /// Test tone (0x39): `type param` — type 0 = analog input (generator off),
+  /// 1 = pink noise, 2 = white noise, 3 = sine with param = index of the
+  /// 31 ISO 1/3-octave frequencies (0 = 20 Hz … 30 = 20 kHz). The device
+  /// keeps both in the config dump.
   List<int> buildTestToneCommand(int type, int param) => buildFrame(0x39, [type & 0xFF, param & 0xFF]);
 
   /// Channel name (0x3D): `ch name(8 ASCII, zero-padded)`
@@ -524,8 +668,9 @@ class ProtocolService {
       final footerIndex = 5 + data[4];
       if (footerIndex > data.length) return null;
 
-      // Only device → host responses carry state
-      final isResponse = data[2] == 0x01;
+      // Only responses of our device (source = device ID, destination = host)
+      // carry state; the original editor ignores other addresses.
+      final isResponse = data[2] == deviceId && data[3] == 0x00;
       if (!isResponse || data.length <= 7) return null;
 
       final cmdByte = data[5];
@@ -549,9 +694,25 @@ class ProtocolService {
         return PresetMessage(dataByte, presetName, data);
       }
 
-      // Preset count
-      if (cmdByte == 0x2c && footerIndex > 7) {
-        return PresetCountMessage(data[7], data);
+      // PTS / lock status: ptsOn limit(BE) count(BE) locked
+      if (cmdByte == 0x2c && footerIndex >= 12) {
+        return LockStatusMessage(
+            data[6] != 0, (data[7] << 8) | data[8], (data[9] << 8) | data[10], data[11] != 0, data);
+      }
+
+      // Preset slot table: one byte per user slot, 0xFF = used
+      if (cmdByte == 0x22 && footerIndex > 6) {
+        return PresetSlotsMessage([for (final b in data.sublist(6, footerIndex)) b == 0xFF], data);
+      }
+
+      // Current preset number
+      if (cmdByte == 0x14 && dataByte != null) {
+        return CurrentPresetMessage(dataByte, data);
+      }
+
+      // Password check: mode result
+      if (cmdByte == 0x2d && footerIndex >= 8) {
+        return PasswordResultMessage(data[6], data[7] == 1, data);
       }
 
       // Channel config chunk (cmd 0x24)

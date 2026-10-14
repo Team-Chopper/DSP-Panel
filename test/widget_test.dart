@@ -72,15 +72,23 @@ void main() {
     });
 
     test('meters: peak hold, clip and the compressor/limiter status from the DSP', () {
+      final state = DeviceState();
+      state.compressors['Out 2'] = CompressorState(ratio: 5);
+      state.limiters['Out 3'] = LimiterState(threshold: 200);
+      device.applyState(state.toJson());
       final levels = List.filled(12, -30.0);
       levels[0] = -0.2; // In A at full scale
-      // Out 2: compressor working, Out 3: limiter working
-      device.applyMeters(levels, dynamics: 0x0402);
+      // Out 2: compressor working, Out 3: limiter working; Out 4 reports both
+      // but has a 1:1 ratio and the limiter at +20 dB (no LEDs, like the
+      // original editor).
+      device.applyMeters(levels, dynamics: 0x0402 | 0x0808);
       expect(device.isClipping('In A'), isTrue);
       expect(device.isClipping('In B'), isFalse);
       expect(device.isCompressing('Out 2'), isTrue);
       expect(device.isLimiting('Out 2'), isFalse);
       expect(device.isLimiting('Out 3'), isTrue);
+      expect(device.isCompressing('Out 4'), isFalse);
+      expect(device.isLimiting('Out 4'), isFalse);
       expect(device.getMeterPeakDb('In A'), -0.2);
       device.applyMeters(List.filled(12, -40.0));
       expect(device.getMeterPeakDb('In A'), -0.2, reason: 'held');
@@ -131,43 +139,79 @@ void main() {
       device.applyRemoteOp({'op': 'gain', 'ch': 'nope', 'db': 1}); // ignored
     });
 
-    test('linked channels change together, only the original op is sent', () {
+    test('linking and copying run on the server; linked channels follow the master', () {
       fakeAsync((async) {
-        device.setLinkSlaves('Out 1', ['Out 2'], copySettings: false);
-        async.elapse(const Duration(milliseconds: 50));
-        expect(sent.map((m) => m['op']), [DeviceOps.link('Out 1', 0x03)]);
-        expect(device.linkedWith('Out 1'), ['Out 2']);
+        device.setGain('Out 3', -2);
+        device.setLinkSlaves('Out 1', ['Out 2']);
+        device.copyChannel('Out 3', ['Out 4']);
+        // Queued changes go out first, then the jobs; nothing changes locally
+        // until the server sends the state it read back.
+        expect(sent, [
+          {'t': Msg.op, 'dsp': 'dsp1', 'op': DeviceOps.gain('Out 3', -2)},
+          {'t': Msg.link, 'dsp': 'dsp1', 'master': 'Out 1', 'slaves': ['Out 2']},
+          {'t': Msg.copy, 'dsp': 'dsp1', 'from': 'Out 3', 'to': ['Out 4']},
+        ]);
+        expect(device.linkedWith('Out 1'), isEmpty);
 
+        device.applyState((DeviceState()..links['Out 1'] = 0x03).toJson());
+        expect(device.linkedWith('Out 1'), ['Out 2']);
         sent.clear();
         device.setGain('Out 1', -6);
         device.toggleMute('Out 2');
-        expect(device.getOutputGain('Out 2'), -6.0);
-        expect(device.getOutputMute('Out 1'), isTrue);
+        expect(device.getOutputGain('Out 2'), -6.0, reason: 'the master moves its slave');
+        expect(device.getOutputMute('Out 1'), isFalse, reason: 'the original editor changes only the slave');
         expect(device.getOutputGain('Out 3'), 0.0);
         async.elapse(const Duration(milliseconds: 50));
-        // The server distributes the change to the linked channels.
+        // Every change is sent once, for the edited channel.
         expect(sent.map((m) => m['op']), [DeviceOps.gain('Out 1', -6), DeviceOps.mute('Out 2', true)]);
+
+        device.unlink('Out 2');
+        expect(sent.last, {'t': Msg.link, 'dsp': 'dsp1', 'master': 'Out 1', 'slaves': <String>[]});
       });
     });
 
-    test('copies the settings of a channel', () {
+    test('a server preset (offline) links and copies in its own state', () {
       fakeAsync((async) {
-        device.setGain('Out 1', -3);
-        device.setPeqBand('Out 1', 2, gainDb: 5, freqRaw: 120);
-        device.setHiPass('Out 1', enabled: true, freqRaw: 80);
-        device.setAlias('Out 1', 'Top L');
-        device.toggleMatrixInput('Out 1', 'In C');
-        final routingOut3 = device.getMatrixEnabled('Out 3', 'In C');
-        device.copyChannel('Out 1', ['Out 3', 'Out 4']);
-        expect(device.getMatrixEnabled('Out 3', 'In C'), routingOut3, reason: 'routing is not copied');
+        final preset = DeviceProvider('preset:p1', sent.add, () => true);
+        expect(preset.offline, isTrue);
+        preset.setGain('Out 1', -3);
+        preset.toggleMute('Out 1');
+        preset.setPeqBand('Out 1', 2, gainDb: 5, freqRaw: 120);
+        preset.setHiPass('Out 1', enabled: true, freqRaw: 80);
+        preset.setAlias('Out 1', 'Top L');
+        preset.toggleMatrixInput('Out 1', 'In C');
+        final routingOut3 = preset.getMatrixEnabled('Out 3', 'In C');
+        preset.copyChannel('Out 1', ['Out 3', 'Out 4']);
+        expect(preset.getMatrixEnabled('Out 3', 'In C'), routingOut3, reason: 'routing is not copied');
         for (final ch in ['Out 3', 'Out 4']) {
-          expect(device.getOutputGain(ch), -3.0);
-          expect(device.getPeqBand(ch, 2).gainDb, 5.0);
-          expect(device.getPeqBand(ch, 2).freqRaw, 120);
-          expect(device.getHiPass(ch).freqRaw, 80);
-          expect(device.getAlias(ch), ch, reason: 'names are not copied');
+          expect(preset.getOutputGain(ch), -3.0);
+          expect(preset.getOutputMute(ch), isTrue, reason: 'mute is copied like in the original editor');
+          expect(preset.getPeqBand(ch, 2).gainDb, 5.0);
+          expect(preset.getPeqBand(ch, 2).freqRaw, 120);
+          expect(preset.getHiPass(ch).freqRaw, 80);
+          expect(preset.getAlias(ch), ch, reason: 'names are not copied');
         }
-        expect(() => device.copyChannel('Out 1', ['In A']), throwsArgumentError);
+        expect(() => preset.copyChannel('Out 1', ['In A']), throwsArgumentError);
+
+        preset.setGain('Out 5', -9);
+        preset.setLinkSlaves('Out 6', ['Out 5']);
+        expect(preset.linkedWith('Out 6'), ['Out 5']);
+        expect(preset.getOutputGain('Out 5'), 0.0, reason: 'new slaves get the master settings');
+        async.elapse(const Duration(milliseconds: 50));
+        expect(sent.every((m) => m['t'] == Msg.op), isTrue);
+      });
+    });
+
+    test('PEQ types with a Q limit start at Q 0.71 and stop at Q 3', () {
+      fakeAsync((async) {
+        device.setPeqBand('In A', 0, qRaw: 60);
+        expect(device.getPeqBand('In A', 0).qRaw, 60, reason: 'peak: full range');
+        device.setPeqBand('In A', 0, type: 1);
+        expect(device.getPeqBand('In A', 0).qRaw, ProtocolService.qRawTypeReset);
+        device.setPeqBand('In A', 0, qRaw: 80);
+        expect(device.getPeqBand('In A', 0).qRaw, ProtocolService.qRawLimited);
+        device.setPeqBand('In A', 0, type: 0, qRaw: 80);
+        expect(device.getPeqBand('In A', 0).qRaw, 80);
         async.elapse(const Duration(milliseconds: 50));
       });
     });

@@ -85,7 +85,16 @@ class Hub {
     final session = _sessionFactory(config);
     _sessions[config.id] = session;
     _sessionSubscriptions[config.id] = session.events.listen((e) => _onSessionEvent(session, e));
+    session.setMetersWanted(false);
     session.start();
+  }
+
+  /// Meters are polled only while a client shows the DSP; otherwise the
+  /// session keeps the link alive with the idle heartbeat.
+  void _updateMeterPolling() {
+    for (final session in _sessions.values) {
+      session.setMetersWanted(_clients.any((c) => c.subscriptions.contains(session.id)));
+    }
   }
 
   // ─── Clients ───
@@ -103,6 +112,7 @@ class Hub {
       (data) => _onMessage(client, data),
       onDone: () {
         _clients.remove(client);
+        _updateMeterPolling();
         logInfo('Client disconnected ($remote), ${_clients.length} total');
       },
       onError: (Object e) => logWarn('WebSocket error ($remote): $e'),
@@ -174,6 +184,7 @@ class Hub {
     switch (type) {
       case Msg.subscribe:
         client.subscriptions.add(session.id);
+        _updateMeterPolling();
         client.send({'t': Msg.state, 'dsp': session.id, 'state': session.state.toJson()});
         client.send({
           't': Msg.log,
@@ -184,6 +195,7 @@ class Hub {
         return null;
       case Msg.unsubscribe:
         client.subscriptions.remove(session.id);
+        _updateMeterPolling();
         return null;
       case Msg.op:
         final op = msg['op'];
@@ -194,6 +206,16 @@ class Hub {
           client.send({'t': Msg.state, 'dsp': session.id, 'state': session.state.toJson()});
         }
         return error;
+      case Msg.link:
+        final master = msg['master'];
+        final slaves = msg['slaves'];
+        if (master is! String || slaves is! List || slaves.any((s) => s is! String)) return 'master/slaves missing';
+        return session.linkChannels(master, slaves.cast<String>());
+      case Msg.copy:
+        final from = msg['from'];
+        final to = msg['to'];
+        if (from is! String || to is! List || to.any((s) => s is! String)) return 'from/to missing';
+        return session.copyChannels(from, to.cast<String>());
       case Msg.loadPreset:
         final index = msg['index'];
         return index is int ? session.loadPreset(index) : 'index missing';
@@ -291,15 +313,25 @@ class Hub {
     final host = msg['host'];
     final port = msg['port'] ?? 9761;
     final model = msg['model'] ?? 'auto';
-    if (name is! String || host is! String || port is! int || model is! String) {
+    final deviceId = msg['deviceId'] ?? 1;
+    final password = msg['password'] ?? '';
+    if (name is! String || host is! String || port is! int || model is! String || deviceId is! int ||
+        password is! String) {
       return 'Name, host and port are required';
     }
-    final error = DspConfig.validateFields(name: name, host: host.trim(), port: port, model: model);
+    final error = DspConfig.validateFields(
+        name: name, host: host.trim(), port: port, model: model, deviceId: deviceId, password: password);
     if (error != null) return error;
     if (_sessions.length >= maxDevices) return 'At most $maxDevices DSPs';
 
     final config = DspConfig(
-        id: DspConfig.newId(), name: name.trim(), host: host.trim(), port: port, model: model);
+        id: DspConfig.newId(),
+        name: name.trim(),
+        host: host.trim(),
+        port: port,
+        model: model,
+        deviceId: deviceId,
+        password: password.toUpperCase());
     _addSession(config);
     _broadcast({'t': Msg.dspInfo, 'info': _sessions[config.id]!.info.toJson()});
     _scheduleSave();
@@ -315,15 +347,24 @@ class Hub {
     final port = msg['port'];
     final enabled = msg['enabled'];
     final model = msg['model'];
+    final deviceId = msg['deviceId'];
+    final password = msg['password'];
     if ((name != null && name is! String) ||
         (host != null && host is! String) ||
         (port != null && port is! int) ||
         (enabled != null && enabled is! bool) ||
-        (model != null && model is! String)) {
+        (model != null && model is! String) ||
+        (deviceId != null && deviceId is! int) ||
+        (password != null && password is! String)) {
       return 'Invalid values';
     }
     final error = DspConfig.validateFields(
-        name: name as String?, host: (host as String?)?.trim(), port: port as int?, model: model as String?);
+        name: name as String?,
+        host: (host as String?)?.trim(),
+        port: port as int?,
+        model: model as String?,
+        deviceId: deviceId as int?,
+        password: password as String?);
     if (error != null) return error;
 
     unawaited(session.updateConfig(
@@ -332,6 +373,8 @@ class Hub {
       port: port,
       model: model,
       enabled: enabled as bool?,
+      deviceId: deviceId,
+      password: password,
     ));
     return null;
   }

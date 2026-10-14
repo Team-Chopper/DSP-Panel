@@ -46,7 +46,7 @@ Future<void> showChannelMenu(BuildContext context, DeviceProvider device, String
           ListTile(
             leading: const Icon(Icons.copy_all_outlined),
             title: const Text('Copy settings to …'),
-            subtitle: const Text('Gain, phase, delay, EQ, filters, dynamics'),
+            subtitle: const Text('Gain, mute, phase, delay, EQ, filters, dynamics'),
             onTap: () {
               Navigator.pop(sheet);
               showCopyDialog(context, device, channel);
@@ -118,9 +118,11 @@ Future<void> showCopyDialog(BuildContext context, DeviceProvider device, String 
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Overwrites gain, phase, delay, EQ, filters and dynamics of the selected '
-                  'channels. Names, mute, links and matrix routing stay.',
-                  style: TextStyle(fontSize: 12, color: AppColors.muted)),
+              Text(
+                  'Overwrites gain, mute, phase, delay, EQ, filters and dynamics of the selected channels. '
+                  'Names, links and matrix routing stay.'
+                  '${device.offline ? '' : ' The DSP copies the settings itself; the panel reads them back.'}',
+                  style: const TextStyle(fontSize: 12, color: AppColors.muted)),
               const SizedBox(height: 8),
               for (final ch in candidates)
                 CheckboxListTile(
@@ -139,10 +141,10 @@ Future<void> showCopyDialog(BuildContext context, DeviceProvider device, String 
             onPressed: targets.isEmpty
                 ? null
                 : () {
-                    device.copyChannel(from, targets.toList());
+                    device.copyChannel(from, [for (final ch in candidates) if (targets.contains(ch)) ch]);
                     Navigator.of(dialog).pop();
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content: Text('Copied ${device.getAlias(from)} to ${targets.length} channel(s)')));
+                        content: Text('Copying ${device.getAlias(from)} to ${targets.length} channel(s)')));
                   },
             child: const Text('Copy'),
           ),
@@ -165,8 +167,8 @@ Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String 
         content: SizedBox(
           width: 340,
           child: Text(
-            '${device.getAlias(channel)} is linked to ${device.getAlias(master)} (master) and follows every change '
-            'of the group. A linked channel cannot be linked to other channels – to add more channels, link them '
+            '${device.getAlias(channel)} is linked to ${device.getAlias(master)} (master): changes of the master '
+            'apply to it. A linked channel cannot be linked to other channels – to add more channels, link them '
             'to ${device.getAlias(master)}.',
             style: const TextStyle(fontSize: 13),
           ),
@@ -196,12 +198,10 @@ Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String 
   final current = device.linkSlaves(channel);
   final candidates = device.linkCandidates(channel);
   final selection = {...current};
-  var copySettings = true;
   return showDialog<void>(
     context: context,
     builder: (dialog) => StatefulBuilder(
       builder: (dialog, setState) {
-        final added = selection.difference(current.toSet());
         return AlertDialog(
           title: Text('Link ${device.getAlias(channel)} with …'),
           content: SizedBox(
@@ -211,8 +211,10 @@ Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String 
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '${device.getAlias(channel)} becomes the master, the selected channels follow it. Changes on any '
-                  'linked channel apply to all of them. The link is stored on the DSP.',
+                  '${device.getAlias(channel)} becomes the master, the selected channels follow it. Like the '
+                  'original editor, newly linked channels first get the settings of ${device.getAlias(channel)} '
+                  '(gain, mute, phase, delay, EQ, filters, dynamics – not names or routing). The link is stored on '
+                  'the DSP; a change is sent once and the DSP applies it to the linked channels.',
                   style: const TextStyle(fontSize: 12, color: AppColors.muted),
                 ),
                 const SizedBox(height: 8),
@@ -226,15 +228,6 @@ Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String 
                       enabled: candidates.contains(ch),
                       onChanged: (v) => setState(() => v == true ? selection.add(ch) : selection.remove(ch)),
                     ),
-                const Divider(),
-                CheckboxListTile(
-                  dense: true,
-                  value: copySettings,
-                  enabled: added.isNotEmpty,
-                  title: Text('Copy the settings of ${device.getAlias(channel)} to newly linked channels'),
-                  subtitle: const Text('Gain, phase, delay, EQ, filters, dynamics – not names, mute or routing'),
-                  onChanged: (v) => setState(() => copySettings = v ?? true),
-                ),
               ],
             ),
           ),
@@ -250,8 +243,7 @@ Future<void> showLinkDialog(BuildContext context, DeviceProvider device, String 
             TextButton(onPressed: () => Navigator.of(dialog).pop(), child: const Text('Cancel')),
             FilledButton(
               onPressed: () {
-                device.setLinkSlaves(channel, [for (final ch in group) if (selection.contains(ch)) ch],
-                    copySettings: copySettings);
+                device.setLinkSlaves(channel, [for (final ch in group) if (selection.contains(ch)) ch]);
                 Navigator.of(dialog).pop();
               },
               child: const Text('Apply'),

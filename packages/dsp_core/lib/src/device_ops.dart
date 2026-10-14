@@ -46,7 +46,16 @@ class DeviceOps {
   static Map<String, Object?> compressor(String ch, CompressorState c) =>
       {'op': 'compressor', 'ch': ch, ...c.toJson()};
   static Map<String, Object?> limiter(String ch, LimiterState l) =>
-      {'op': 'limiter', 'ch': ch, 'attack': l.attack, 'release': l.release, 'threshold': l.threshold};
+      {'op': 'limiter', 'ch': ch, ...l.toJson()};
+
+  /// Bypass the whole PEQ of a channel (cmd 0x3C).
+  static Map<String, Object?> eqBypass(String ch, bool on) => {'op': 'eqBypass', 'ch': ch, 'on': on};
+
+  /// Bypass the GEQ of an input (cmd 0x49).
+  static Map<String, Object?> geqBypass(String ch, bool on) => {'op': 'geqBypass', 'ch': ch, 'on': on};
+
+  /// Delay display unit stored on the device (0 = ms, 1 = m, 2 = ft).
+  static Map<String, Object?> delayUnit(int unit) => {'op': 'delayUnit', 'unit': unit};
 
   /// Device channel name; null or empty restores the default ("InA").
   static Map<String, Object?> channelName(String ch, String? name) =>
@@ -57,8 +66,8 @@ class DeviceOps {
   /// own bit).
   static Map<String, Object?> link(String ch, int mask) => {'op': 'link', 'ch': ch, 'mask': mask};
 
-  /// Signal generator of the DSP (0 = off, 1 = pink, 2 = white, 3 = sine
-  /// with [param] = frequency index).
+  /// Signal generator of the DSP (0 = analog input, i.e. off, 1 = pink,
+  /// 2 = white, 3 = sine with [param] = frequency index).
   static Map<String, Object?> testTone(int type, [int param = 0]) =>
       {'op': 'testTone', 'type': type, 'param': param};
 
@@ -69,19 +78,44 @@ class DeviceOps {
   //
   // Links work like in the original editor: a master is linked to one or
   // more slaves (In A → In B). The master's link mask holds its own bit and
-  // the bits of its slaves; a slave keeps only its own bit and cannot be
-  // linked to anything else. A change of any member applies to the whole
-  // group (master and all slaves).
+  // the bits of its slaves; a slave cannot be linked to anything else.
+  //
+  // Changing a linked channel sends the change once, for that channel; the
+  // DSP applies it to the linked channels (assumed, like the original
+  // editor does). The state of the other members follows the original
+  // editor's rule, see [editGroupOf].
 
-  /// Ops that change another channel with the same value when it is linked.
-  /// Matrix routing and crossing gains are not mirrored: linked channels are
+  /// Ops that change the other members of a link group in the state as well.
+  /// Matrix routing and crossing gains are not linked: linked channels are
   /// usually a left/right pair fed from different inputs.
   static const _linkableOps = {
     'gain', 'mute', 'phase', 'delay', 'peqBand', 'hiPass', 'loPass',
-    'gate', 'compressor', 'limiter', 'geqBand', 'geqReset',
+    'gate', 'compressor', 'limiter', 'geqBand', 'geqReset', 'eqBypass', 'geqBypass',
   };
 
   static int _mask(DeviceState state, String ch) => state.links[ch] ?? state.model.linkBit(ch);
+
+  /// Channels whose state changes together with [ch], by the original
+  /// editor's rule: the channel's own link mask if it contains its own bit,
+  /// otherwise the mask of the first lower channel of the group that
+  /// contains it; just [ch] if there is none.
+  static List<String> editGroupOf(DeviceState state, String ch) {
+    final model = state.model;
+    final group = model.groupOf(ch);
+    final bit = model.linkBit(ch);
+    var mask = _mask(state, ch);
+    if (mask & bit == 0) {
+      mask = 0;
+      for (final lower in group.take(group.indexOf(ch))) {
+        if (_mask(state, lower) & bit != 0) {
+          mask = _mask(state, lower);
+          break;
+        }
+      }
+    }
+    final members = [for (final c in group) if (mask & model.linkBit(c) != 0) c];
+    return members.contains(ch) ? members : [ch];
+  }
 
   /// Master whose link mask contains [ch] (not [ch] itself), or null.
   ///
@@ -122,14 +156,16 @@ class DeviceOps {
   static List<String> linkedWith(DeviceState state, String ch) =>
       [for (final c in linkGroupOf(state, ch)) if (c != ch) c];
 
-  /// [op] plus a copy for every other member of the link group of the
-  /// channel it changes.
+  /// [op] plus a copy for every other channel whose state follows the
+  /// channel it changes (see [editGroupOf]). Only [op] itself goes to the
+  /// device.
   static List<Map<String, Object?>> expandLinked(DeviceState state, Map<String, Object?> op) {
     if (!_linkableOps.contains(op['op'])) return [op];
     final ch = op['ch'] as String;
     return [
       op,
-      for (final other in linkedWith(state, ch)) {...op, 'ch': other},
+      for (final other in editGroupOf(state, ch))
+        if (other != ch) {...op, 'ch': other},
     ];
   }
 
@@ -146,11 +182,12 @@ class DeviceOps {
     ];
   }
 
-  /// Ops that make [slaves] the slaves of [master] (replacing its previous
-  /// slaves); an empty list unlinks [master]. If [copySettings] is set, the
-  /// settings of the master are copied to newly linked slaves.
-  static List<Map<String, Object?>> linkSlaves(DeviceState state, String master, List<String> slaves,
-      {bool copySettings = true}) {
+  /// A link change checked like the original link dialog: the new mask of
+  /// [master], the newly added slaves (they get the master's settings
+  /// first) and released channels whose mask still lists other channels
+  /// (written by older panel versions; reset to their own bit).
+  static ({int mask, List<String> added, List<String> reset}) linkChange(
+      DeviceState state, String master, List<String> slaves) {
     final model = state.model;
     if (!model.hasChannel(master)) throw ArgumentError('Unknown channel $master');
     final group = model.groupOf(master);
@@ -165,36 +202,48 @@ class DeviceOps {
     if (invalid.isNotEmpty) throw ArgumentError('${invalid.join(', ')} cannot be linked to $master');
 
     final previous = slavesOf(state, master);
-    final mask = slaves.fold<int>(model.linkBit(master), (m, c) => m | model.linkBit(c));
+    return (
+      mask: slaves.fold<int>(model.linkBit(master), (m, c) => m | model.linkBit(c)),
+      added: [for (final s in slaves) if (!previous.contains(s)) s],
+      reset: [
+        for (final s in previous)
+          if (!slaves.contains(s) && _mask(state, s) & ~model.linkBit(s) != 0) s,
+      ],
+    );
+  }
+
+  /// Ops that make [slaves] the slaves of [master] in a state without a
+  /// device (offline preset editor), like the original editor: newly
+  /// linked slaves get the master's settings, then the master's mask is
+  /// set. An empty list unlinks [master].
+  static List<Map<String, Object?>> linkSlaves(DeviceState state, String master, List<String> slaves) {
+    final change = linkChange(state, master, slaves);
     return [
-      link(master, mask),
-      for (final s in {...previous, ...slaves})
-        if (_mask(state, s) != model.linkBit(s)) link(s, model.linkBit(s)),
-      if (copySettings)
-        for (final s in slaves)
-          if (!previous.contains(s)) ...copyChannel(state, master, s),
+      for (final s in change.added) ...copyChannel(state, master, s),
+      link(master, change.mask),
+      for (final s in change.reset) link(s, state.model.linkBit(s)),
     ];
   }
 
-  /// Ops that remove [ch] from its link group (a slave leaves its master,
-  /// a master releases all its slaves).
-  static List<Map<String, Object?>> unlink(DeviceState state, String ch) {
+  /// Master and remaining slaves after [ch] leaves its link group (a slave
+  /// leaves its master, a master releases all its slaves).
+  static ({String master, List<String> slaves}) unlinkTarget(DeviceState state, String ch) {
     final master = masterOf(state, ch);
-    if (master == null) return linkSlaves(state, ch, const [], copySettings: false);
-    final model = state.model;
-    return [
-      link(master, _mask(state, master) & ~model.linkBit(ch)),
-      // All slaves get their own bit only (also normalises symmetric masks
-      // of older versions, which would otherwise still point to [ch]).
-      for (final s in slavesOf(state, master))
-        if (_mask(state, s) != model.linkBit(s)) link(s, model.linkBit(s)),
-    ];
+    if (master == null) return (master: ch, slaves: const []);
+    return (master: master, slaves: [for (final s in slavesOf(state, master)) if (s != ch) s]);
   }
 
-  /// Ops that copy the settings of [from] to [to] (same group only):
-  /// gain, phase, delay, PEQ, filters, GEQ/gate (inputs) and dynamics
-  /// (outputs). Name, mute, link and matrix routing are not copied (copying
-  /// left to right must not route the right channel from the left input).
+  /// Ops that remove [ch] from its link group (offline preset editor).
+  static List<Map<String, Object?>> unlink(DeviceState state, String ch) {
+    final target = unlinkTarget(state, ch);
+    return linkSlaves(state, target.master, target.slaves);
+  }
+
+  /// Ops that copy the settings of [from] to [to] (same group only) in a
+  /// state without a device, like the original editor's offline copy:
+  /// gain, phase, delay, mute, PEQ (with bypass), EQ bypass, filters, and
+  /// GEQ/gate (inputs) or dynamics (outputs). Name, link and matrix are not
+  /// copied. On a DSP the device copies itself (cmd 0x2A).
   static List<Map<String, Object?>> copyChannel(DeviceState state, String from, String to) {
     final model = state.model;
     if (from == to || !model.hasChannel(from) || !model.hasChannel(to) ||
@@ -205,60 +254,91 @@ class DeviceOps {
       gain(to, state.gains[from]!),
       phase(to, state.phase[from]!),
       delay(to, state.delays[from]!),
+      mute(to, state.mutes[from]!),
       for (var b = 0; b < state.peqBands[from]!.length; b++) peqBand(to, b, state.peqBands[from]![b]),
+      eqBypass(to, state.eqBypass[from] ?? false),
       hiPass(to, state.hiPass[from]!),
       loPass(to, state.loPass[from]!),
       if (model.isInput(from)) ...[
         for (var b = 0; b < geqBandCount; b++) geqBand(to, b, state.geqBands[from]![b]),
-        gate(to, state.gates[from]!),
+        gate(to, clampGate(state.gates[from]!)),
       ] else ...[
-        compressor(to, state.compressors[from]!),
-        limiter(to, state.limiters[from]!),
+        compressor(to, clampCompressor(state.compressors[from]!)),
+        limiter(to, clampLimiter(state.limiters[from]!)),
       ],
     ];
   }
 
   /// Ops that bring a device to [state] completely (e.g. when a preset
-  /// stored on the server is loaded onto a DSP).
+  /// stored on the server is loaded onto a DSP), in the order the original
+  /// editor loads a preset file: per input name, gate, GEQ, filters, gain,
+  /// phase, delay, link; per output name, routing, crossing gains, filters,
+  /// dynamics, gain, phase, delay, link; then all mutes and all PEQ bands.
+  /// The values a preset file does not hold (EQ/GEQ bypass, delay unit)
+  /// follow at the end.
   static List<Map<String, Object?>> fullState(DeviceState state) {
     final model = state.model;
     return [
-      for (final ch in model.channels) ...[
+      for (final ch in model.inputs) ...[
         channelName(ch, state.channelNames[ch]),
-        link(ch, state.links[ch] ?? model.linkBit(ch)),
-        gain(ch, state.gains[ch]!),
-        mute(ch, state.mutes[ch]!),
-        phase(ch, state.phase[ch]!),
-        delay(ch, state.delays[ch]!),
+        gate(ch, state.gates[ch]!),
+        for (var b = 0; b < geqBandCount; b++) geqBand(ch, b, state.geqBands[ch]![b]),
         hiPass(ch, state.hiPass[ch]!),
         loPass(ch, state.loPass[ch]!),
-        for (var b = 0; b < state.peqBands[ch]!.length; b++) peqBand(ch, b, state.peqBands[ch]![b]),
-      ],
-      for (final ch in model.inputs) ...[
-        for (var b = 0; b < geqBandCount; b++) geqBand(ch, b, state.geqBands[ch]![b]),
-        gate(ch, state.gates[ch]!),
+        gain(ch, state.gains[ch]!),
+        phase(ch, state.phase[ch]!),
+        delay(ch, state.delays[ch]!),
+        link(ch, state.links[ch] ?? model.linkBit(ch)),
       ],
       for (final ch in model.outputs) ...[
+        channelName(ch, state.channelNames[ch]),
         matrixRoute(ch, state.matrixRouting[ch]!),
         for (final input in model.inputs) matrixGain(ch, input, state.matrixGains['$ch:$input'] ?? 0),
+        hiPass(ch, state.hiPass[ch]!),
+        loPass(ch, state.loPass[ch]!),
         compressor(ch, state.compressors[ch]!),
         limiter(ch, state.limiters[ch]!),
+        gain(ch, state.gains[ch]!),
+        phase(ch, state.phase[ch]!),
+        delay(ch, state.delays[ch]!),
+        link(ch, state.links[ch] ?? model.linkBit(ch)),
       ],
+      for (final ch in model.channels) mute(ch, state.mutes[ch]!),
+      for (final ch in model.channels)
+        for (var b = 0; b < state.peqBands[ch]!.length; b++) peqBand(ch, b, state.peqBands[ch]![b]),
+      for (final ch in model.channels) eqBypass(ch, state.eqBypass[ch] ?? false),
+      for (final ch in model.inputs) geqBypass(ch, state.geqBypass[ch] ?? false),
+      delayUnit(state.delayUnit),
     ];
   }
 
   // ─── Validation ───
+  /// [g] limited to the original editor's ranges (older versions allowed
+  /// longer times).
+  static GateState clampGate(GateState g) => GateState(
+        attack: g.attack.clamp(0, ProtocolService.attackRawMax),
+        release: g.release.clamp(ProtocolService.releaseRawMin, ProtocolService.releaseRawMax),
+        hold: g.hold.clamp(ProtocolService.holdRawMin, ProtocolService.holdRawMax),
+        threshold: g.threshold.clamp(0, ProtocolService.gateThresholdRawMax),
+      );
 
-  /// Value ranges of raw dynamics parameters (see TODO.md: not yet verified
-  /// against the original editor).
-  static const int maxGateTime = 2998;      // 1 … 2999 ms
-  static const int maxDynTime = 4999;       // 1 … 5000 ms
-  static const int minThresholdRaw = 0;     // -90 dB
-  static const int maxGateThresholdRaw = 180; // 0 dB
-  static const int maxThresholdRaw = 220;   // +20 dB
-  static const int maxKnee = 12;
+  static CompressorState clampCompressor(CompressorState c) => CompressorState(
+        ratio: c.ratio.clamp(0, ProtocolService.compressorRatioNames.length - 1),
+        attack: c.attack.clamp(0, ProtocolService.attackRawMax),
+        release: c.release.clamp(ProtocolService.releaseRawMin, ProtocolService.releaseRawMax),
+        knee: c.knee.clamp(0, ProtocolService.kneeMax),
+        threshold: c.threshold.clamp(0, ProtocolService.thresholdRawMax),
+      );
+
+  static LimiterState clampLimiter(LimiterState l) => LimiterState(
+        attack: l.attack.clamp(0, ProtocolService.attackRawMax),
+        release: l.release.clamp(ProtocolService.releaseRawMin, ProtocolService.releaseRawMax),
+        knee: l.knee.clamp(0, ProtocolService.kneeMax),
+        threshold: l.threshold.clamp(0, ProtocolService.thresholdRawMax),
+      );
 
   /// Returns an error message, or null if [op] is well-formed for [model].
+  /// Value ranges are those of the original editor (see ProtocolService).
   static String? validate(Object? op, DeviceModel model) {
     if (op is! Map) return 'op must be an object';
     String? str(String k) => op[k] is String ? op[k] as String : null;
@@ -266,6 +346,10 @@ class DeviceOps {
     bool isBool(String k) => op[k] is bool;
     bool intIn(String k, int min, int max) =>
         op[k] is int && (op[k] as int) >= min && (op[k] as int) <= max;
+    bool times({bool hold = false}) =>
+        intIn('attack', 0, ProtocolService.attackRawMax) &&
+        intIn('release', ProtocolService.releaseRawMin, ProtocolService.releaseRawMax) &&
+        (!hold || intIn('hold', ProtocolService.holdRawMin, ProtocolService.holdRawMax));
 
     final ch = str('ch');
     final hasChannel = ch != null && model.hasChannel(ch);
@@ -278,11 +362,17 @@ class DeviceOps {
         if (!isNum('db')) return 'db must be a number';
       case 'mute':
       case 'phase':
+      case 'eqBypass':
         if (!hasChannel) return 'invalid channel';
+        if (!isBool('on')) return 'on must be a bool';
+      case 'geqBypass':
+        if (!isInput) return 'invalid GEQ channel';
         if (!isBool('on')) return 'on must be a bool';
       case 'delay':
         if (!hasChannel) return 'invalid channel';
         if (!intIn('raw', 0, ProtocolService.delayRawMax)) return 'delay out of range';
+      case 'delayUnit':
+        if (!intIn('unit', 0, ProtocolService.delayUnitNames.length - 1)) return 'invalid delay unit';
       case 'matrixRoute':
         final out = str('out');
         if (out == null || !model.isOutput(out)) return 'invalid output';
@@ -302,6 +392,8 @@ class DeviceOps {
       case 'peqBand':
         if (!hasChannel) return 'invalid channel';
         if (!intIn('band', 0, peqBandCountFor(model, ch) - 1)) return 'invalid band';
+        // The per-type Q limit is applied when a band is edited (the device
+        // may hold higher values set by other software).
         if (!intIn('freqRaw', 0, ProtocolService.freqRawMax) ||
             !intIn('qRaw', 0, ProtocolService.qRawMax) ||
             !intIn('type', 0, ProtocolService.peqTypeNames.length - 1) ||
@@ -318,26 +410,18 @@ class DeviceOps {
         }
       case 'gate':
         if (!isInput) return 'gate is only available on inputs';
-        if (!intIn('attack', 0, maxGateTime) ||
-            !intIn('release', 0, maxGateTime) ||
-            !intIn('hold', 0, maxGateTime) ||
-            !intIn('threshold', minThresholdRaw, maxGateThresholdRaw)) {
-          return 'invalid gate';
-        }
+        if (!times(hold: true) || !intIn('threshold', 0, ProtocolService.gateThresholdRawMax)) return 'invalid gate';
       case 'compressor':
         if (!isOutput) return 'compressor is only available on outputs';
         if (!intIn('ratio', 0, ProtocolService.compressorRatioNames.length - 1) ||
-            !intIn('attack', 0, maxDynTime) ||
-            !intIn('release', 0, maxDynTime) ||
-            !intIn('knee', 0, maxKnee) ||
-            !intIn('threshold', minThresholdRaw, maxThresholdRaw)) {
+            !times() ||
+            !intIn('knee', 0, ProtocolService.kneeMax) ||
+            !intIn('threshold', 0, ProtocolService.thresholdRawMax)) {
           return 'invalid compressor';
         }
       case 'limiter':
         if (!isOutput) return 'limiter is only available on outputs';
-        if (!intIn('attack', 0, maxDynTime) ||
-            !intIn('release', 0, maxDynTime) ||
-            !intIn('threshold', minThresholdRaw, maxThresholdRaw)) {
+        if (!times() || !intIn('knee', 0, ProtocolService.kneeMax) || !intIn('threshold', 0, ProtocolService.thresholdRawMax)) {
           return 'invalid limiter';
         }
       case 'channelName':
@@ -379,8 +463,14 @@ class DeviceOps {
         state.mutes[ch!] = op['on'] as bool;
       case 'phase':
         state.phase[ch!] = op['on'] as bool;
+      case 'eqBypass':
+        state.eqBypass[ch!] = op['on'] as bool;
+      case 'geqBypass':
+        state.geqBypass[ch!] = op['on'] as bool;
       case 'delay':
         state.delays[ch!] = i('raw');
+      case 'delayUnit':
+        state.delayUnit = i('unit');
       case 'matrixRoute':
         state.matrixRouting[op['out'] as String] = i('mask');
       case 'matrixGain':
@@ -415,9 +505,8 @@ class DeviceOps {
           threshold: i('threshold'),
         );
       case 'limiter':
-        final unknown = state.limiters[ch!]?.unknown ?? 0;
-        state.limiters[ch] = LimiterState(
-            attack: i('attack'), release: i('release'), unknown: unknown, threshold: i('threshold'));
+        state.limiters[ch!] =
+            LimiterState(attack: i('attack'), release: i('release'), knee: i('knee'), threshold: i('threshold'));
       case 'channelName':
         final name = (op['name'] as String?)?.trim();
         state.channelNames[ch!] =
@@ -440,16 +529,19 @@ class DeviceOps {
     final ch = op['ch'] as String?;
     switch (op['op']) {
       case 'gain':
-        // The original app always sends gain twice; keep that until it is
-        // known to be unnecessary.
-        final frame = proto.buildGainCommand(ch!, state.gains[ch]!);
-        return {'gain:$ch': [frame, frame]};
+        return {'gain:$ch': [proto.buildGainCommand(ch!, state.gains[ch]!)]};
       case 'mute':
         return {'mute:$ch': [proto.buildMuteCommand(ch!, state.mutes[ch]!)]};
       case 'phase':
         return {'phase:$ch': [proto.buildPhaseCommand(ch!, state.phase[ch]!)]};
+      case 'eqBypass':
+        return {'eqBypass:$ch': [proto.buildEqBypassCommand(ch!, state.eqBypass[ch]!)]};
+      case 'geqBypass':
+        return {'geqBypass:$ch': [proto.buildGeqBypassCommand(ch!, state.geqBypass[ch]!)]};
       case 'delay':
         return {'delay:$ch': [proto.buildDelayCommand(ch!, state.delays[ch]!)]};
+      case 'delayUnit':
+        return {'delayUnit': [proto.buildDelayUnitCommand(state.delayUnit)]};
       case 'matrixRoute':
         final out = op['out'] as String;
         return {'matrix:$out': [proto.buildMatrixRoutingCommand(out, state.matrixRouting[out]!)]};
@@ -504,8 +596,7 @@ class DeviceOps {
         final l = state.limiters[ch]!;
         return {
           'limit:$ch': [
-            proto.buildLimiterCommand(ch!,
-                attack: l.attack, release: l.release, unknown: l.unknown, threshold: l.threshold),
+            proto.buildLimiterCommand(ch!, attack: l.attack, release: l.release, knee: l.knee, threshold: l.threshold),
           ],
         };
       case 'channelName':

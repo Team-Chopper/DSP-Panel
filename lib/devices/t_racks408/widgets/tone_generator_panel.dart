@@ -11,8 +11,8 @@ import '../providers/device_provider.dart';
 import 'eq_math.dart';
 import 'value_field.dart';
 
-/// The DSP's own signal generator (cmd 0x39, from a capture, not verified
-/// on a device).
+/// The DSP's own signal generator (cmd 0x39 like the original editor; not
+/// tested on a device). "Analog input" switches it off.
 class DspGeneratorPanel extends StatelessWidget {
   final DeviceProvider device;
 
@@ -37,7 +37,7 @@ class DspGeneratorPanel extends StatelessWidget {
             child: Text(
               'The DSP plays the test signal itself – depending on gains and routing it can reach the speakers '
               'at full level. Turn the outputs down first.\n\n'
-              'The command is known from a capture of the original editor but has not been tested on a device.',
+              'The command is the one of the original editor but has not been tested on a device.',
             ),
           ),
           actions: [
@@ -93,7 +93,7 @@ class DspGeneratorPanel extends StatelessWidget {
                 ),
                 const SizedBox(width: 6),
                 const Tooltip(
-                  message: 'Assumed: the frequency index counts the 31 ISO 1/3-octave frequencies (see TODO.md)',
+                  message: 'The 31 ISO 1/3-octave frequencies of the original editor',
                   child: Icon(Icons.info_outline, size: 14, color: AppColors.muted),
                 ),
               ]),

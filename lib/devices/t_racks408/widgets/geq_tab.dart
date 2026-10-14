@@ -162,6 +162,12 @@ class _GeqTabState extends State<GeqTab> {
               ),
               _ActionButton(label: 'Flat', active: false, onPressed: () => deviceProvider.resetGeqBands(_channel)),
               const SizedBox(width: 8),
+              _ActionButton(
+                label: 'Bypass',
+                active: deviceProvider.getGeqBypass(_channel),
+                onPressed: () => deviceProvider.setGeqBypass(_channel, !deviceProvider.getGeqBypass(_channel)),
+              ),
+              const SizedBox(width: 8),
               _ActionButton(label: 'RTA', active: _rtaEnabled, onPressed: _toggleRta),
               const SizedBox(width: 8),
               _ActionButton(label: 'Auto-EQ', active: _autoEqOpen, onPressed: _openAutoEq),
