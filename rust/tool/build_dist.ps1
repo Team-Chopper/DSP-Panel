@@ -18,7 +18,11 @@
 
 param(
   [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
-  [string]$Web
+  [string]$Web,
+  # Also publish the package as rust\release\dsp-panel-rs-linux-<arch>.tar.gz
+  # with rust\release\latest-<arch>.json (version, sha256) for automatic
+  # installation from the repository.
+  [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +31,10 @@ $repo = Split-Path -Parent $rust
 if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel" }
 
 function Invoke-Checked([scriptblock]$block, [string]$what) {
-  & $block
+  # Native tools report progress on stderr; only the exit code counts.
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $block 2>&1 | ForEach-Object { "$_" } | Out-Host } finally { $ErrorActionPreference = $previous }
   if ($LASTEXITCODE -ne 0) { throw "$what failed (exit code $LASTEXITCODE)" }
 }
 
@@ -66,4 +73,26 @@ foreach ($f in 'install.sh', 'uninstall.sh', 'dsp-panel-rs.service', 'config.exa
 
 Invoke-Checked { tar -C (Join-Path $rust 'dist') -czf $archive $name } 'tar'
 Write-Host "==> rust\dist\$name.tar.gz"
+
+if ($Release) {
+  $releaseDir = Join-Path $rust 'release'
+  New-Item -ItemType Directory -Force $releaseDir | Out-Null
+  $file = "dsp-panel-rs-linux-$Arch.tar.gz"
+  Copy-Item $archive (Join-Path $releaseDir $file) -Force
+  $hash = (Get-FileHash -Algorithm SHA256 (Join-Path $releaseDir $file)).Hash.ToLower()
+  $manifest = [ordered]@{
+    name    = 'dsp-panel-rs'
+    version = $version
+    arch    = $Arch
+    file    = $file
+    folder  = $name
+    sha256  = $hash
+    size    = (Get-Item (Join-Path $releaseDir $file)).Length
+    built   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    install = 'sudo bash install.sh [--import-from /var/lib/dsp-panel]'
+  }
+  $json = ($manifest | ConvertTo-Json) -replace "`r`n", "`n"
+  [System.IO.File]::WriteAllText((Join-Path $releaseDir "latest-$Arch.json"), "$json`n", (New-Object System.Text.UTF8Encoding $false))
+  Write-Host "==> rust\release\$file (sha256 $hash)"
+}
 Write-Host "    On the VM (Windows tar does not keep the executable bits): sudo bash install.sh [--import-from /var/lib/dsp-panel]"

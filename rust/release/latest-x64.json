@@ -1,0 +1,11 @@
+{
+    "name":  "dsp-panel-rs",
+    "version":  "1.0.0-alpha.1",
+    "arch":  "x64",
+    "file":  "dsp-panel-rs-linux-x64.tar.gz",
+    "folder":  "dsp-panel-rs-1.0.0-alpha.1-linux-x64",
+    "sha256":  "08c482535a053d6c276a920c838384e3457497383589d8d35a536292e6ad303f",
+    "size":  14753141,
+    "built":  "2026-10-22T17:09:26Z",
+    "install":  "sudo bash install.sh [--import-from /var/lib/dsp-panel]"
+}
