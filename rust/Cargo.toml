@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/dsp-core", "crates/fake-dsp", "crates/dsp-server"]
+
+[workspace.package]
+version = "1.0.0-alpha.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+dsp-core = { path = "crates/dsp-core" }
+fake-dsp = { path = "crates/fake-dsp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync", "signal", "io-util", "fs"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

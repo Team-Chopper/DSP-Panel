@@ -1,0 +1,12 @@
+[package]
+name = "fake-dsp"
+description = "Simulated DSP 206 / DSP 408 for development and tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dsp-core.workspace = true
+tokio = { workspace = true }
+clap = { workspace = true }

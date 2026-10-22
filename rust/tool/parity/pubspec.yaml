@@ -1,0 +1,10 @@
+name: dsp_parity
+description: Writes reference data of the Dart dsp_core for the Rust parity tests.
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  dsp_core:
+    path: ../../../packages/dsp_core
