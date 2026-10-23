@@ -13,8 +13,9 @@
 #   sudo bash install.sh --import-from /var/lib/dsp-panel
 #
 # The Linux binary is cross-compiled with cargo-zigbuild (needs zig and
-# cargo-zigbuild on PATH). Until the Rust web client exists, the Flutter build
-# in build\web is packaged as the web client.
+# cargo-zigbuild on PATH). The web client (crates\dsp-web) is built with trunk;
+# -Web <folder> packages another build instead (e.g. -Web build\web for the
+# Flutter client).
 
 param(
   [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
@@ -27,7 +28,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $rust = Split-Path -Parent $PSScriptRoot
-$repo = Split-Path -Parent $rust
 if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel" }
 
 function Invoke-Checked([scriptblock]$block, [string]$what) {
@@ -44,12 +44,15 @@ $name = "dsp-panel-rs-$version-linux-$Arch"
 $out = Join-Path $rust "dist\$name"
 $archive = Join-Path $rust "dist\$name.tar.gz"
 
+Write-Host "==> Building $name"
 if (-not $Web) {
-  $Web = if (Test-Path "$rust\crates\dsp-web\dist\index.html") { "$rust\crates\dsp-web\dist" } else { "$repo\build\web" }
+  Write-Host "==> Web client (trunk)"
+  Push-Location "$rust\crates\dsp-web"
+  try { Invoke-Checked { trunk build --release } 'trunk build' } finally { Pop-Location }
+  $Web = "$rust\crates\dsp-web\dist"
 }
 if (-not (Test-Path "$Web\index.html")) { throw "Web client not found in $Web" }
 
-Write-Host "==> Building $name"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 if (Test-Path $archive) { Remove-Item -Force $archive }
 New-Item -ItemType Directory -Force $out | Out-Null

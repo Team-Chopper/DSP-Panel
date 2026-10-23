@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/dsp-core", "crates/fake-dsp", "crates/dsp-server"]
+members = ["crates/dsp-core", "crates/fake-dsp", "crates/dsp-server", "crates/dsp-web"]
 
 [workspace.package]
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -20,3 +20,13 @@ clap = { version = "4", features = ["derive"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Web client (trunk, see crates/dsp-web/index.html): small download first.
+[profile.web-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+
+# The RTA FFT and the EQ curves stay at full speed.
+[profile.web-release.package.dsp-core]
+opt-level = 3

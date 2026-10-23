@@ -284,6 +284,42 @@ pub fn fit_peq_correction(target: &[f64], centers: &[f64], bands: &[PeqBand], li
     result
 }
 
+/// Auto-EQ range and cut limit of [auto_eq_correction].
+pub const AUTO_EQ_LO_HZ: f64 = 40.0;
+pub const AUTO_EQ_HI_HZ: f64 = 16000.0;
+pub const AUTO_EQ_MAX_CUT: f64 = 12.0;
+
+/// Auto-EQ: GEQ correction for a measured 1/3-octave response (pink noise
+/// through the system, measured with a microphone).
+///
+/// The bands between 40 Hz and 16 kHz are corrected towards their median
+/// level; the correction is smoothed over neighbouring bands, limited to
+/// [max_boost] / 12 dB cut and added to the [current] GEQ (the measurement
+/// already includes it). Bands outside the range keep their value.
+pub fn auto_eq_correction(measured_db: &[f64], centers: &[f64], current: &[f64], max_boost: f64) -> Vec<f64> {
+    let in_range: Vec<bool> = centers.iter().map(|f| (AUTO_EQ_LO_HZ..=AUTO_EQ_HI_HZ).contains(f)).collect();
+    let mut used: Vec<f64> = (0..centers.len()).filter(|i| in_range[*i]).map(|i| measured_db[i]).collect();
+    if used.is_empty() {
+        return current.to_vec();
+    }
+    // Median as reference: robust against single deep notches or peaks.
+    used.sort_by(f64::total_cmp);
+    let reference = used[used.len() / 2];
+    let raw: Vec<f64> = (0..centers.len()).map(|i| if in_range[i] { reference - measured_db[i] } else { 0.0 }).collect();
+    (0..centers.len())
+        .map(|i| {
+            if !in_range[i] {
+                return current[i];
+            }
+            let prev = if i > 0 && in_range[i - 1] { raw[i - 1] } else { raw[i] };
+            let next = if i + 1 < centers.len() && in_range[i + 1] { raw[i + 1] } else { raw[i] };
+            let smooth = 0.25 * prev + 0.5 * raw[i] + 0.25 * next;
+            let target = current[i] + smooth.clamp(-AUTO_EQ_MAX_CUT, max_boost);
+            (target.clamp(-12.0, 12.0) * 10.0).round() / 10.0
+        })
+        .collect()
+}
+
 /// The EQ settings of one channel, read once, for evaluating its total
 /// response at many frequencies (a curve has ~160–240 points).
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -3,7 +3,8 @@
 
 use dsp_core::PeqBand;
 use dsp_core::eq_math::{
-    FitLimits, GEQ_CENTER_FREQUENCIES, filter_response_db, fit_peq_correction, free_peq_bands, peq_response_db,
+    FitLimits, GEQ_CENTER_FREQUENCIES, auto_eq_correction, filter_response_db, fit_peq_correction, free_peq_bands,
+    peq_response_db,
 };
 use dsp_core::protocol as p;
 
@@ -80,4 +81,29 @@ fn crossover_slopes() {
     assert!(close(filter_response_db(4000.0, 1000.0, slope("BW -24"), false), -48.2, 0.3), "24 dB/oct");
     assert!(close(filter_response_db(100.0, 1000.0, slope("BW -12"), false), 0.0, 0.01));
     assert_eq!(filter_response_db(100.0, 1000.0, 0, true), 0.0, "bypass");
+}
+
+#[test]
+fn auto_eq_corrects_towards_the_median_inside_the_range() {
+    let centers = GEQ_CENTER_FREQUENCIES;
+    // Flat at -30 dB except a 6 dB peak at 1 kHz (index 17) and a dip below 40 Hz.
+    let mut measured = vec![-30.0; centers.len()];
+    measured[17] = -24.0;
+    measured[0] = -50.0;
+    let current = vec![1.0; centers.len()];
+    let out = auto_eq_correction(&measured, &centers, &current, 6.0);
+    assert_eq!(out[0], 1.0, "outside the range the band keeps its value");
+    assert_eq!(out[17], 1.0 - 3.0, "smoothed: half of the 6 dB peak");
+    assert_eq!(out[16], 1.0 - 1.5);
+    assert_eq!(out[18], 1.0 - 1.5);
+    assert_eq!(out[10], 1.0);
+    // Boost limited by max_boost.
+    let mut dip = vec![-30.0; centers.len()];
+    for d in dip.iter_mut().take(25).skip(10) {
+        *d = -50.0;
+    }
+    let out = auto_eq_correction(&dip, &centers, &vec![0.0; centers.len()], 3.0);
+    assert_eq!(out[15], 0.0, "the median is the dip level, so nothing is boosted there");
+    let out = auto_eq_correction(&measured.iter().map(|m| -m - 60.0).collect::<Vec<_>>(), &centers, &vec![0.0; 31], 0.0);
+    assert!(out.iter().all(|v| *v <= 0.0), "max boost 0 never boosts");
 }

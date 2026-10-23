@@ -14,6 +14,7 @@ pub mod frame_decoder;
 pub mod model;
 pub mod ops;
 pub mod protocol;
+pub mod rta;
 pub mod state;
 pub mod testing;
 

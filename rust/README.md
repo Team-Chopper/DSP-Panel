@@ -8,7 +8,7 @@ Rewrite of the DSP panel in Rust, built next to the Dart/Flutter version
 | `crates/dsp-core` | Protocol, frame decoder, config dump, device state, ops/linking, packet descriptions, web API types, EQ math. Port of `packages/dsp_core` (byte-for-byte identical, see the parity test). |
 | `crates/dsp-server` | The panel server: TCP to the DSPs, HTTP(S), WebSocket, login, server presets. Port of `server/` with the same API and data files. |
 | `crates/fake-dsp` | Simulated DSP 408 / 206 for development and tests. |
-| `crates/dsp-web` | (coming) the web client in Leptos. Until then the Flutter build (`build/web`) is served. |
+| `crates/dsp-web` | The web client in Leptos (WebAssembly, built with trunk). Same pages as the Flutter client; the RTA runs in an AudioWorklet + WebAssembly. |
 
 The WebSocket API, `config.yaml`, `devices.json`, `presets.json`, `auth.json`
 and `secret.key` have the formats of the Dart server: the Rust server works
@@ -21,10 +21,15 @@ cd rust
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel"   # build outside the network share
 cargo test --workspace
 cargo run -p fake-dsp -- --port 19761 --models 408,206
-cargo run -p dsp-server -- serve --no-tls --no-auth --port 8090 --data-dir <dir> --web-root ..\build\web
+cd crates\dsp-web; trunk build --release; cd ..\..                  # web client -> crates/dsp-web/dist
+cargo run -p dsp-server -- serve --no-tls --no-auth --port 8090 --data-dir <dir> --web-root crates\dsp-web\dist
 ```
 
 Then open http://localhost:8090 and add the fake DSPs (127.0.0.1:19761 / 19762).
+`--web-root ..\build\web` serves the Flutter client instead. The web client
+uses the cargo profile `web-release` (size-optimised, `dsp-core` at full
+speed); trunk needs the `wasm32-unknown-unknown` target (`rust-toolchain.toml`).
+The microphone (RTA, Auto-EQ) needs HTTPS or `localhost`.
 
 `crates/dsp-core/tests/parity.rs` replays reference data of the Dart
 implementation (`tests/fixtures/parity.json`). Regenerate it after changing
