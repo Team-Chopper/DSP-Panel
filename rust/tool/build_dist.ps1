@@ -67,6 +67,7 @@ Copy-Item "$env:CARGO_TARGET_DIR\$triple\release\dsp-server" "$out\dsp-server"
 
 Write-Host "==> Web client ($Web)"
 Copy-Item -Recurse $Web "$out\web"
+Remove-Item -Force -ErrorAction SilentlyContinue "$out\web\.trunk-lock"
 
 # Scripts with LF line endings (a checkout with autocrlf may have CRLF)
 foreach ($f in 'install.sh', 'uninstall.sh', 'dsp-panel-rs.service', 'config.example.yaml') {
