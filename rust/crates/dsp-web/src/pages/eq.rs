@@ -1,24 +1,30 @@
 //! EQ page (parametric EQ of every channel): channel selection, the PEQ graph
-//! over the full width, then the band table with the Freq/Q/Gain faders of the
-//! selected band, HPF and LPF, and the channel gain.
+//! over the full width (magnitude or phase, optionally compared with another
+//! channel), then the band table with the Freq/Q/Gain faders of the selected
+//! band, HPF and LPF, and the channel gain. A filter settings file of a
+//! measurement program can be taken over as a proposal.
 
-use dsp_core::eq_math::{filter_response_db, peq_band_audible, peq_response_db};
+use dsp_core::eq_math::{
+    ChannelEq, filter_phase_deg, filter_response_db, peq_band_audible, peq_phase_deg, peq_response_db, wrap_deg,
+};
+use dsp_core::filter_file::{self, FileBands};
 use dsp_core::protocol as p;
 use dsp_core::{FilterState, PeqBand};
 use leptos::html;
 use leptos::prelude::*;
 use web_sys::{PointerEvent, WheelEvent};
 
-use crate::components::common::{ChannelSelector, PanelCard};
+use crate::components::common::{ChannelSelector, PanelCard, Segmented};
 use crate::components::fader::Fader;
 use crate::components::size::use_size;
 use crate::components::value_field::ValueField;
 use crate::fmt::{db_mark_label, format_db_value, format_hz, parse_frequency, parse_number};
 use crate::icons::{I, Icon};
+use crate::local_settings;
 use crate::pages::auto_eq::{AutoEqPanel, AutoEqTarget, PROPOSAL_COLOR};
 use crate::pages::dsp::ui;
 use crate::pages::gain::ChannelStrip;
-use crate::store::{Device, PeqEdit, alias_in, filter_of};
+use crate::store::{Device, PeqEdit, alias_in, app, filter_of};
 use crate::taper::Taper;
 
 /// One colour per PEQ band (9 bands on outputs).
@@ -82,6 +88,15 @@ pub fn EqPage() -> impl IntoView {
     let band = RwSignal::new(0usize);
     let auto_eq = RwSignal::new(false);
     let proposal = RwSignal::new(None::<Vec<PeqBand>>);
+    let import = RwSignal::new(None::<FileImport>);
+    let phase_view = RwSignal::new(local_settings::get_string("eqGraph").as_deref() == Some("phase"));
+    let compare = RwSignal::new(None::<String>);
+    Effect::new(move |_| {
+        let (m, ch) = (model.get(), channel.get());
+        if compare.get_untracked().is_some_and(|c| c == ch || !m.has_channel(&c)) {
+            compare.set(None);
+        }
+    });
 
     let color = move || if model.get().is_input(&channel.get()) { "var(--input)" } else { "var(--output)" };
     let band_count = Memo::new(move |_| {
@@ -112,6 +127,7 @@ pub fn EqPage() -> impl IntoView {
             })/>
         <button class="btn text compact" class:warn=move || auto_eq.get() on:click=move |_| {
             auto_eq.update(|a| *a = !*a);
+            import.set(None);
             proposal.set(None);
         }>
             <Icon icon=I::Tune size=16/>"Auto-EQ"
@@ -119,14 +135,93 @@ pub fn EqPage() -> impl IntoView {
     }
     .into_any();
 
+    let open_file = move |ev: leptos::ev::Event| {
+        let input = event_target::<web_sys::HtmlInputElement>(&ev);
+        let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
+        input.set_value("");
+        let ch = channel.get_untracked();
+        leptos::task::spawn_local(async move {
+            let name = file.name();
+            let text = match wasm_bindgen_futures::JsFuture::from(file.text()).await {
+                Ok(v) => v.as_string().unwrap_or_default(),
+                Err(_) => {
+                    app().toast(format!("{name} could not be read"), true);
+                    return;
+                }
+            };
+            let filters = filter_file::parse(&text);
+            if filters.is_empty() {
+                app().toast(format!("No filter lines (\"Filter 1: ON PK Fc …\") in {name}"), true);
+                return;
+            }
+            let current = device.state.with_untracked(|s| s.peq_bands.get(&ch).cloned().unwrap_or_default());
+            let result = filter_file::to_bands(&filters, &current);
+            auto_eq.set(false);
+            proposal.set(Some(result.bands.clone()));
+            import.set(Some(FileImport { name, channel: ch, result }));
+        });
+    };
+    let close_import = Callback::new(move |_| {
+        import.set(None);
+        proposal.set(None);
+    });
+    let compare_options = move || {
+        let ch = channel.get();
+        let m = model.get();
+        device.state.with(|s| {
+            m.channels()
+                .filter(|c| *c != ch)
+                .map(|c| {
+                    let name = alias_in(s, c);
+                    view! { <option value=c selected=move || compare.get().as_deref() == Some(c)>{name}</option> }
+                })
+                .collect_view()
+        })
+    };
+    let tools = view! {
+        <div class="eq-graph-tools">
+            <span data-view-ok>
+                <Segmented labels=vec!["Magnitude", "Phase"] selected=Signal::derive(move || phase_view.get() as usize)
+                    on_select=Callback::new(move |i: usize| {
+                        phase_view.set(i == 1);
+                        local_settings::set_string("eqGraph", if i == 1 { "phase" } else { "magnitude" });
+                    })/>
+            </span>
+            <span class="small muted">"Compare"</span>
+            <select class="select" data-view-ok title="Draw the curve of another channel (dashed)" on:change=move |ev| {
+                let v = event_target_value(&ev);
+                compare.set((!v.is_empty()).then_some(v));
+            }>
+                <option value="" selected=move || compare.with(Option::is_none)>"—"</option>
+                {compare_options}
+            </select>
+            <span class="eq-graph-note">
+                {move || phase_view.get().then_some(
+                    "Phase of PEQ, all-passes, HPF/LPF and polarity, without delay and GEQ. The compared channel includes the delay difference.",
+                )}
+            </span>
+            <label class="btn text compact file-button" title="Take over a filter settings text file (\"Filter 1: ON PK Fc 63 Hz Gain -5 dB Q 4\", REW / Equalizer APO format) as a proposal">
+                <Icon icon=I::Download size=16/>"Filter file …"
+                <input type="file" accept=".txt,text/plain" on:change=open_file/>
+            </label>
+        </div>
+    };
+
     view! {
         <div class="eq-page" style=move || format!("--chc:{}", color())>
             <ChannelSelector device=device selected=channel on_select=Callback::new(move |c: String| {
                 if c != channel.get_untracked() {
                     proposal.set(None);
+                    import.set(None);
                 }
                 channel.set(c);
             })/>
+            {tools}
+            <Show when=move || import.with(Option::is_some)>
+                <div class="auto-eq-wrap">
+                    {move || import.get().map(|i| view! { <FilterFilePanel import=i on_close=close_import/> })}
+                </div>
+            </Show>
             <Show when=move || auto_eq.get()>
                 <div class="auto-eq-wrap">
                     {move || {
@@ -143,7 +238,7 @@ pub fn EqPage() -> impl IntoView {
                 </div>
             </Show>
             <div class="peq-graph-box">
-                <PeqGraph device=device channel=channel selected=band proposal=proposal/>
+                <PeqGraph device=device channel=channel selected=band proposal=proposal phase=phase_view compare=compare/>
             </div>
             <div class="eq-bottom-scroll">
                 <div class="eq-bottom">
@@ -188,6 +283,79 @@ pub fn SmallToggle(
             title=title on:click=move |_| on_click.run(())>
             {label}
         </button>
+    }
+}
+
+// ─── Filter file ───
+
+/// A filter settings file mapped onto the PEQ of a channel.
+#[derive(Clone, Debug, PartialEq)]
+struct FileImport {
+    name: String,
+    channel: String,
+    result: FileBands,
+}
+
+/// The file's filters as a proposal (orange curve) with what could not be
+/// taken over exactly; "Apply" writes the changed bands.
+#[component]
+fn FilterFilePanel(import: FileImport, on_close: Callback<()>) -> impl IntoView {
+    let device = ui().device;
+    let FileImport { name, channel, result } = import;
+    let alias = device.alias(&channel);
+    let count = result.bands.len();
+    let summary = if result.used == 0 {
+        "No usable filter in the file.".to_string()
+    } else {
+        format!(
+            "{} filter{} → band{} 1{}; the other bands become flat (Peak, 0 dB). Proposal shown as orange curve.",
+            result.used,
+            if result.used == 1 { "" } else { "s" },
+            if result.used == 1 { "" } else { "s" },
+            if result.used == 1 { String::new() } else { format!("–{}", result.used) },
+        )
+    };
+    let notes = result.notes.iter().map(|n| view! { <li>{n.clone()}</li> }).collect_view();
+    let has_notes = !result.notes.is_empty();
+    let bands = StoredValue::new(result.bands);
+    let ch = StoredValue::new(channel);
+    let apply = move |_| {
+        let c = ch.get_value();
+        let current = device.state.with_untracked(|s| s.peq_bands.get(&c).cloned().unwrap_or_default());
+        for (i, b) in bands.get_value().iter().enumerate() {
+            if current.get(i) != Some(b) {
+                let edit = PeqEdit {
+                    gain_db: Some(b.gain_db),
+                    freq_raw: Some(b.freq_raw),
+                    q_raw: Some(b.q_raw),
+                    peq_type: Some(b.peq_type),
+                    bypass: Some(b.bypass),
+                };
+                device.set_peq_band(&c, i, edit);
+            }
+        }
+        app().toast(format!("Filter file applied to the PEQ of {}", device.alias(&c)), false);
+        on_close.run(());
+    };
+    view! {
+        <div class="auto-eq">
+            <div class="auto-eq-head">
+                <Icon icon=I::Download size=16 color="var(--warning)"/>
+                <span class="auto-eq-title">{format!("Filter file · {name} → {alias} ({count} bands)")}</span>
+                <span class="auto-eq-step">{summary}</span>
+                <button class="icon-button small" title="Close" on:click=move |_| on_close.run(())>
+                    <Icon icon=I::Close size=16/>
+                </button>
+            </div>
+            {has_notes.then(|| view! { <ul class="filter-file-notes">{notes}</ul> })}
+            <div class="wrap-row">
+                <button class="btn compact" style="background:var(--warning);color:var(--bg-deep)"
+                    prop:disabled=result.used == 0 on:click=apply>
+                    <Icon icon=I::Check size=18/>{format!("Apply to {alias}")}
+                </button>
+                <button class="btn text compact" on:click=move |_| on_close.run(())>"Discard"</button>
+            </div>
+        </div>
     }
 }
 
@@ -483,6 +651,20 @@ impl Geometry {
         }
         out
     }
+    fn deg_to_y(&self, deg: f64) -> f64 {
+        PAD_TOP + self.h() / 2.0 - deg.clamp(-180.0, 180.0) / 180.0 * self.h() / 2.0
+    }
+    /// Phase curve (−180 … 180°); a wrap starts a new segment instead of a
+    /// vertical line.
+    fn phase_path(&self, deg: &[f64]) -> String {
+        let mut out = String::with_capacity(deg.len() * 14);
+        for (s, v) in deg.iter().enumerate() {
+            let x = PAD_LEFT + self.w() * s as f64 / STEPS as f64;
+            let jump = s == 0 || (v - deg[s - 1]).abs() > 180.0;
+            out.push_str(&format!("{}{:.1},{:.1}", if jump { "M" } else { "L" }, x, self.deg_to_y(*v)));
+        }
+        out
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -492,6 +674,16 @@ struct GraphInput {
     lp: FilterState,
     hp_preview: i64,
     lp_preview: i64,
+    inverted: bool,
+}
+
+/// Another channel drawn dashed for comparison: its EQ, its delay minus the
+/// delay of the shown channel (ms), its colour.
+#[derive(Clone, PartialEq)]
+struct Compared {
+    eq: ChannelEq,
+    delay_ms: f64,
+    color: &'static str,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -502,6 +694,8 @@ struct GraphShapes {
     /// (path, colour, dashed)
     filter_paths: Vec<(String, &'static str, bool)>,
     proposal: Option<String>,
+    /// (path, colour) of the compared channel.
+    compare: Option<(String, &'static str)>,
     total: String,
     /// (x, y, colour, label, bypass, selected)
     points: Vec<(f64, f64, &'static str, usize, bool, bool)>,
@@ -540,8 +734,59 @@ fn total(bands: &[PeqBand], curves: &[Vec<f64>], hp: Option<&Vec<f64>>, lp: Opti
     sum
 }
 
-fn shapes(g: &Geometry, input: &GraphInput, selected: usize, proposal: Option<&Vec<PeqBand>>) -> GraphShapes {
-    let hz: Vec<f64> = (0..=STEPS).map(|s| g.x_to_hz(PAD_LEFT + g.w() * s as f64 / STEPS as f64)).collect();
+fn graph_hz(g: &Geometry) -> Vec<f64> {
+    (0..=STEPS).map(|s| g.x_to_hz(PAD_LEFT + g.w() * s as f64 / STEPS as f64)).collect()
+}
+
+/// Phase of [bands] (bypassed ones left out) with the filters and polarity
+/// of [input].
+fn phase_curve(input: &GraphInput, bands: &[PeqBand], hz: &[f64]) -> Vec<f64> {
+    let active: Vec<(f64, f64, f64, i64)> = bands
+        .iter()
+        .filter(|b| !b.bypass)
+        .map(|b| (p::peq_freq_to_hz(b.freq_raw), p::peq_raw_to_q(b.q_raw), b.gain_db, b.peq_type))
+        .collect();
+    let filters: Vec<(f64, i64, bool)> = [(&input.hp, true), (&input.lp, false)]
+        .into_iter()
+        .filter(|(f, _)| f.enabled())
+        .map(|(f, high)| (p::peq_freq_to_hz(f.freq_raw), f.slope, high))
+        .collect();
+    hz.iter()
+        .map(|f| {
+            let mut deg = if input.inverted { 180.0 } else { 0.0 };
+            for (fc, q, gain, t) in &active {
+                deg += peq_phase_deg(*f, *fc, *q, *gain, *t);
+            }
+            for (fc, slope, high) in &filters {
+                deg += filter_phase_deg(*f, *fc, *slope, *high);
+            }
+            wrap_deg(deg)
+        })
+        .collect()
+}
+
+fn phase_shapes(g: &Geometry, input: &GraphInput, proposal: Option<&Vec<PeqBand>>, compare: Option<&Compared>) -> GraphShapes {
+    let hz = graph_hz(g);
+    GraphShapes {
+        total: g.phase_path(&phase_curve(input, &input.bands, &hz)),
+        proposal: proposal.map(|bands| g.phase_path(&phase_curve(input, bands, &hz))),
+        compare: compare.map(|c| {
+            let deg: Vec<f64> =
+                hz.iter().map(|f| wrap_deg(c.eq.phase_deg(*f) - 360.0 * f * c.delay_ms / 1000.0)).collect();
+            (g.phase_path(&deg), c.color)
+        }),
+        ..GraphShapes::default()
+    }
+}
+
+fn shapes(
+    g: &Geometry,
+    input: &GraphInput,
+    selected: usize,
+    proposal: Option<&Vec<PeqBand>>,
+    compare: Option<&Compared>,
+) -> GraphShapes {
+    let hz = graph_hz(g);
     let bands = &input.bands;
     let curves: Vec<Vec<f64>> = bands.iter().map(|b| band_curve(b, &hz)).collect();
     let hp = input.hp.enabled().then(|| filter_curve(input.hp.freq_raw, input.hp.slope, true, &hz));
@@ -588,6 +833,10 @@ fn shapes(g: &Geometry, input: &GraphInput, selected: usize, proposal: Option<&V
         let pc: Vec<Vec<f64>> = proposed.iter().map(|b| band_curve(b, &hz)).collect();
         out.proposal = Some(g.path(&total(proposed, &pc, hp.as_ref(), lp.as_ref())));
     }
+    if let Some(c) = compare {
+        let db: Vec<f64> = hz.iter().map(|f| c.eq.db(*f)).collect();
+        out.compare = Some((g.path(&db), c.color));
+    }
     out.total = g.path(&sum);
 
     // Band points, selected one on top.
@@ -605,13 +854,18 @@ fn shapes(g: &Geometry, input: &GraphInput, selected: usize, proposal: Option<&V
 /// Parametric EQ graph of one channel: band curves, HPF/LPF and the total
 /// response. Drag a band point to change frequency and gain, scroll over it to
 /// change Q, click to select it. Bypassed bands are shown as a dashed preview
-/// of what they would do; an Auto-EQ proposal is drawn in orange.
+/// of what they would do; an Auto-EQ proposal is drawn in orange. In the phase
+/// view only the curves are drawn (no band points).
 #[component]
 pub fn PeqGraph(
     device: Device,
     #[prop(into)] channel: Signal<String>,
     selected: RwSignal<usize>,
     #[prop(into)] proposal: Signal<Option<Vec<PeqBand>>>,
+    #[prop(optional, into)] phase: Signal<bool>,
+    /// Another channel to draw dashed.
+    #[prop(optional, into)]
+    compare: Signal<Option<String>>,
 ) -> impl IntoView {
     let container = NodeRef::<html::Div>::new();
     let size = use_size(container);
@@ -630,7 +884,20 @@ pub fn PeqGraph(
                     b.bypass = true;
                 }
             }
-            GraphInput { bands, hp: filter_of(s, &ch, true), lp: filter_of(s, &ch, false), hp_preview, lp_preview }
+            let inverted = s.phase.get(&ch).copied().unwrap_or(false);
+            GraphInput { bands, hp: filter_of(s, &ch, true), lp: filter_of(s, &ch, false), hp_preview, lp_preview, inverted }
+        })
+    });
+    let compared = Memo::new(move |_| {
+        let other = compare.get()?;
+        let ch = channel.get();
+        device.state.with(|s| {
+            if !s.model.has_channel(&other) || other == ch {
+                return None;
+            }
+            let delay = |c: &str| p::delay_raw_to_ms(s.delays.get(c).copied().unwrap_or(0));
+            let color = if s.model.is_input(&other) { "var(--input)" } else { "var(--output)" };
+            Some(Compared { eq: ChannelEq::of(s, &other), delay_ms: delay(&other) - delay(&ch), color })
         })
     });
     let drawn = Memo::new(move |_| {
@@ -638,7 +905,17 @@ pub fn PeqGraph(
         if g.width < 50.0 || g.height < 50.0 {
             return GraphShapes::default();
         }
-        proposal.with(|prop| input.with(|i| shapes(&g, i, selected.get(), prop.as_ref())))
+        proposal.with(|prop| {
+            compared.with(|c| {
+                input.with(|i| {
+                    if phase.get() {
+                        phase_shapes(&g, i, prop.as_ref(), c.as_ref())
+                    } else {
+                        shapes(&g, i, selected.get(), prop.as_ref(), c.as_ref())
+                    }
+                })
+            })
+        })
     });
 
     // ─── Interaction ───
@@ -662,7 +939,7 @@ pub fn PeqGraph(
         })
     };
     let on_down = move |ev: PointerEvent| {
-        if ev.button() != 0 {
+        if ev.button() != 0 || phase.get_untracked() {
             return;
         }
         let Some((x, y)) = local(&ev) else { return };
@@ -690,6 +967,9 @@ pub fn PeqGraph(
     };
     let on_up = move |_: PointerEvent| drag.set_value(None);
     let on_wheel = move |ev: WheelEvent| {
+        if phase.get_untracked() {
+            return;
+        }
         let Some(el) = container.get_untracked() else { return };
         let rect = el.get_bounding_client_rect();
         let (x, y) = (ev.client_x() as f64 - rect.left(), ev.client_y() as f64 - rect.top());
@@ -713,8 +993,19 @@ pub fn PeqGraph(
         let top = PAD_TOP;
         let bottom = PAD_TOP + g.h();
         let mut db_lines = Vec::new();
+        if phase.get() {
+            for deg in (-4..=4).map(|k| k as f64 * 45.0) {
+                let y = g.deg_to_y(deg);
+                let class = if deg == 0.0 { "graph-zero" } else { "graph-grid" };
+                db_lines.push(view! { <line class=class x1=left y1=y x2=right y2=y/> }.into_any());
+                if deg % 90.0 == 0.0 {
+                    let text = format!("{}°", deg as i64);
+                    db_lines.push(view! { <text class="graph-text" x=left - 4.0 y=y + 3.0 text-anchor="end">{text}</text> }.into_any());
+                }
+            }
+        }
         let mut db = -12.0;
-        while db <= 12.0 {
+        while db <= 12.0 && !phase.get() {
             let y = g.db_to_y(db);
             let class = if db == 0.0 { "graph-zero" } else { "graph-grid" };
             db_lines.push(view! { <line class=class x1=left y1=y x2=right y2=y/> }.into_any());
@@ -784,6 +1075,9 @@ pub fn PeqGraph(
         let proposal = d.proposal.map(|path| {
             view! { <path d=path fill="none" stroke=PROPOSAL_COLOR stroke-width="2.2" stroke-linejoin="round"/> }
         });
+        let compare = d.compare.map(|(path, color)| {
+            view! { <path d=path fill="none" stroke=color stroke-width="1.8" stroke-dasharray="6 4" stroke-opacity="0.9"/> }
+        });
         let points = d
             .points
             .into_iter()
@@ -810,6 +1104,7 @@ pub fn PeqGraph(
                 {fill}
                 {bands}
                 {filters}
+                {compare}
                 {proposal}
                 <path d=d.total fill="none" stroke="var(--text)" stroke-width="2.4" stroke-linejoin="round"/>
             </g>

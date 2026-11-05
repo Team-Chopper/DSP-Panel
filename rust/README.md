@@ -14,6 +14,13 @@ The WebSocket API, `config.yaml`, `devices.json`, `presets.json`, `auth.json`
 and `secret.key` have the formats of the Dart server: the Rust server works
 with the Flutter client, and data can be copied between both installations.
 
+Live-safety additions of the Rust panel (the Dart server ignores them): mute
+all, a max level per channel (`gainCaps` in `devices.json`, enforced by the
+server) and a safe DSP test generator (outputs lowered before it starts,
+restored after it stops). `safety.json` in the data directory keeps what mute
+all has to unmute again and the output gains saved for the generator, so both
+survive a crash or restart.
+
 ## Develop
 
 ```powershell

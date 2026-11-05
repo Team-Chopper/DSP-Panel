@@ -6,9 +6,13 @@ pub mod auth;
 pub mod config;
 pub mod http;
 pub mod hub;
+pub mod light;
 pub mod log;
+pub mod panel_data;
 pub mod presets;
 pub mod registry;
+pub mod safety;
+pub mod scan;
 pub mod session;
 
 use std::net::SocketAddr;
@@ -16,14 +20,17 @@ use std::time::Duration;
 
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::spawn_local;
 
 use crate::auth::AuthService;
 use crate::config::ServerConfig;
 use crate::http::AppState;
-use crate::hub::Hub;
+use crate::hub::{Hub, HubStores};
+use crate::light::LightSnapshot;
+use crate::panel_data::PanelStore;
 use crate::registry::DeviceRegistry;
+use crate::safety::SafetyStore;
 use crate::session::Timing;
 
 /// A running server (inside a tokio `LocalSet`).
@@ -47,7 +54,14 @@ impl Server {
         }
 
         let registry = DeviceRegistry::new(config.data_dir.join("devices.json"));
-        let hub = Hub::new(registry, config.data_dir.join("presets.json"), timing);
+        let (light_tx, light_rx) = watch::channel(LightSnapshot::default());
+        let stores = HubStores {
+            presets_file: config.data_dir.join("presets.json"),
+            safety: SafetyStore::new(config.data_dir.join("safety.json")),
+            panel: PanelStore::new(config.data_dir.join("panel.json")),
+            light: light_tx,
+        };
+        let hub = Hub::new(registry, stores, timing);
         hub.start()?;
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let runner = hub.clone();
@@ -67,7 +81,7 @@ impl Server {
             None
         };
 
-        let app = http::router(AppState::new(config, auth, hub_tx))
+        let app = http::router(AppState::new(config, auth, hub_tx, light_rx))
             .into_make_service_with_connect_info::<SocketAddr>();
         let handle = Handle::new();
         let serve_handle = handle.clone();

@@ -3,15 +3,18 @@
 
 use std::cell::Cell;
 
+use dsp_core::api::{TEST_LEVEL_MAX_DB, TEST_LEVEL_MIN_DB, TEST_START_LEVEL_DB};
 use dsp_core::eq_math::GEQ_CENTER_FREQUENCIES;
 use dsp_core::protocol as p;
 use leptos::prelude::*;
 
 use crate::components::common::{Modal, Segmented, Slider};
+use crate::components::fader::Fader;
 use crate::components::value_field::ValueField;
-use crate::fmt::{format_hz, parse_frequency};
+use crate::fmt::{db_mark_label, format_db_value, format_hz, parse_frequency, parse_number};
 use crate::icons::{I, Icon};
 use crate::store::Device;
+use crate::taper::Taper;
 use crate::tone::{MAX_LEVEL_DB, MIN_LEVEL_DB, ToneGenerator, ToneSignal};
 
 thread_local! {
@@ -25,10 +28,15 @@ fn iso_label(hz: f64) -> String {
 }
 
 /// The DSP's own signal generator (cmd 0x39 like the original editor; not
-/// tested on a device). "Analog input" switches it off.
+/// tested on a device). "Analog input" switches it off. While it runs the
+/// server keeps all outputs at the test level (the gains from before come back
+/// when it stops).
 #[component]
 pub fn DspGeneratorPanel(device: Device) -> impl IntoView {
     let tone_type = Memo::new(move |_| device.state.with(|s| s.test_tone_type));
+    let test_level = Memo::new(move |_| device.info.with(|i| i.test_level));
+    // Only this rebuilds the fader, not every new level.
+    let test_running = Memo::new(move |_| test_level.with(Option::is_some));
     let param = Memo::new(move |_| {
         device.state.with(|s| s.test_tone_param.clamp(0, GEQ_CENTER_FREQUENCIES.len() as i64 - 1))
     });
@@ -70,6 +78,31 @@ pub fn DspGeneratorPanel(device: Device) -> impl IntoView {
             <Show when=move || tone_type.get() != 0>
                 <span class="small" style="color:var(--warning)">"generator running"</span>
             </Show>
+            {move || test_running.get().then(|| {
+                let level = Signal::derive(move || test_level.get().unwrap_or(TEST_START_LEVEL_DB));
+                view! {
+                    <div class="row tight test-level">
+                        <span class="small muted">"Test level"</span>
+                        <div class="test-level-fader">
+                            <Fader vertical=false value=level
+                                taper=Taper::Linear(TEST_LEVEL_MIN_DB, TEST_LEVEL_MAX_DB)
+                                marks=vec![-60.0, -50.0, -40.0, -30.0, -20.0, -10.0, 0.0] major=vec![TEST_START_LEVEL_DB]
+                                label={db_mark_label as fn(f64) -> String} color="var(--warning)"
+                                step=Signal::derive(|| 1.0) reset=TEST_START_LEVEL_DB
+                                on_change=Callback::new(move |v: f64| device.set_test_level(v))/>
+                        </div>
+                        <ValueField width=64 text=Signal::derive(move || format!("{} dB", format_db_value(level.get())))
+                            title="All outputs while the generator runs (-60 … 0 dB)"
+                            on_submit=Callback::new(move |input: String| match parse_number(&input) {
+                                Some(v) => {
+                                    device.set_test_level(v);
+                                    true
+                                }
+                                None => false,
+                            })/>
+                    </div>
+                }
+            })}
         </div>
         {move || confirm.get().map(|t| {
             let close = Callback::new(move |_| confirm.set(None));
@@ -83,7 +116,7 @@ pub fn DspGeneratorPanel(device: Device) -> impl IntoView {
                     }>"Start"</button>
                 }.into_any()>
                     <div class="note-text">
-                        "The DSP plays the test signal itself – depending on gains and routing it can reach the speakers at full level. Turn the outputs down first."
+                        "The DSP plays the test signal itself – depending on routing it can reach the speakers. The panel first saves all output gains and lowers every output to -50 dB; the test level sets them while it runs. Switching the generator off stops it first and then restores the saved gains."
                     </div>
                     <div class="note-text">
                         "The command is the one of the original editor but has not been tested on a device."

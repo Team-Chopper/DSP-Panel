@@ -269,6 +269,48 @@ fn link_change_new_slaves_mask_and_masks_of_older_versions_to_reset() {
 }
 
 #[test]
+fn copy_parts_between_models_sends_only_what_differs() {
+    let mut src = DeviceState::new(M408);
+    ops::apply(&mut src, &Op::gain("Out 1", -4.0));
+    ops::apply(&mut src, &Op::delay("Out 1", 960));
+    ops::apply(&mut src, &Op::matrix_route("Out 1", 0b1010)); // In B + In D
+    ops::apply(&mut src, &Op::matrix_gain("Out 1", "In B", -6.0));
+    ops::apply(&mut src, &Op::peq_band("Out 1", 8, PeqBand { gain_db: 2.0, ..PeqBand::default() }));
+    let dst = DeviceState::new(M206);
+    let list = ops::copy_parts(&src, "Out 1", &dst, "Out 3", &strings(&["level", "routing", "eq"])).unwrap();
+    assert_eq!(
+        list,
+        [
+            Op::gain("Out 3", -4.0),
+            Op::delay("Out 3", 960),
+            Op::peq_band("Out 3", 8, PeqBand { gain_db: 2.0, ..PeqBand::default() }),
+            // The 206 has no In D; Out 3 is fed from In A by default.
+            Op::matrix_route("Out 3", 0b10),
+            Op::matrix_gain("Out 3", "In B", -6.0),
+        ]
+    );
+    assert!(ops::copy_parts(&src, "Out 1", &dst, "In A", &strings(&["level"])).is_err());
+    assert!(ops::copy_parts(&src, "Out 1", &dst, "Out 2", &strings(&["mute"])).is_err());
+    assert!(ops::copy_parts(&src, "Out 2", &dst, "Out 2", &strings(&["level", "dynamics"])).unwrap().is_empty());
+}
+
+#[test]
+fn link_change_resets_released_slaves_with_mask_zero() {
+    // Slaves with link word 0, as other control software leaves them: the DSP
+    // ignores changes on such a channel once it is no longer in a group.
+    let mut state = DeviceState::new(M408);
+    state.links.insert("Out 1".into(), 0x07);
+    state.links.insert("Out 2".into(), 0);
+    state.links.insert("Out 3".into(), 0);
+    assert_eq!(ops::link_group_of(&state, "Out 3"), strings(&["Out 1", "Out 2", "Out 3"]));
+    let change = ops::link_change(&state, "Out 1", &strings(&["Out 2"])).unwrap();
+    assert_eq!(change.mask, 0x03);
+    assert_eq!(change.reset, strings(&["Out 3"]));
+    let list = ops::unlink(&state, "Out 1").unwrap();
+    assert_eq!(list, [Op::link("Out 1", 0x01), Op::link("Out 2", 0x02), Op::link("Out 3", 0x04)]);
+}
+
+#[test]
 fn symmetric_masks_form_one_group_with_the_first_channel_as_master() {
     let mut state = DeviceState::new(M408);
     for o in ["Out 1", "Out 2", "Out 3"] {

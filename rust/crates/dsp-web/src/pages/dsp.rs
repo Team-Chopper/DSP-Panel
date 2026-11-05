@@ -13,6 +13,7 @@ use leptos::prelude::*;
 use crate::app::status_color;
 use crate::components::common::{Check, MenuButton, ProgressRing};
 use crate::dialogs::{ChannelDialogs, DspDialog, SettingsDialog};
+use crate::fmt::format_db_value;
 use crate::icons::{I, Icon};
 use crate::pages;
 use crate::store::{Device, app};
@@ -79,6 +80,10 @@ pub enum Dialog {
     Rename(String),
     Copy(String),
     Link(String),
+    /// Max level of a channel.
+    MaxLevel(String),
+    /// Confirm a typed gain above the channel's max level.
+    ForceGain(String, f64),
     EditDsp,
     Settings,
     Presets,
@@ -157,10 +162,31 @@ pub fn DspPage(device: Device) -> impl IntoView {
         })
     };
 
+    let test_level = Memo::new(move |_| if device.offline { None } else { device.info.with(|i| i.test_level) });
+    let test_running = Memo::new(move |_| test_level.with(Option::is_some));
+    let test_banner = move || {
+        test_running.get().then(|| {
+            view! {
+                <div class="banner test-banner">
+                    <Icon icon=I::Warning size=18/>
+                    <span class="grow">{move || format!(
+                        "DSP test generator running – all outputs at {} dB. Only mutes and the test controls are \
+                         accepted; the saved output gains come back when it is switched off.",
+                        format_db_value(test_level.get().unwrap_or_default())
+                    )}</span>
+                    <button class="btn danger compact" on:click=move |_| device.set_test_tone(0, None)>
+                        <Icon icon=I::Stop size=18/>"Stop generator"
+                    </button>
+                </div>
+            }
+        })
+    };
+
     view! {
         <div class="dsp-page">
             <SectionBar show_debug=show_debug/>
             {config_warning}
+            {test_banner}
             <div class="dsp-content" class:locked=locked>
                 <div class="page">{content}</div>
                 <Show when=locked>

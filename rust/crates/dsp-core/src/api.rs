@@ -10,7 +10,7 @@
 //!   {t: subscribe,   dsp}                 full state + log, then live updates
 //!   {t: unsubscribe, dsp}
 //!   {t: addDsp,      name, host, port, model, deviceId?, password?}
-//!                    model: auto|dsp408|dsp206
+//!                    model: auto|dsp408|dsp206|dsp204
 //!   {t: updateDsp,   id, name?, host?, port?, enabled?, model?, deviceId?, password?}
 //!   {t: removeDsp,   id}
 //!   {t: op,          dsp, op}             see ops.rs
@@ -23,15 +23,38 @@
 //!   {t: debug,       dsp, rx, tx}         packet logging on/off
 //!   {t: clearLog,    dsp}
 //!
+//! Live safety
+//!   {t: muteAll,     on}                  mute every channel of every DSP / release
+//!   {t: op, dsp, op: gain, force: true}   set a gain above the channel's max level
+//!   {t: gainCap,     dsp, ch, db}         max level of a channel (db: null removes it)
+//!   {t: testLevel,   dsp, db}             all outputs while the DSP generator runs
+//!
 //! Presets stored on the server (edited offline, loaded onto a DSP)
 //!   {t: presetCreate, name, model?, fromDsp?}   empty preset or snapshot of a DSP
 //!   {t: presetRename, preset, name}
 //!   {t: presetDelete, preset}
-//!   {t: presetApply,  preset, dsp}              send all values to the DSP
+//!   {t: presetApply,  preset, dsp}              send what differs (all values if
+//!                                               the links differ), read back, compare;
+//!                                               the DSP's values before are kept for undo
+//!   {t: presetUndo,   dsp}                      back to the values before the last load
 //!   subscribe / unsubscribe / op with dsp: "preset:<id>" edit a preset offline
 //!
+//! Several DSPs
+//!   {t: copyTo, dsp, from, parts: [level|filters|eq|dynamics|routing],
+//!          targets: [{dsp, ch}]}              copy settings of a channel to channels of
+//!                                             the same kind, also on other DSPs
+//!   {t: scan, networks?: ["192.168.1"]}       search the LAN for DSPs → scanResult
+//!
+//! Panel data (dsp_core::panel, kept on the server for every client)
+//!   {t: limiterSetup,  setup}                 limiter calculator: amplifiers, outputs
+//!   {t: linkName,      dsp, members, name}    name of a link group ("" removes it)
+//!   {t: lightSettings, settings}              limit light page /limit (no login)
+//!
 //! Server → client
-//!   {t: hello,      dsps: [DspInfo]}
+//!   {t: hello,      dsps: [DspInfo], muteAll, panel}
+//!   {t: panel,      data}                     panel data changed
+//!   {t: scanResult, found: [{host, port, info, model}], networks: [..]}
+//!   {t: notice,     dsp?, message, error}     result of a job (e.g. values a load missed)
 //!   {t: dspInfo,    info: DspInfo}        added or changed
 //!   {t: dspRemoved, id}
 //!   {t: state,      dsp, state}           full DeviceState
@@ -40,8 +63,11 @@
 //!                   dyn: bit n = compressor, bit 8+n = limiter of output n active
 //!   {t: log,        dsp, entries: [LogEntry], reset?}
 //!   {t: presets,    presets: [ServerPresetInfo]}  on connect and on every change
+//!   {t: muteAll,    on}                   mute all switched by a client
 //!   {t: error,      dsp?, message}
 //! ```
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -65,6 +91,15 @@ pub mod msg {
     pub const PRESET_RENAME: &str = "presetRename";
     pub const PRESET_DELETE: &str = "presetDelete";
     pub const PRESET_APPLY: &str = "presetApply";
+    pub const MUTE_ALL: &str = "muteAll";
+    pub const GAIN_CAP: &str = "gainCap";
+    pub const TEST_LEVEL: &str = "testLevel";
+    pub const PRESET_UNDO: &str = "presetUndo";
+    pub const COPY_TO: &str = "copyTo";
+    pub const SCAN: &str = "scan";
+    pub const LIMITER_SETUP: &str = "limiterSetup";
+    pub const LINK_NAME: &str = "linkName";
+    pub const LIGHT_SETTINGS: &str = "lightSettings";
 
     /// Prefix of the "dsp" id that addresses a server preset (offline editor).
     pub const PRESET_PREFIX: &str = "preset:";
@@ -77,11 +112,25 @@ pub mod msg {
     pub const LOG: &str = "log";
     pub const PRESETS: &str = "presets";
     pub const ERROR: &str = "error";
+    pub const PANEL: &str = "panel";
+    pub const SCAN_RESULT: &str = "scanResult";
+    pub const NOTICE: &str = "notice";
 }
+
+/// Parts of a channel's settings that [msg::COPY_TO] can copy.
+pub const COPY_PARTS: [&str; 5] = ["level", "filters", "eq", "dynamics", "routing"];
 
 /// Default meter polling interval in ms (allowed: 5–300), the interval of the
 /// original editor.
 pub const DEFAULT_REFRESH_MS: i64 = 300;
+
+/// Level of every output right after the DSP test generator is switched on.
+pub const TEST_START_LEVEL_DB: f64 = -50.0;
+/// Range of the test level (all outputs together while the generator runs).
+pub const TEST_LEVEL_MIN_DB: f64 = -60.0;
+pub const TEST_LEVEL_MAX_DB: f64 = 0.0;
+/// Error for changes refused while the DSP test generator runs.
+pub const TEST_RUNNING: &str = "The DSP test generator is running – switch it off first";
 
 /// A preset stored on the server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +231,17 @@ pub struct DspInfo {
     /// to clients).
     #[serde(default)]
     pub has_password: bool,
+    /// Max level per channel in dB, kept by the server only (the DSP does not
+    /// know it): the server never sets a gain above max(cap, current gain).
+    #[serde(default)]
+    pub gain_caps: BTreeMap<String, f64>,
+    /// Level of all outputs while the DSP test generator runs (the gains from
+    /// before are saved on the server); `None` while it is off.
+    #[serde(default)]
+    pub test_level: Option<f64>,
+    /// Labels of the states kept for undoing preset loads, newest last.
+    #[serde(default)]
+    pub undo: Vec<String>,
 }
 
 impl DspInfo {
@@ -203,6 +263,9 @@ impl DspInfo {
             config_readable: true,
             device_id: 1,
             has_password: false,
+            gain_caps: BTreeMap::new(),
+            test_level: None,
+            undo: Vec::new(),
         }
     }
 }

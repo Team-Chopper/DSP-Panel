@@ -9,6 +9,7 @@ use dsp_core::{DeviceModel, DspInfo, ops};
 use leptos::prelude::*;
 
 use crate::components::common::{Check, Modal};
+use crate::fmt::{format_db_value, parse_number};
 use crate::icons::{I, Icon};
 use crate::pages::dsp::{Dialog, ui};
 use crate::rta::RtaSettings;
@@ -244,7 +245,97 @@ pub fn ChannelDialogs(dialog: Dialog) -> impl IntoView {
         Dialog::Rename(ch) => view! { <RenameDialog channel=ch/> }.into_any(),
         Dialog::Copy(ch) => view! { <CopyDialog channel=ch/> }.into_any(),
         Dialog::Link(ch) => view! { <LinkDialog channel=ch/> }.into_any(),
+        Dialog::MaxLevel(ch) => view! { <MaxLevelDialog channel=ch/> }.into_any(),
+        Dialog::ForceGain(ch, db) => view! { <ForceGainDialog channel=ch db=db/> }.into_any(),
         _ => ().into_any(),
+    }
+}
+
+/// Max level of a channel: kept by the server (the DSP does not know it), it
+/// never sets the gain higher; a channel already above can only go down.
+#[component]
+fn MaxLevelDialog(channel: String) -> impl IntoView {
+    let ui = ui();
+    let device = ui.device;
+    let (name, linked) = device.state.with_untracked(|s| {
+        let others: Vec<String> = ops::linked_with(s, &channel).iter().map(|c| alias_in(s, c)).collect();
+        (alias_in(s, &channel), others)
+    });
+    let current = device.gain_cap(&channel);
+    let value = RwSignal::new(current.map(format_db_value).unwrap_or_default());
+    let error = move || value.with(|v| parse_number(v).filter(|db| (-60.0..=12.0).contains(db)).is_none());
+    // An empty field is not wrong yet, it just cannot be set.
+    let invalid = move || value.with(|v| !v.trim().is_empty()) && error();
+    let ch = channel.clone();
+    let set = move || {
+        if let Some(db) = parse_number(&value.get_untracked()).filter(|db| (-60.0..=12.0).contains(db)) {
+            device.set_gain_cap(&ch, Some(db));
+            ui.dialog.set(None);
+        }
+    };
+    let set_click = set.clone();
+    let remove_ch = channel.clone();
+    let actions = view! {
+        {current.is_some().then(|| view! {
+            <button class="btn text danger-text" on:click=move |_| {
+                device.set_gain_cap(&remove_ch, None);
+                ui.dialog.set(None);
+            }>"Remove"</button>
+        })}
+        <span class="spacer"></span>
+        <button class="btn text" on:click=move |_| ui.dialog.set(None)>"Cancel"</button>
+        <button class="btn filled" prop:disabled=error on:click=move |_| set_click()>"Set"</button>
+    }
+    .into_any();
+    let note = if linked.is_empty() {
+        String::new()
+    } else {
+        format!(" Linked channels share it: {}.", linked.join(", "))
+    };
+    view! {
+        <Modal title=format!("Max level of {name}") on_close=Callback::new(move |_| ui.dialog.set(None)) actions=actions>
+            <form on:submit=move |ev| {
+                ev.prevent_default();
+                set();
+            }>
+                <div class="field" class:invalid=invalid>
+                    <label>"Max level (dB)"</label>
+                    <input inputmode="decimal" autofocus placeholder="e.g. -6" prop:value=move || value.get()
+                        on:input=move |ev| value.set(event_target_value(&ev))/>
+                    <span class="help">{format!(
+                        "The panel never sets the gain higher (-60 … +12 dB); typing a higher value asks first. \
+                         Kept by the panel server, not on the DSP. A channel that is already above it can only be \
+                         turned down.{note}"
+                    )}</span>
+                </div>
+            </form>
+        </Modal>
+    }
+}
+
+/// Confirmation for a typed gain above the max level.
+#[component]
+fn ForceGainDialog(channel: String, db: f64) -> impl IntoView {
+    let ui = ui();
+    let device = ui.device;
+    let name = device.alias(&channel);
+    let cap = device.gain_cap(&channel).map(format_db_value).unwrap_or_default();
+    let close = Callback::new(move |_| ui.dialog.set(None));
+    let actions = view! {
+        <button class="btn text" on:click=move |_| ui.dialog.set(None)>"Cancel"</button>
+        <button class="btn danger" on:click=move |_| {
+            device.set_gain_forced(&channel, db);
+            ui.dialog.set(None);
+        }>"Set anyway"</button>
+    }
+    .into_any();
+    view! {
+        <Modal title="Above the max level" on_close=close actions=actions>
+            <div class="note-text">{format!(
+                "The max level of {name} is {cap} dB. Set it to {} dB anyway?",
+                format_db_value(db)
+            )}</div>
+        </Modal>
     }
 }
 
@@ -287,6 +378,12 @@ fn ChannelMenu(channel: String) -> impl IntoView {
                 {item(I::Edit, "Rename", "Stored on the DSP, max. 8 characters", Dialog::Rename(channel.clone()))}
                 {item(I::Copy, "Copy settings to …", "Gain, mute, phase, delay, EQ, filters, dynamics", Dialog::Copy(channel.clone()))}
                 {item(I::Link, "Link with …", "Linked channels change together", Dialog::Link(channel.clone()))}
+                {(!device.offline).then(|| item(
+                    I::VerticalTop,
+                    "Max level …",
+                    "Panel-side gain limit, not stored on the DSP",
+                    Dialog::MaxLevel(channel.clone()),
+                ))}
             </div>
         </Modal>
     }

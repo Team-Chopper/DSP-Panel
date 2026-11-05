@@ -5,6 +5,7 @@ use dsp_core::DeviceModel;
 use dsp_core::api::{DspStatus, msg};
 use leptos::prelude::*;
 
+use crate::components::common::Modal;
 use crate::dialogs::DspDialog;
 use crate::icons::{I, Icon};
 use crate::net;
@@ -17,6 +18,7 @@ pub fn Root() -> impl IntoView {
     // Panel-wide audio state, owned by the root so it lives as long as the panel.
     crate::rta::RtaSettings::get();
     crate::tone::ToneGenerator::get();
+    crate::read_only::install();
     net::start();
     view! {
         {move || match app.server.get() {
@@ -179,6 +181,10 @@ fn PanelPage() -> impl IntoView {
                     <div class="logo"><Icon icon=I::GraphicEq size=18/></div>
                     <span class="app-title">"DSP Panel"</span>
                     <span class="spacer"></span>
+                    <ReadOnlyToggle/>
+                    <Show when=move || !app.dsps.with(Vec::is_empty)>
+                        <MuteAllButton/>
+                    </Show>
                     <crate::components::common::MenuButton icon=I::Menu title="Menu" items=menu_items/>
                 </div>
                 <Show when=has_tabs>
@@ -208,6 +214,60 @@ fn PanelPage() -> impl IntoView {
                 <DspDialog initial=None on_close=Callback::new(move |_| adding.set(false))/>
             </Show>
         </div>
+    }
+}
+
+/// View-only switch of this browser tab (see read_only.rs).
+#[component]
+fn ReadOnlyToggle() -> impl IntoView {
+    let app = app();
+    let on = app.read_only;
+    view! {
+        <button class="btn compact read-only-toggle" class:on=move || on.get()
+            title=move || if on.get() {
+                "View only: nothing on the page can be changed in this browser tab. Click to allow changes."
+            } else {
+                "Changes allowed. Click to switch this browser tab to view only."
+            }
+            on:click=move |_| on.update(|v| *v = !*v)>
+            {move || view! { <Icon icon=if on.get() { I::Lock } else { I::Edit } size=18/> }}
+            <span class="wide-only">{move || if on.get() { "View only" } else { "Edit" }}</span>
+        </button>
+    }
+}
+
+/// Mutes every channel of every DSP at once; releasing (after a confirmation)
+/// opens only the channels that were open before. Any client can do both.
+#[component]
+fn MuteAllButton() -> impl IntoView {
+    let app = app();
+    let on = app.mute_all;
+    let confirm = RwSignal::new(false);
+    view! {
+        <button class="btn compact mute-all" class:on=move || on.get()
+            title=move || if on.get() {
+                "All DSPs are muted. Click to release: only the channels that were open before are unmuted."
+            } else {
+                "Mute every channel of every DSP"
+            }
+            on:click=move |_| if on.get_untracked() { confirm.set(true) } else { app.set_mute_all(true) }>
+            <Icon icon=I::VolumeOff size=18/>
+            <span>{move || if on.get() { "All muted" } else { "Mute all" }}</span>
+        </button>
+        <Show when=move || confirm.get()>
+            <Modal title="Release mute all?" on_close=Callback::new(move |_| confirm.set(false)) actions=view! {
+                <button class="btn text" on:click=move |_| confirm.set(false)>"Cancel"</button>
+                <button class="btn filled" on:click=move |_| {
+                    confirm.set(false);
+                    app.set_mute_all(false);
+                }>"Release"</button>
+            }.into_any()>
+                <div class="note-text">
+                    "The channels that were open before mute all are unmuted again; channels that were muted stay muted. \
+                     A DSP that is offline now is unmuted when it connects again."
+                </div>
+            </Modal>
+        </Show>
     }
 }
 

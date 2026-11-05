@@ -11,8 +11,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dsp_core::api::msg;
+use dsp_core::api::{TEST_LEVEL_MAX_DB, TEST_LEVEL_MIN_DB, TEST_RUNNING, msg};
+use dsp_core::limiter_calc::LimiterSetup;
 use dsp_core::ops::{self, Op};
+use dsp_core::panel::{LightSettings, PanelData};
 use dsp_core::protocol as p;
 use dsp_core::{
     CompressorState, DeviceModel, DeviceState, DspInfo, DspStatus, FilterState, GateState, LimiterState, LogEntry, ServerPresetInfo,
@@ -75,8 +77,39 @@ pub struct App {
     /// Server presets open in the offline editor, as "preset:<id>".
     pub editors: RwSignal<Vec<String>>,
     pub toasts: RwSignal<Vec<Toast>>,
+    /// Mute all is on (for every DSP, switched by any client).
+    pub mute_all: RwSignal<bool>,
+    /// Limiter calculator, link group names, limit light (kept on the server).
+    pub panel: RwSignal<PanelData>,
+    /// Result of the last network search (None while none was answered).
+    pub scan: RwSignal<Option<ScanResult>>,
+    /// This browser tab only looks (no changes); see `read_only`.
+    pub read_only: RwSignal<bool>,
     devices: StoredValue<HashMap<String, Device>>,
     next_toast: StoredValue<u64>,
+}
+
+/// One device found by the network search.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct FoundDsp {
+    pub host: String,
+    pub port: i64,
+    #[serde(default)]
+    pub info: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Name of the configured DSP at this address.
+    #[serde(default)]
+    pub known: Option<String>,
+    /// The panel is connected to it (it was not probed).
+    #[serde(default)]
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanResult {
+    pub found: Vec<FoundDsp>,
+    pub networks: Vec<String>,
 }
 
 pub fn app() -> App {
@@ -96,6 +129,10 @@ impl App {
             presets: RwSignal::new(Vec::new()),
             editors: RwSignal::new(Vec::new()),
             toasts: RwSignal::new(Vec::new()),
+            mute_all: RwSignal::new(false),
+            panel: RwSignal::new(PanelData::default()),
+            scan: RwSignal::new(None),
+            read_only: RwSignal::new(crate::read_only::starts_read_only()),
             devices: StoredValue::new(HashMap::new()),
             next_toast: StoredValue::new(0),
         };
@@ -109,9 +146,14 @@ impl App {
     }
 
     pub fn toast(&self, text: impl Into<String>, error: bool) {
+        let text = text.into();
+        // A refused fader drag would repeat the same message on every move.
+        if self.toasts.with_untracked(|t| t.iter().any(|x| x.text == text)) {
+            return;
+        }
         let id = self.next_toast.get_value() + 1;
         self.next_toast.set_value(id);
-        self.toasts.update(|t| t.push(Toast { id, text: text.into(), error }));
+        self.toasts.update(|t| t.push(Toast { id, text, error }));
         let toasts = self.toasts;
         set_timeout(move || toasts.update(|t| t.retain(|x| x.id != id)), Duration::from_secs(5));
     }
@@ -164,6 +206,53 @@ impl App {
 
     pub fn remove_dsp(&self, id: &str) {
         send(json!({"t": msg::REMOVE_DSP, "id": id}));
+    }
+
+    /// Mute every channel of every DSP, or release (the server unmutes only
+    /// what was open before).
+    pub fn set_mute_all(&self, on: bool) {
+        self.mute_all.set(on);
+        send(json!({"t": msg::MUTE_ALL, "on": on}));
+    }
+
+    // ─── Panel data, several DSPs ───
+
+    /// Search the LAN for DSPs; [networks] empty: the server's own network
+    /// and those of the configured DSPs.
+    pub fn scan_network(&self, networks: &[String]) {
+        self.scan.set(None);
+        let mut message = json!({"t": msg::SCAN});
+        if !networks.is_empty() {
+            message["networks"] = json!(networks);
+        }
+        send(message);
+    }
+
+    pub fn set_limiter_setup(&self, setup: LimiterSetup) {
+        self.panel.update(|p| p.limiter = setup.clone());
+        send(json!({"t": msg::LIMITER_SETUP, "setup": setup}));
+    }
+
+    /// Name a link group of [dsp] ("" removes the name).
+    pub fn set_link_name(&self, dsp: &str, members: &[String], name: &str) {
+        send(json!({"t": msg::LINK_NAME, "dsp": dsp, "members": members, "name": name}));
+    }
+
+    pub fn set_light_settings(&self, settings: LightSettings) {
+        self.panel.update(|p| p.light = settings.clone());
+        send(json!({"t": msg::LIGHT_SETTINGS, "settings": settings}));
+    }
+
+    /// Copy [parts] (api::COPY_PARTS) of [from] on [dsp] to [targets] (DSP id,
+    /// channel), also on other DSPs.
+    pub fn copy_to(&self, dsp: &str, from: &str, parts: &[String], targets: &[(String, String)]) {
+        let targets: Vec<Value> = targets.iter().map(|(d, c)| json!({"dsp": d, "ch": c})).collect();
+        send(json!({"t": msg::COPY_TO, "dsp": dsp, "from": from, "parts": parts, "targets": targets}));
+    }
+
+    /// Back to the values before the last preset load on [dsp].
+    pub fn undo_preset_load(&self, dsp: &str) {
+        send(json!({"t": msg::PRESET_UNDO, "dsp": dsp}));
     }
 
     // ─── Server presets ───
@@ -267,6 +356,10 @@ impl App {
                     self.upsert(info);
                 }
                 self.dsps.set(ids);
+                self.mute_all.set(message.get("muteAll") == Some(&Value::Bool(true)));
+                if let Some(panel) = message.get("panel").and_then(|p| serde_json::from_value(p.clone()).ok()) {
+                    self.panel.set(panel);
+                }
                 self.loaded.set(true);
                 // After a reconnect, subscribe again to the DSP on screen.
                 let selected = self.selected.get_untracked();
@@ -335,17 +428,47 @@ impl App {
                     log.drain(..excess);
                 });
             }
+            msg::MUTE_ALL => {
+                let on = message.get("on") == Some(&Value::Bool(true));
+                if self.mute_all.get_untracked() != on {
+                    self.mute_all.set(on);
+                }
+            }
             msg::ERROR => {
                 let text = message.get("message").and_then(Value::as_str).unwrap_or("Error");
                 self.toast(text, true);
+            }
+            msg::NOTICE => {
+                let text = message.get("message").and_then(Value::as_str).unwrap_or_default();
+                let name = device.map(|d| d.info.with_untracked(|i| i.name.clone())).unwrap_or_default();
+                let text = if name.is_empty() { text.to_string() } else { format!("{name}: {text}") };
+                self.toast(text, message.get("error") == Some(&Value::Bool(true)));
+            }
+            msg::PANEL => {
+                if let Some(panel) = message.get("data").and_then(|p| serde_json::from_value::<PanelData>(p.clone()).ok())
+                    && self.panel.with_untracked(|p| *p != panel)
+                {
+                    self.panel.set(panel);
+                }
+            }
+            msg::SCAN_RESULT => {
+                let found: Vec<FoundDsp> =
+                    message.get("found").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+                let networks: Vec<String> =
+                    message.get("networks").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default();
+                self.scan.set(Some(ScanResult { found, networks }));
             }
             _ => {}
         }
     }
 
-    fn upsert(&self, info: DspInfo) {
+    fn upsert(&self, mut info: DspInfo) {
         match self.device(&info.id) {
             Some(d) => {
+                // Keep the test level the user is dragging.
+                if info.test_level.is_some() && d.pending_test_level.get_value().is_some() {
+                    info.test_level = d.info.with_untracked(|i| i.test_level);
+                }
                 if d.info.with_untracked(|i| *i != info) {
                     d.info.set(info);
                 }
@@ -390,6 +513,8 @@ pub struct Device {
     pub meters: StoredValue<MeterBank, LocalStorage>,
     outgoing: StoredValue<Vec<(String, Op)>>,
     flush_scheduled: StoredValue<bool>,
+    /// Test level waiting to be sent (coalesced like the ops).
+    pending_test_level: StoredValue<Option<f64>>,
 }
 
 impl Device {
@@ -407,6 +532,7 @@ impl Device {
             meters: StoredValue::new_local(MeterBank::new(&model)),
             outgoing: StoredValue::new(Vec::new()),
             flush_scheduled: StoredValue::new(false),
+            pending_test_level: StoredValue::new(None),
         }
     }
 
@@ -433,6 +559,12 @@ impl Device {
         self.offline || self.info.with(|i| i.status == DspStatus::Ready)
     }
 
+    /// The DSP test generator runs (only mutes and the test controls are
+    /// accepted meanwhile).
+    pub fn test_running(&self) -> bool {
+        !self.offline && self.info.with_untracked(|i| i.test_level.is_some())
+    }
+
     // ─── Changes ───
 
     /// Apply an op locally and queue it for the server. Ops for the same
@@ -443,6 +575,10 @@ impl Device {
         }
         let model = self.model_untracked();
         if ops::validate(&op.to_json(), &model).is_some() {
+            return;
+        }
+        if self.test_running() && !ops::allowed_during_test(&op) {
+            app().toast(TEST_RUNNING, true);
             return;
         }
         // Linked channels follow locally right away (by the original editor's
@@ -477,9 +613,75 @@ impl Device {
         self.flush();
     }
 
+    /// Set a gain within the channel's max level, like the server does.
     pub fn set_gain(&self, channel: &str, db: f64) {
-        let db = p::quantize_gain(db.clamp(-60.0, 12.0));
+        let mut db = p::quantize_gain(db.clamp(-60.0, 12.0));
+        if let Some(limit) = self.gain_limit(channel) {
+            db = db.min(limit);
+        }
         self.change(&format!("gain:{channel}"), Op::gain(channel, db));
+    }
+
+    /// Set a gain above the channel's max level (confirmed by the user): sent
+    /// right away with the force flag.
+    pub fn set_gain_forced(&self, channel: &str, db: f64) {
+        if !self.is_ready() || self.test_running() {
+            return;
+        }
+        let op = Op::gain(channel, p::quantize_gain(db.clamp(-60.0, 12.0)));
+        if ops::validate(&op.to_json(), &self.model_untracked()).is_some() {
+            return;
+        }
+        let key = format!("gain:{channel}");
+        self.outgoing.update_value(|out| out.retain(|(k, _)| *k != key));
+        self.state.update(|s| {
+            for expanded in ops::expand_linked(s, &op) {
+                ops::apply(s, &expanded);
+            }
+        });
+        send(json!({"t": msg::OP, "dsp": self.id(), "op": op.to_json(), "force": true}));
+    }
+
+    /// Max level of [channel] (shared by its link group), if it has one.
+    pub fn gain_cap(&self, channel: &str) -> Option<f64> {
+        self.info.with(|i| self.state.with(|s| ops::group_cap(s, &i.gain_caps, channel)))
+    }
+
+    /// Highest gain the panel sets for [channel] without asking: max(cap,
+    /// current gain), or `None` without a cap.
+    pub fn gain_limit(&self, channel: &str) -> Option<f64> {
+        let cap = self.info.with_untracked(|i| self.state.with_untracked(|s| ops::group_cap(s, &i.gain_caps, channel)))?;
+        let current = self.state.with_untracked(|s| s.gains.get(channel).copied().unwrap_or(0.0));
+        Some(cap.max(current))
+    }
+
+    /// Change the max level of [channel] and its link group (`None` removes
+    /// it); stored on the server.
+    pub fn set_gain_cap(&self, channel: &str, db: Option<f64>) {
+        send(json!({"t": msg::GAIN_CAP, "dsp": self.id(), "ch": channel, "db": db}));
+    }
+
+    /// Level of all outputs while the DSP test generator runs (sent at most
+    /// every 30 ms).
+    pub fn set_test_level(&self, db: f64) {
+        let db = p::quantize_gain(db.clamp(TEST_LEVEL_MIN_DB, TEST_LEVEL_MAX_DB));
+        if !self.test_running() || !self.is_ready() {
+            return;
+        }
+        self.info.update(|i| i.test_level = Some(db));
+        let scheduled = self.pending_test_level.get_value().is_some();
+        self.pending_test_level.set_value(Some(db));
+        if !scheduled {
+            let device = *self;
+            set_timeout(
+                move || {
+                    if let Some(db) = device.pending_test_level.try_update_value(Option::take).flatten() {
+                        send(json!({"t": msg::TEST_LEVEL, "dsp": device.id(), "db": db}));
+                    }
+                },
+                Duration::from_millis(30),
+            );
+        }
     }
 
     pub fn toggle_mute(&self, channel: &str) {

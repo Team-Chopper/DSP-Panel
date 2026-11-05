@@ -18,6 +18,8 @@
 //! linked channels (assumed, like the original editor does). The state of the
 //! other members follows the original editor's rule, see [edit_group_of].
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value, json};
 
 use crate::model::{DeviceModel, GEQ_BAND_COUNT};
@@ -816,8 +818,10 @@ pub struct LinkChange {
     pub mask: i64,
     /// Newly added slaves (they get the master's settings first).
     pub added: Vec<String>,
-    /// Released channels whose mask still lists other channels (written by
-    /// older panel versions; reset to their own bit).
+    /// Released channels whose mask is not just their own bit (one listing
+    /// other channels, written by older panel versions, or 0 as other control
+    /// software leaves on slaves, where the DSP then ignores changes); reset
+    /// to their own bit.
     pub reset: Vec<String>,
 }
 
@@ -844,7 +848,7 @@ pub fn link_change(state: &DeviceState, master: &str, slaves: &[String]) -> Json
         added: slaves.iter().filter(|s| !previous.contains(s)).cloned().collect(),
         reset: previous
             .iter()
-            .filter(|s| !slaves.contains(s) && state.link_mask(s) & !(model.link_bit(s) as i64) != 0)
+            .filter(|s| !slaves.contains(s) && state.link_mask(s) != model.link_bit(s) as i64)
             .cloned()
             .collect(),
     })
@@ -975,4 +979,108 @@ pub fn full_state(state: &DeviceState) -> Vec<Op> {
     }
     ops.push(Op::delay_unit(state.delay_unit));
     ops
+}
+
+// ─── Live safety ───
+
+/// Ops that stay allowed while the DSP test generator runs: mutes, the
+/// generator itself and raw link masks (Auto-EQ lifts a link for a
+/// measurement). Nothing that changes a level.
+pub fn allowed_during_test(op: &Op) -> bool {
+    matches!(op, Op::Mute { .. } | Op::TestTone { .. } | Op::Link { .. })
+}
+
+/// Max level of [ch] from the per-channel [caps] (kept by the server, unknown
+/// to the DSP): the lowest cap of the channels that change together with it,
+/// so linked channels share the cap of their group.
+pub fn group_cap(state: &DeviceState, caps: &BTreeMap<String, f64>, ch: &str) -> Option<f64> {
+    edit_group_of(state, ch).iter().filter_map(|c| caps.get(c).copied()).reduce(f64::min)
+}
+
+/// [db] limited by [cap] to max(cap, current): a channel that is already above
+/// its cap can only be turned down.
+pub fn capped_gain(db: f64, current: f64, cap: Option<f64>) -> f64 {
+    cap.map_or(db, |cap| db.min(cap.max(current)))
+}
+
+// ─── Copy between DSPs ───
+
+/// Ops that copy [parts] (api::COPY_PARTS) of channel [from] of [src] to
+/// channel [to] of a device in state [dst] – the same kind of channel, maybe
+/// on another DSP or model:
+/// - level: gain, phase, delay
+/// - filters: HPF and LPF
+/// - eq: the PEQ bands both channels have and the EQ bypass; inputs also the
+///   GEQ and its bypass
+/// - dynamics: gate (inputs), compressor and limiter (outputs)
+/// - routing (outputs): matrix routing and crossing gains of the inputs both
+///   models have
+///
+/// Values the target already has are left out. Unlike the device copy (0x2A)
+/// nothing else is touched (no mute, name or link).
+pub fn copy_parts(src: &DeviceState, from: &str, dst: &DeviceState, to: &str, parts: &[String]) -> JsonResult<Vec<Op>> {
+    let (sm, dm) = (src.model, dst.model);
+    if !sm.has_channel(from) || !dm.has_channel(to) {
+        return Err("Unknown channel".into());
+    }
+    if sm.is_input(from) != dm.is_input(to) {
+        return Err("Settings can only be copied between two inputs or two outputs".into());
+    }
+    if let Some(p) = parts.iter().find(|p| !crate::api::COPY_PARTS.contains(&p.as_str())) {
+        return Err(format!("Unknown part {p}"));
+    }
+    let has = |p: &str| parts.iter().any(|x| x == p);
+    let input = sm.is_input(from);
+    let mut list = Vec::new();
+    if has("level") {
+        list.push(Op::gain(to, src.gains.get(from).copied().unwrap_or(0.0)));
+        list.push(Op::phase(to, src.phase.get(from).copied().unwrap_or(false)));
+        list.push(Op::delay(to, src.delays.get(from).copied().unwrap_or(0)));
+    }
+    if has("filters") {
+        list.push(Op::hi_pass(to, src.hi_pass.get(from).cloned().unwrap_or_default()));
+        list.push(Op::lo_pass(to, src.lo_pass.get(from).cloned().unwrap_or(FilterState::new(300, 0))));
+    }
+    if has("eq") {
+        let count = sm.peq_band_count(from).min(dm.peq_band_count(to));
+        for (b, band) in src.peq_bands.get(from).into_iter().flatten().take(count).enumerate() {
+            list.push(Op::peq_band(to, b, band.clone()));
+        }
+        list.push(Op::eq_bypass(to, src.eq_bypass.get(from).copied().unwrap_or(false)));
+        if input {
+            for (b, db) in src.geq_bands.get(from).into_iter().flatten().enumerate().take(GEQ_BAND_COUNT) {
+                list.push(Op::geq_band(to, b, *db));
+            }
+            list.push(Op::geq_bypass(to, src.geq_bypass.get(from).copied().unwrap_or(false)));
+        }
+    }
+    if has("dynamics") {
+        if input {
+            list.push(Op::gate(to, clamp_gate(&src.gates.get(from).cloned().unwrap_or_default())));
+        } else {
+            list.push(Op::compressor(to, clamp_compressor(&src.compressors.get(from).cloned().unwrap_or_default())));
+            list.push(Op::limiter(to, clamp_limiter(&src.limiters.get(from).cloned().unwrap_or_default())));
+        }
+    }
+    if has("routing") && !input {
+        let shared: Vec<&str> = sm.inputs.iter().copied().filter(|i| dm.inputs.contains(i)).collect();
+        let mask = src.matrix_routing.get(from).copied().unwrap_or(0);
+        let routed = shared.iter().filter(|i| mask & sm.matrix_bit(i) as i64 != 0).fold(0i64, |m, i| m | dm.matrix_bit(i) as i64);
+        list.push(Op::matrix_route(to, routed));
+        for i in shared {
+            let db = src.matrix_gains.get(&format!("{from}:{i}")).copied().unwrap_or(0.0);
+            list.push(Op::matrix_gain(to, i, db));
+        }
+    }
+    let mut state = dst.clone();
+    Ok(list
+        .into_iter()
+        .filter(|op| {
+            let mut next = state.clone();
+            apply(&mut next, op);
+            let changes = next != state;
+            state = next;
+            changes
+        })
+        .collect())
 }

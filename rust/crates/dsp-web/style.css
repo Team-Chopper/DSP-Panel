@@ -169,6 +169,12 @@ button, input, select { font: inherit; color: inherit; }
   background: rgba(251, 191, 36, .12); flex: none;
 }
 .banner .icon { color: var(--warning); }
+.banner.test-banner { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.banner.test-banner .icon { color: var(--danger); }
+
+/* Mute all (app bar) */
+.btn.mute-all { background: transparent; border-color: color-mix(in srgb, var(--danger) 55%, transparent); color: var(--danger); }
+.btn.mute-all.on { background: var(--danger); border-color: var(--danger); color: var(--bg-deep); font-weight: 700; }
 
 .dsp-content { flex: 1; position: relative; min-height: 0; }
 .dsp-content > .page { position: absolute; inset: 0; overflow: auto; }
@@ -280,6 +286,13 @@ button, input, select { font: inherit; color: inherit; }
 .fader.vertical .fader-cap::after { left: 2px; right: 2px; top: 50%; height: 2px; margin-top: -1px; }
 .fader.horizontal .fader-cap::after { top: 2px; bottom: 2px; left: 50%; width: 2px; margin-left: -1px; }
 .fader:focus .fader-cap { outline: 1.5px solid color-mix(in srgb, var(--fc) 60%, transparent); outline-offset: 3px; }
+/* Max level: the range above it is hatched. */
+.fader-limit {
+  position: absolute; pointer-events: none; border-radius: 2px;
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--danger) 38%, transparent) 0 2px, transparent 2px 6px);
+}
+.fader.vertical .fader-limit { left: 50%; width: calc(var(--capw) + 10px); transform: translateX(-50%); border-bottom: 1.5px solid var(--danger); }
+.fader.horizontal .fader-limit { top: 50%; height: calc(var(--capw) + 10px); transform: translateY(-50%); border-left: 1.5px solid var(--danger); }
 
 /* Meter: gradient fixed to the meter, the lit layer is clipped. */
 .meter { position: absolute; right: 0; width: 22px; contain: strict; background: #000; border-radius: 2px; outline: 1px solid #000; pointer-events: none; }
@@ -323,6 +336,7 @@ button, input, select { font: inherit; color: inherit; }
 .strip-name .link { color: var(--gc); }
 .strip .fader-box { flex: 1; min-height: 0; }
 .strip .toggles { display: flex; gap: 4px; }
+.gain-value { display: flex; }
 
 /* EQ overview */
 .eq-overview { flex: 1; position: relative; min-height: 0; cursor: pointer; }
@@ -362,6 +376,7 @@ button, input, select { font: inherit; color: inherit; }
 
 /* ─── Shared controls ─── */
 .wrap-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.test-level-fader { position: relative; width: 220px; height: 42px; flex: none; }
 .row.tight { gap: 6px; }
 .small { font-size: 12px; }
 .note-text { font-size: 13px; line-height: 1.5; }
@@ -388,6 +403,26 @@ button, input, select { font: inherit; color: inherit; }
 .eq-page { min-height: 100%; display: flex; flex-direction: column; }
 .eq-page > .channel-selector { height: 46px; }
 .auto-eq-wrap { padding: 0 12px 10px; flex: none; }
+.eq-graph-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 0 12px 8px; flex: none; }
+.eq-graph-note { flex: 1; min-width: 160px; font-size: 11px; color: var(--muted); }
+.file-button { cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+.file-button input { display: none; }
+.filter-file-notes { margin: 0; padding-left: 18px; font-size: 12px; color: var(--warning); }
+
+/* ─── Limiter calculator ─── */
+.calc-body { display: flex; flex-direction: column; gap: 8px; }
+.calc-input {
+  width: 64px; height: 30px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg-deep); font-size: 12px;
+}
+.calc-result { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+.calc-watts { font-size: 22px; font-weight: 700; color: var(--output); }
+.calc-note { font-size: 12px; }
+.calc-note.warn { color: var(--warning); }
+.calc-help { font-size: 11px; color: var(--muted); }
+.amp-row { display: grid; grid-template-columns: minmax(120px, 1fr) 64px 64px 64px 120px 64px 32px; gap: 6px; align-items: center; margin-bottom: 4px; }
+.amp-row .amp-name { width: auto; }
+.amp-head { margin-top: 8px; }
 .peq-graph-box { flex: 1; min-height: 232px; padding: 0 12px 12px; display: flex; }
 .peq-graph { flex: 1; position: relative; min-width: 0; touch-action: none; user-select: none; }
 .peq-graph svg { position: absolute; inset: 0; display: block; overflow: hidden; }

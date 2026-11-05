@@ -6,6 +6,7 @@ pub mod eq;
 pub mod gain;
 pub mod generators;
 pub mod geq;
+pub mod limiter_calc;
 pub mod matrix;
 pub mod presets;
 pub mod rta;

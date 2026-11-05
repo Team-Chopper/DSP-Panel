@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use dsp_core::eq_math::ChannelEq;
 use dsp_core::ops;
+use dsp_core::protocol as p;
 use leptos::html;
 use leptos::prelude::*;
 
@@ -115,18 +116,31 @@ pub fn ChannelStrip(channel: String, color: &'static str, #[prop(default = true)
             })
         })
     });
+    let ch = channel.clone();
+    let cap = Memo::new(move |_| device.gain_cap(&ch));
     let is_output = device.model_untracked().is_output(&channel);
 
     let ch = channel.clone();
     let set_gain = Callback::new(move |v: f64| device.set_gain(&ch, v));
+    // A typed value above the max level needs a second confirmation.
     let ch = channel.clone();
     let submit = Callback::new(move |input: String| match parse_number(&input) {
         Some(v) => {
-            device.set_gain(&ch, v);
+            let v = p::quantize_gain(v.clamp(-60.0, 12.0));
+            match device.gain_limit(&ch) {
+                Some(limit) if v > limit && !device.test_running() => {
+                    ui.dialog.set(Some(Dialog::ForceGain(ch.clone(), v)))
+                }
+                _ => device.set_gain(&ch, v),
+            }
             true
         }
         None => false,
     });
+    let gain_title = move || match cap.get() {
+        Some(cap) => format!("Gain in dB (-60 … +12), max level {} dB", format_db_value(cap)),
+        None => "Gain in dB (-60 … +12)".to_string(),
+    };
     let ch = channel.clone();
     let toggle_mute = Callback::new(move |_| device.toggle_mute(&ch));
     let ch = channel.clone();
@@ -154,9 +168,12 @@ pub fn ChannelStrip(channel: String, color: &'static str, #[prop(default = true)
                     color=color
                     meter={MeterSpec { device, channel: channel.clone(), clip: true, limit: is_output }}
                     step=Signal::derive(move || if gain.get() < -20.0 { 0.5 } else { 0.1 })
+                    limit=cap
                 />
             </div>
-            <ValueField text=Signal::derive(move || format_db_value(gain.get())) on_submit=submit title="Gain in dB (-60 … +12)"/>
+            <div class="gain-value" title=gain_title>
+                <ValueField text=Signal::derive(move || format_db_value(gain.get())) on_submit=submit/>
+            </div>
             <div class="toggles">
                 <ToggleButton label="M" active=muted active_color="var(--danger)"
                     title=Signal::derive(move || if muted.get() { "Unmute" } else { "Mute" }.to_string())

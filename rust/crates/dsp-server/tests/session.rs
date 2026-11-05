@@ -586,20 +586,56 @@ fn heartbeat_instead_of_meters_while_nobody_watches_and_0x11_when_stopping() {
 }
 
 #[test]
-fn a_server_preset_is_loaded_like_a_preset_file() {
+fn a_server_preset_sends_what_differs_reads_back_and_can_be_undone() {
     run(async {
         let fake = fake(DeviceModel::DSP408).await;
         let s = session(&fake, 300);
         s.start();
         wait_for(&s, || s.status() == DspStatus::Ready).await;
+        let before = s.state();
+        let mut target = before.clone();
+        ops::apply(&mut target, &Op::gain("Out 2", -7.5));
+        ops::apply(&mut target, &Op::delay("In B", 480));
         fake.device().received.clear();
-        assert_eq!(s.apply_full_state(&DeviceState::default(), "Hall"), None);
+        assert_eq!(s.apply_full_state(&target, "Hall"), None);
+        wait_for_within(&s, Duration::from_secs(30), || s.status() == DspStatus::Ready).await;
+        let sent = received_except_meters(&fake);
+        assert_eq!(sent[0], p::build_store_preset_name_command("Hall"));
+        let values: Vec<u8> = sent.iter().skip(1).take_while(|f| f[5] != 0x12).map(|f| f[5]).collect();
+        assert_eq!(values, [0x38, 0x34], "only the delay and the gain");
+        let chunks = sent.iter().filter(|f| f[5] == 0x27).count();
+        assert_eq!(chunks, ConfigDump::new(DeviceModel::DSP408).chunk_count(), "read back");
+        assert_eq!(s.state().gains["Out 2"], -7.5);
+        assert_eq!(s.state().current_preset, "Hall");
+        assert_eq!(s.info().undo, ["Before \"Hall\""]);
+
+        assert_eq!(s.undo_load(), None);
+        wait_for_within(&s, Duration::from_secs(30), || s.status() == DspStatus::Ready).await;
+        assert_eq!(s.state().gains["Out 2"], before.gains["Out 2"]);
+        assert_eq!(s.state().delays["In B"], before.delays["In B"]);
+        assert!(s.info().undo.is_empty());
+        assert_eq!(s.undo_load().as_deref(), Some("Nothing to undo"));
+        s.dispose().await;
+    });
+}
+
+#[test]
+fn a_server_preset_with_other_links_is_loaded_like_a_preset_file() {
+    run(async {
+        let fake = fake(DeviceModel::DSP408).await;
+        let s = session(&fake, 300);
+        s.start();
+        wait_for(&s, || s.status() == DspStatus::Ready).await;
+        let mut target = DeviceState::default();
+        ops::apply(&mut target, &Op::link("Out 1", 0x03));
+        fake.device().received.clear();
+        assert_eq!(s.apply_full_state(&target, "Hall"), None);
         wait_for_within(&s, Duration::from_secs(30), || s.status() == DspStatus::Ready).await;
         let sent = received_except_meters(&fake);
         assert_eq!(sent[0], p::build_store_preset_name_command("Hall"));
         assert_eq!(sent[1][5], 0x3D, "In A name first");
-        assert_eq!(sent.last().cloned().unwrap(), p::build_heartbeat_command());
         assert_eq!(sent.iter().filter(|f| f[5] == 0x34).count(), 12, "gain once per channel");
+        assert_eq!(sent.last().unwrap()[5], 0x27, "read back at the end");
         s.dispose().await;
     });
 }

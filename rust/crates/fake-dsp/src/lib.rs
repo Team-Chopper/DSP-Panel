@@ -1,4 +1,4 @@
-//! Fake DSP 206 / 408.
+//! Fake DSP 204 / 206 / 408.
 //!
 //! A TCP server that answers the DSP protocol well enough to develop and test
 //! the panel without hardware. It keeps a device state, applies every set

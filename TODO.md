@@ -1,6 +1,7 @@
 # TODO – open protocol questions
 
-The panel supports the DSP 206 and DSP 408. Since version 0.9.0 it follows the
+The panel supports the DSP 206 and DSP 408, and since 1.0.0-alpha.3 (Rust only)
+the DSP 204. Since version 0.9.0 it follows the
 original editor in everything the DSP sees, as far as static analysis of the
 editor shows it: see [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md) (how the
 original software works, section 15 for the status in this project) and
@@ -36,7 +37,15 @@ now and how to capture what is missing.
       (current preset): does the 206 answer them like the 408? The panel
       tolerates missing answers.
 
-## Both models
+## DSP 204
+
+- [ ] **Everything.** No editor of the 204 was analysed; the panel treats it
+      like the 206 with four outputs (channel bytes Out 1–4 = 0x02–0x05,
+      dump 724 bytes in 15 chunks, meters in slots 0–1 and 4–7), which matches
+      the measurements of the other project. *Check:* connect, compare every
+      page with the device, then one link and one preset store/recall.
+
+## All models
 
 - [ ] **Linked channels (0x3B).** Like the original editor, the panel sends a
       change only for the edited channel and expects the DSP to apply it to
@@ -44,6 +53,21 @@ now and how to capture what is missing.
       the panel, change the gain of **Out 1**, then reconnect and check that
       **Out 2** has the same gain on the device. Also note the link bytes of
       both channels in the dump (does the slave keep its own bit or 0?).
+      *Seen on a DSP 204 (V0104P) by another project:* the DSP applies a
+      change on any member to the whole group (gain, delay, polarity, HP/LP,
+      PEQ, GEQ, gate, compressor, limiter, mute), not names, routing and
+      crossing gains; forming a group copies the first channel's settings.
+      Slaves there had link word 0, and a channel with 0 that is no longer in
+      a group ignores changes. Since 1.0.0-alpha.3 the panel therefore resets
+      every released slave whose word is not just its own bit.
+- [ ] **Link mask width (0x3B):** the editor sends one byte, the other project
+      a u16 (little endian), which works on the 204. *Check:* after linking in
+      the panel, the link word of the master in the dump must be exactly its
+      own bit plus the slaves (no stray high byte).
+- [ ] **PEQ type order:** the panel uses the editor's language table
+      (3/4 = LP −6/−12, 5/6 = HP −6/−12); the other project has HP and LP the
+      other way round. *Check with the RTA:* pink noise from In A to Out 1,
+      PEQ band 1 of Out 1 at type 3, 1 kHz: the highs must drop, not the lows.
 - [ ] **Current preset number (0x14):** 0-based or 1-based? A capture showed 20
       while U20 was active (1-based); the panel reads it that way.
 - [ ] **Limiter knee:** the editor hides it; does the device use the value?
@@ -51,7 +75,17 @@ now and how to capture what is missing.
       with knee 0.
 - [ ] **GEQ bypass flag 0 (0x49)** is assumed to mean "active" like 0x3C.
 - [ ] **Meter calibration:** feed a 1 kHz sine at −40, −20, −10 and 0 dBFS into
-      **In A** to confirm that 1.0 really is full scale.
+      **In A** to confirm that 1.0 really is full scale. *Seen on a DSP 204 by
+      the other project:* the output meter is after the output gain (−6 dB
+      gain moved it by −6.3 dB) and before the mute; when the limiter starts,
+      its threshold is about 26 dB (25.1 … 27.7 in five rounds) above the
+      loudest meter reading. That fits the editor's output LEDs, which sit
+      24 dB lower than the meter (PROTOCOL-RE.md, Meters). The limiter
+      calculator uses this as its default reference.
+- [x] **Limiter bits of the status word** (bit 8 + n = limiter of output n):
+      confirmed by the other project on a DSP 204 (`00 03` while Out 1 and 2
+      limit). The bit can stay on for up to 4 s, in two of six cases even
+      after the threshold was raised to +20 dB, so a limit LED may hang on.
 - [ ] **Test tone (0x39):** the commands are those of the editor but have not
       been tested on a device. *Capture:* switch the generator through pink,
       white and sine and note which inputs/outputs carry the signal.
@@ -72,6 +106,9 @@ now and how to capture what is missing.
   [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md), [PROTOCOL-RE.md](PROTOCOL-RE.md).
 - FlexiFlizz/t.racks-DSP-control (GPL-3.0), DSP 206 protocol verified on
   hardware: https://github.com/FlexiFlizz/t.racks-DSP-control
+- "The other project": an independent open-source control app for the DSP
+  204/408 (MIT, November 2026). Its protocol notes include measurements on a
+  real DSP 204 (firmware V0104P); its DSP 408 and 206 support is untested.
 - Captures of a DSP 408 in this repository: `analyze_pcap.py`
   ("Default Preset" dump), `pcap_error.txt` (full session with the "Test"
   preset), `analyze2.py`–`analyze5.py` ("Forest" preset, partially

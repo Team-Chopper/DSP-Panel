@@ -12,6 +12,7 @@ mod local_settings;
 mod meters;
 mod net;
 mod pages;
+mod read_only;
 mod rta;
 mod store;
 mod taper;

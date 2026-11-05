@@ -9,6 +9,10 @@
 //! tan(π·f/fs) / tan(π·fc/fs). The HPF/LPF crossover slopes are drawn as
 //! Butterworth (−3 dB at the cut-off), Linkwitz-Riley (−6 dB) and Bessel
 //! (−3 dB) filters of the slope's order.
+//!
+//! The phase is that of the same prototypes (all-pass bands included, Allpass
+//! 1 = (1 − s)/(1 + s), Allpass 2 = (s² − s/Q + 1)/(s² + s/Q + 1)); the GEQ
+//! is left out, its phase is not known.
 
 use std::f64::consts::{LN_10, PI};
 use std::sync::OnceLock;
@@ -44,6 +48,34 @@ fn abs2(c: &[f64], w: f64) -> f64 {
         power *= w;
     }
     re * re + im * im
+}
+
+/// p(jw) as (re, im).
+fn eval(c: &[f64], w: f64) -> (f64, f64) {
+    let (mut re, mut im, mut power) = (0.0, 0.0, 1.0);
+    for (k, coefficient) in c.iter().enumerate() {
+        let term = coefficient * power;
+        match k & 3 {
+            0 => re += term,
+            1 => im += term,
+            2 => re -= term,
+            _ => im -= term,
+        }
+        power *= w;
+    }
+    (re, im)
+}
+
+/// arg p(jw) in degrees.
+fn arg_deg(c: &[f64], w: f64) -> f64 {
+    let (re, im) = eval(c, w);
+    im.atan2(re).to_degrees()
+}
+
+/// Phase in degrees wrapped to −180 … 180.
+pub fn wrap_deg(deg: f64) -> f64 {
+    let d = (deg + 180.0).rem_euclid(360.0) - 180.0;
+    if d == -180.0 { 180.0 } else { d }
 }
 
 /// |num(jw) / den(jw)| in dB.
@@ -128,6 +160,61 @@ pub fn filter_response_db(freq: f64, cutoff_hz: f64, slope: i64, is_high_pass: b
     }
 }
 
+/// Butterworth denominator of [order] (ascending powers): the product of
+/// (s − p_k) over the left-half-plane poles p_k = e^{jπ(2k + n − 1)/2n}.
+fn butterworth(order: usize) -> &'static [f64] {
+    static CACHE: OnceLock<Vec<Vec<f64>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| (0..=8).map(compute_butterworth).collect());
+    &cache[order.min(8)]
+}
+
+fn compute_butterworth(order: usize) -> Vec<f64> {
+    // Complex coefficients, ascending powers.
+    let mut c: Vec<(f64, f64)> = vec![(1.0, 0.0)];
+    for k in 1..=order {
+        let angle = PI * (2 * k + order - 1) as f64 / (2 * order) as f64;
+        let (pr, pi) = (angle.cos(), angle.sin());
+        // Multiply by (s − p).
+        let mut next = vec![(0.0, 0.0); c.len() + 1];
+        for (i, (re, im)) in c.iter().enumerate() {
+            next[i + 1].0 += re;
+            next[i + 1].1 += im;
+            next[i].0 -= re * pr - im * pi;
+            next[i].1 -= re * pi + im * pr;
+        }
+        c = next;
+    }
+    c.into_iter().map(|(re, _)| re).collect()
+}
+
+/// Phase of the low-pass prototype at w = f/fc in degrees.
+fn crossover_lp_phase(family: &str, order: i64, w: f64) -> f64 {
+    match family {
+        // Two Butterworth filters of half the order.
+        "LK" => -2.0 * arg_deg(butterworth((order / 2).max(1) as usize), w),
+        "BL" => -arg_deg(bessel(order as usize), w),
+        _ => -arg_deg(butterworth(order as usize), w),
+    }
+}
+
+/// HPF/LPF phase in degrees (not wrapped) at [freq] for a crossover slope
+/// index (0 = bypass). A high-pass is the low-pass at fc/f with the opposite
+/// sign.
+pub fn filter_phase_deg(freq: f64, cutoff_hz: f64, slope: i64, is_high_pass: bool) -> f64 {
+    if cutoff_hz <= 0.0 || slope <= 0 || freq <= 0.0 {
+        return 0.0;
+    }
+    let (family, order) = crossover_shape(slope);
+    if order <= 0 {
+        return 0.0;
+    }
+    if is_high_pass {
+        -crossover_lp_phase(family, order, cutoff_hz / freq)
+    } else {
+        crossover_lp_phase(family, order, freq / cutoff_hz)
+    }
+}
+
 // ─── PEQ band ───
 
 /// Frequency of the analog prototype for [freq] when the digital filter is
@@ -179,6 +266,31 @@ pub fn peq_response_db(freq: f64, center: f64, q: f64, gain_db: f64, peq_type: i
         // HP -12 dB: s² / (s² + s/Q + 1)
         6 => biquad_db(0.0, 0.0, 1.0, 1.0, 1.0 / q, 1.0, w),
         // All pass: no magnitude change
+        _ => 0.0,
+    }
+}
+
+/// Phase of one PEQ band in degrees (not wrapped) at [freq].
+pub fn peq_phase_deg(freq: f64, center: f64, q: f64, gain_db: f64, peq_type: i64) -> f64 {
+    if center <= 0.0 {
+        return 0.0;
+    }
+    let q = q.clamp(0.05, 200.0);
+    let w = warped(freq, center);
+    let v = 10f64.powf(gain_db.abs() / 20.0);
+    let ratio = |num: &[f64], den: &[f64]| arg_deg(num, w) - arg_deg(den, w);
+    // A cut is the inverse of the boost: the phase changes sign.
+    let boost_or_cut = |boost: f64| if gain_db >= 0.0 { boost } else { -boost };
+    match peq_type {
+        0 if gain_db.abs() >= 0.01 => boost_or_cut(ratio(&[1.0, v / q, 1.0], &[1.0, 1.0 / q, 1.0])),
+        1 if gain_db.abs() >= 0.01 => boost_or_cut(ratio(&[v, v.sqrt() / q, 1.0], &[1.0, 1.0 / q, 1.0])),
+        2 if gain_db.abs() >= 0.01 => boost_or_cut(ratio(&[1.0, v.sqrt() / q, v], &[1.0, 1.0 / q, 1.0])),
+        3 => ratio(&[1.0], &[1.0, 1.0]),
+        4 => ratio(&[1.0], &[1.0, 1.0 / q, 1.0]),
+        5 => ratio(&[0.0, 1.0], &[1.0, 1.0]),
+        6 => ratio(&[0.0, 0.0, 1.0], &[1.0, 1.0 / q, 1.0]),
+        7 => ratio(&[1.0, -1.0], &[1.0, 1.0]),
+        8 => ratio(&[1.0, -1.0 / q, 1.0], &[1.0, 1.0 / q, 1.0]),
         _ => 0.0,
     }
 }
@@ -324,11 +436,13 @@ pub fn auto_eq_correction(measured_db: &[f64], centers: &[f64], current: &[f64],
 /// response at many frequencies (a curve has ~160–240 points).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChannelEq {
-    /// Audible PEQ bands: (Hz, Q, gain dB, type).
+    /// Audible PEQ bands and active all-passes: (Hz, Q, gain dB, type).
     bands: Vec<(f64, f64, f64, i64)>,
     hp: Option<(f64, i64)>,
     lp: Option<(f64, i64)>,
     geq: Option<Vec<f64>>,
+    /// Polarity inverted (phase only).
+    inverted: bool,
 }
 
 impl ChannelEq {
@@ -342,7 +456,7 @@ impl ChannelEq {
                 .get(channel)
                 .into_iter()
                 .flatten()
-                .filter(|b| peq_band_audible(b))
+                .filter(|b| peq_band_audible(b) || (!b.bypass && b.peq_type >= 7))
                 .map(|b| (p::peq_freq_to_hz(b.freq_raw), p::peq_raw_to_q(b.q_raw), b.gain_db, b.peq_type))
                 .collect()
         };
@@ -355,7 +469,24 @@ impl ChannelEq {
             hp: filter(state.hi_pass.get(channel)),
             lp: filter(state.lo_pass.get(channel)),
             geq: if geq_on { state.geq_bands.get(channel).cloned() } else { None },
+            inverted: state.phase.get(channel).copied().unwrap_or(false),
         }
+    }
+
+    /// Phase in degrees (−180 … 180) at [freq]: PEQ bands (all-passes
+    /// included), HPF/LPF and the polarity; delay and GEQ are left out.
+    pub fn phase_deg(&self, freq: f64) -> f64 {
+        let mut deg = if self.inverted { 180.0 } else { 0.0 };
+        for (hz, q, gain, t) in &self.bands {
+            deg += peq_phase_deg(freq, *hz, *q, *gain, *t);
+        }
+        if let Some((hz, slope)) = self.hp {
+            deg += filter_phase_deg(freq, hz, slope, true);
+        }
+        if let Some((hz, slope)) = self.lp {
+            deg += filter_phase_deg(freq, hz, slope, false);
+        }
+        wrap_deg(deg)
     }
 
     /// Total response in dB at [freq]: PEQ bands (not bypassed), HPF/LPF and,

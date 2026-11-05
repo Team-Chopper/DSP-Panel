@@ -53,6 +53,9 @@ pub fn Fader(
     #[prop(optional, into)]
     step: Option<Signal<f64>>,
     #[prop(default = 30.0)] cap: f64,
+    /// Max level: the range above it is drawn hatched.
+    #[prop(optional, into)]
+    limit: Option<Signal<Option<f64>>>,
 ) -> impl IntoView {
     let travel = NodeRef::<html::Div>::new();
     let dragging = RwSignal::new(false);
@@ -177,6 +180,20 @@ pub fn Fader(
         if vertical { format!("height:{p:.3}%") } else { format!("width:{p:.3}%") }
     };
     let cap_style = move || along(position.get());
+    let limit_view = limit.map(|limit| {
+        let style = move || match limit.get() {
+            Some(v) => {
+                let p = taper.to_position(v);
+                if vertical {
+                    format!("top:0;height:{:.3}%", (1.0 - p) * 100.0)
+                } else {
+                    format!("left:{:.3}%;right:0", p * 100.0)
+                }
+            }
+            None => "display:none".to_string(),
+        };
+        view! { <div class="fader-limit" style=style></div> }
+    });
 
     let meter_view = meter.filter(|_| vertical).map(|m| view! { <FaderMeter spec=m indicators=indicators cap=cap/> });
 
@@ -200,6 +217,7 @@ pub fn Fader(
                 {mark_views}
                 <div class="fader-slot"></div>
                 <div class="fader-fill" style=fill_style></div>
+                {limit_view}
                 <div class="fader-cap" style=cap_style></div>
             </div>
             {meter_view}

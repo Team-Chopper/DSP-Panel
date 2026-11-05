@@ -5,6 +5,8 @@
 //! POST /api/login    {password} → sets the session cookie
 //! POST /api/logout   clears the session cookie
 //! GET  /ws           WebSocket (see hub.rs)
+//! GET  /limit        limit light page, no login, only when switched on (light.rs)
+//! GET  /limit/events {on, ready} as server-sent events
 //! GET  /*            web client (static files)
 //! ```
 
@@ -22,13 +24,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
 use crate::auth::{AuthService, COOKIE_NAME, SESSION_LIFETIME};
 use crate::config::ServerConfig;
 use crate::hub::{HubCommand, MAX_MESSAGE_LENGTH};
+use crate::light::{self, LightSnapshot};
 use crate::log;
 
 /// Interval of the WebSocket ping; a client that does not answer before the
@@ -39,12 +42,19 @@ pub struct AppState {
     pub config: ServerConfig,
     pub auth: Mutex<AuthService>,
     pub hub: mpsc::UnboundedSender<HubCommand>,
+    /// State of the limit light, published by the hub.
+    pub light: watch::Receiver<LightSnapshot>,
     next_client: AtomicU64,
 }
 
 impl AppState {
-    pub fn new(config: ServerConfig, auth: AuthService, hub: mpsc::UnboundedSender<HubCommand>) -> Arc<Self> {
-        Arc::new(AppState { config, auth: Mutex::new(auth), hub, next_client: AtomicU64::new(1) })
+    pub fn new(
+        config: ServerConfig,
+        auth: AuthService,
+        hub: mpsc::UnboundedSender<HubCommand>,
+        light: watch::Receiver<LightSnapshot>,
+    ) -> Arc<Self> {
+        Arc::new(AppState { config, auth: Mutex::new(auth), hub, light, next_client: AtomicU64::new(1) })
     }
 
     fn auth(&self) -> MutexGuard<'_, AuthService> {
@@ -71,8 +81,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/logout", post(logout))
         .fallback_service(static_files(&state.config))
         .layer(CompressionLayer::new());
+    // The limit light stream must not go through the compression layer.
     Router::new()
         .route("/ws", get(web_socket))
+        .route("/limit", get(light::page))
+        .route("/limit/events", get(light::events))
         .merge(api)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)

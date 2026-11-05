@@ -3,9 +3,11 @@
 
 use dsp_core::PeqBand;
 use dsp_core::eq_math::{
-    FitLimits, GEQ_CENTER_FREQUENCIES, auto_eq_correction, filter_response_db, fit_peq_correction, free_peq_bands,
-    peq_response_db,
+    ChannelEq, FitLimits, GEQ_CENTER_FREQUENCIES, auto_eq_correction, filter_phase_deg, filter_response_db,
+    fit_peq_correction, free_peq_bands, peq_phase_deg, peq_response_db, wrap_deg,
 };
+use dsp_core::ops::{self, Op};
+use dsp_core::{DeviceModel, DeviceState, FilterState};
 use dsp_core::protocol as p;
 
 fn slope(name: &str) -> i64 {
@@ -81,6 +83,51 @@ fn crossover_slopes() {
     assert!(close(filter_response_db(4000.0, 1000.0, slope("BW -24"), false), -48.2, 0.3), "24 dB/oct");
     assert!(close(filter_response_db(100.0, 1000.0, slope("BW -12"), false), 0.0, 0.01));
     assert_eq!(filter_response_db(100.0, 1000.0, 0, true), 0.0, "bypass");
+}
+
+#[test]
+fn phase_of_peq_types_and_crossovers() {
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 3), -45.0, 0.01), "LP -6 at cut-off");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 5), 45.0, 0.01), "HP -6 at cut-off");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 0.707, 0.0, 4), -90.0, 0.01), "LP -12");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 0.707, 0.0, 6), 90.0, 0.01), "HP -12");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 7), -90.0, 0.01), "allpass 1 at its centre");
+    assert!(close(wrap_deg(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 8)), 180.0, 0.01), "allpass 2 at its centre");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 2.0, 6.0, 0), 0.0, 1e-9), "peak at its centre");
+    assert!(close(peq_phase_deg(800.0, 1000.0, 2.0, -6.0, 0), -peq_phase_deg(800.0, 1000.0, 2.0, 6.0, 0), 1e-9));
+
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -6"), false), -45.0, 0.01));
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -12"), false), -90.0, 0.01));
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -12"), true), 90.0, 0.01));
+    assert!(close(wrap_deg(filter_phase_deg(1000.0, 1000.0, slope("LK -24"), false)), 180.0, 0.01), "LR4 at fc");
+    // LR4 low and high pass are in phase at every frequency.
+    for f in [200.0, 700.0, 1000.0, 3000.0] {
+        let lp = filter_phase_deg(f, 1000.0, slope("LK -24"), false);
+        let hp = filter_phase_deg(f, 1000.0, slope("LK -24"), true);
+        assert!(close(wrap_deg(lp - hp), 0.0, 0.01), "LR4 at {f} Hz");
+    }
+    assert!(close(filter_phase_deg(10.0, 1000.0, slope("BL -24"), false), 0.0, 3.0));
+    assert_eq!(filter_phase_deg(100.0, 1000.0, 0, true), 0.0, "bypass");
+    assert_eq!(wrap_deg(-180.0), 180.0);
+    assert_eq!(wrap_deg(540.0), 180.0);
+}
+
+#[test]
+fn channel_phase_adds_polarity_and_all_passes() {
+    let mut state = DeviceState::new(DeviceModel::DSP408);
+    ops::apply(&mut state, &Op::lo_pass("Out 1", FilterState::new(p::peq_hz_to_freq(1000.0), slope("BW -6"))));
+    let lp_only = ChannelEq::of(&state, "Out 1").phase_deg(p::peq_freq_to_hz(p::peq_hz_to_freq(1000.0)));
+    assert!(close(lp_only, -45.0, 0.5));
+    ops::apply(&mut state, &Op::phase("Out 1", true));
+    let inverted = ChannelEq::of(&state, "Out 1").phase_deg(p::peq_freq_to_hz(p::peq_hz_to_freq(1000.0)));
+    assert!(close(inverted, 135.0, 0.5));
+    // An all-pass changes the phase, not the magnitude.
+    let before = ChannelEq::of(&state, "Out 1");
+    let band = dsp_core::PeqBand { peq_type: 7, freq_raw: p::peq_hz_to_freq(500.0), ..dsp_core::PeqBand::default() };
+    ops::apply(&mut state, &Op::peq_band("Out 1", 0, band));
+    let after = ChannelEq::of(&state, "Out 1");
+    assert!(close(after.db(300.0), before.db(300.0), 1e-9));
+    assert!(!close(after.phase_deg(300.0), before.phase_deg(300.0), 1.0));
 }
 
 #[test]

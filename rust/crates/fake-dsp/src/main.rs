@@ -1,4 +1,4 @@
-//! Development tool: simulate DSP 206 / DSP 408 devices.
+//! Development tool: simulate DSP 204 / DSP 206 / DSP 408 devices.
 //!
 //! ```text
 //! fake-dsp --port 19761 --models 408,206
@@ -14,12 +14,12 @@ use dsp_core::DeviceModel;
 use fake_dsp::{FakeDsp, FakeOptions};
 
 #[derive(Parser)]
-#[command(about = "Simulated DSP 206/408 devices for development")]
+#[command(about = "Simulated DSP 204/206/408 devices for development")]
 struct Args {
     /// TCP port of the first device
     #[arg(long, default_value_t = 19761)]
     port: u16,
-    /// Comma-separated models, one device each (408, 206)
+    /// Comma-separated models, one device each (408, 206, 204)
     #[arg(long, default_value = "408")]
     models: String,
     /// Response delay in ms

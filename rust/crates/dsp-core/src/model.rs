@@ -1,12 +1,17 @@
 //! Device models.
 //!
-//! The DSP 206 and DSP 408 speak the same protocol; they differ in the number
-//! of channels and in the channel bytes of the outputs:
+//! The DSP 204, DSP 206 and DSP 408 speak the same protocol; they differ in
+//! the number of channels and in the channel bytes of the outputs:
 //!
 //! ```text
 //! DSP 408: In A–D = 0x00–0x03, Out 1–8 = 0x04–0x0B
 //! DSP 206: In A–B = 0x00–0x01, Out 1–6 = 0x02–0x07
+//! DSP 204: In A–B = 0x00–0x01, Out 1–4 = 0x02–0x05
 //! ```
+//!
+//! The DSP 204 was not analysed in an original editor: its layout follows the
+//! same rules (config dump 724 bytes, 15 chunks; meters in slots 0–1 and 4–7),
+//! as measured on a device by another project (TODO.md).
 //!
 //! Channel labels ("In A" … "Out 8") are the keys of the device state, the
 //! web-panel API and the UI.
@@ -15,7 +20,8 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceModel {
-    /// Stable identifier used in configuration and API ("dsp408", "dsp206").
+    /// Stable identifier used in configuration and API ("dsp408", "dsp206",
+    /// "dsp204").
     pub id: &'static str,
     /// Display name ("DSP 408").
     pub name: &'static str,
@@ -65,7 +71,15 @@ impl DeviceModel {
         first_output_byte: 0x02,
     };
 
-    pub const ALL: [DeviceModel; 2] = [DeviceModel::DSP408, DeviceModel::DSP206];
+    pub const DSP204: DeviceModel = DeviceModel {
+        id: "dsp204",
+        name: "DSP 204",
+        inputs: &["In A", "In B"],
+        outputs: &["Out 1", "Out 2", "Out 3", "Out 4"],
+        first_output_byte: 0x02,
+    };
+
+    pub const ALL: [DeviceModel; 3] = [DeviceModel::DSP408, DeviceModel::DSP206, DeviceModel::DSP204];
 
     /// Protocol version the original editor requires after the prefix.
     pub const INFO_VERSION: &'static str = "V010";
@@ -86,7 +100,7 @@ impl DeviceModel {
 
     /// Recognise the model from the device info string (e.g. "DSP408 V0104P").
     /// Like the original editor, the answer must start with "DSP408" or
-    /// "DSP206".
+    /// "DSP206" (or "DSP204").
     pub fn detect(device_info: &str) -> Option<DeviceModel> {
         let info = device_info.trim().to_uppercase();
         Self::ALL.into_iter().find(|m| info.starts_with(&m.info_prefix()))
@@ -195,7 +209,7 @@ impl DeviceModel {
         channel.replace(' ', "")
     }
 
-    /// PEQ bands of a channel: inputs have 8, outputs 9 (both models).
+    /// PEQ bands of a channel: inputs have 8, outputs 9 (all models).
     pub fn peq_band_count(&self, channel: &str) -> usize {
         if self.is_input(channel) { 8 } else { 9 }
     }

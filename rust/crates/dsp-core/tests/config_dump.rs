@@ -10,6 +10,7 @@ use serde_json::json;
 
 const DUMP408: ConfigDump = ConfigDump::new(DeviceModel::DSP408);
 const DUMP206: ConfigDump = ConfigDump::new(DeviceModel::DSP206);
+const DUMP204: ConfigDump = ConfigDump::new(DeviceModel::DSP204);
 
 fn default_stream() -> Vec<u8> {
     captured_config_chunks().concat()
@@ -39,6 +40,14 @@ fn layout_sizes() {
     assert_eq!(DUMP206.switches_length(), 0x394);
     assert_eq!(DUMP206.total_length(), 0x3A0);
     assert_eq!(DUMP206.chunk_count(), 19);
+    // DSP 204 as measured on a device by another project: outputs at 0x128,
+    // mute bits at 0x2B8, 724 bytes in 15 chunks.
+    assert_eq!(DUMP204.output_record_length(), 100);
+    assert_eq!(DUMP204.output_offset(0), 0x128);
+    assert_eq!(DUMP204.mute_offset(), 0x2B8);
+    assert_eq!(DUMP204.switches_length(), 0x2C8);
+    assert_eq!(DUMP204.total_length(), 724);
+    assert_eq!(DUMP204.chunk_count(), 15);
     // The captured dumps have exactly the expected size.
     assert_eq!(default_stream().len(), DUMP408.total_length());
     assert_eq!(test_stream().len(), DUMP408.total_length());
@@ -65,7 +74,7 @@ fn changed(model: DeviceModel) -> DeviceState {
 
 #[test]
 fn mute_phase_delay_and_peq_bypass_written_and_read_at_their_offsets() {
-    for dump in [DUMP408, DUMP206] {
+    for dump in [DUMP408, DUMP206, DUMP204] {
         let model = dump.model;
         let state = changed(model);
         let stream = dump.encode(&state);

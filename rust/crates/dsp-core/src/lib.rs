@@ -8,11 +8,15 @@
 pub mod api;
 pub mod config_dump;
 pub mod describe;
+pub mod diff;
 pub mod eq_math;
+pub mod filter_file;
 pub mod format;
 pub mod frame_decoder;
+pub mod limiter_calc;
 pub mod model;
 pub mod ops;
+pub mod panel;
 pub mod protocol;
 pub mod rta;
 pub mod state;

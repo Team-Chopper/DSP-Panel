@@ -43,9 +43,9 @@ pub fn ValueField(
         }
         let ok = on_submit.run(typed);
         invalid.set(!ok);
-        if !ok {
-            el.set_value(&current);
-        }
+        // The applied value as the device shows it (or the old one, if the
+        // value was refused or waits for a confirmation).
+        el.set_value(&if ok { text.get_untracked() } else { current });
     };
 
     let on_key = move |ev: KeyboardEvent| match ev.key().as_str() {

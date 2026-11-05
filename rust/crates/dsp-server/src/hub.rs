@@ -2,6 +2,16 @@
 //! messages between them (see dsp_core::api). Runs on the server's
 //! single-threaded `LocalSet`; the WebSocket handlers talk to it through
 //! [HubCommand]s.
+//!
+//! Mute all is a hub function: it mutes every channel of every ready DSP and
+//! remembers (in safety.json) which channels were open. A DSP that becomes
+//! ready while it is on is muted as well (also after a preset load); releasing
+//! it unmutes only the remembered channels, those of a DSP that is offline at
+//! that moment when it is ready again.
+//!
+//! The hub also keeps the panel data (panel.json: limiter calculator, link
+//! group names, limit light settings), feeds the limit light page from the
+//! meter answers, runs the network search and copies settings between DSPs.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -10,16 +20,21 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use dsp_core::api::msg;
+use dsp_core::ops::{self, Op};
 use dsp_core::protocol::level_to_db;
 use dsp_core::{DeviceModel, DeviceState, DspStatus, LogEntry};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, spawn_local};
 
+use crate::light::{LightSnapshot, LightTracker, watched_outputs};
 use crate::log;
+use crate::panel_data::PanelStore;
 use crate::presets::PresetStore;
 use crate::registry::{DeviceRegistry, DspConfig};
+use crate::safety::SafetyStore;
+use crate::scan::{self, ScanTiming};
 use crate::session::{ConfigUpdate, DspSession, SessionEvent, Timing};
 
 pub const MAX_MESSAGE_LENGTH: usize = 64 * 1024;
@@ -56,6 +71,13 @@ struct HubInner {
     clients: IndexMap<u64, Client>,
     presets: PresetStore,
     save_generation: u64,
+    safety: SafetyStore,
+    /// Last status seen per DSP, to notice when one becomes ready.
+    statuses: HashMap<String, DspStatus>,
+    panel: PanelStore,
+    light: LightTracker,
+    light_tx: watch::Sender<LightSnapshot>,
+    scanning: bool,
 }
 
 /// Handle to the hub (single-threaded).
@@ -66,8 +88,30 @@ fn json_int(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64)
 }
 
+/// Where the hub keeps its data besides the DSP list.
+pub struct HubStores {
+    pub presets_file: PathBuf,
+    pub safety: SafetyStore,
+    pub panel: PanelStore,
+    /// The limit light page reads from the other end.
+    pub light: watch::Sender<LightSnapshot>,
+}
+
+impl HubStores {
+    /// Stores that are not written to disk (tests).
+    pub fn memory(presets_file: PathBuf) -> Self {
+        HubStores {
+            presets_file,
+            safety: SafetyStore::memory(),
+            panel: PanelStore::memory(),
+            light: watch::channel(LightSnapshot::default()).0,
+        }
+    }
+}
+
 impl Hub {
-    pub fn new(registry: DeviceRegistry, presets_file: PathBuf, timing: Timing) -> Self {
+    pub fn new(registry: DeviceRegistry, stores: HubStores, timing: Timing) -> Self {
+        let HubStores { presets_file, safety, panel, light } = stores;
         Hub(Rc::new_cyclic(|weak| {
             RefCell::new(HubInner {
                 weak: weak.clone(),
@@ -78,12 +122,26 @@ impl Hub {
                 clients: IndexMap::new(),
                 presets: PresetStore::new(presets_file),
                 save_generation: 0,
+                safety,
+                statuses: HashMap::new(),
+                panel,
+                light: LightTracker::default(),
+                light_tx: light,
+                scanning: false,
             })
         }))
     }
 
+    pub fn panel(&self) -> PanelStore {
+        self.0.borrow().panel.clone()
+    }
+
     pub fn presets(&self) -> PresetStore {
         self.0.borrow().presets.clone()
+    }
+
+    pub fn safety(&self) -> SafetyStore {
+        self.0.borrow().safety.clone()
     }
 
     pub fn sessions(&self) -> Vec<DspSession> {
@@ -102,6 +160,8 @@ impl Hub {
         let presets = self.presets();
         presets.load();
         log::info(format!("{} DSP(s) configured, {} server preset(s)", self.0.borrow().sessions.len(), presets.len()));
+        self.publish_light();
+        self.update_meter_polling();
         Ok(())
     }
 
@@ -146,9 +206,12 @@ impl Hub {
     }
 
     fn add_session(&self, config: DspConfig) {
-        let timing = self.0.borrow().timing.clone();
+        let (timing, safety) = {
+            let inner = self.0.borrow();
+            (inner.timing.clone(), inner.safety.clone())
+        };
         let id = config.id.clone();
-        let session = DspSession::new(config, timing);
+        let session = DspSession::with_safety(config, timing, safety);
         let mut events = session.subscribe();
         let hub = Rc::downgrade(&self.0);
         let task_id = id.clone();
@@ -167,13 +230,165 @@ impl Hub {
         session.start();
     }
 
-    /// Meters are polled only while a client shows the DSP; otherwise the
-    /// session keeps the link alive with the idle heartbeat.
+    /// Meters are polled only while a client shows the DSP, or for the limit
+    /// light; otherwise the session keeps the link alive with the idle
+    /// heartbeat.
     fn update_meter_polling(&self) {
         let inner = self.0.borrow();
+        let light = inner.panel.light().enabled;
         for (id, session) in &inner.sessions {
-            session.set_meters_wanted(inner.clients.values().any(|c| c.subscriptions.contains(id)));
+            session.set_meters_wanted(light || inner.clients.values().any(|c| c.subscriptions.contains(id)));
         }
+    }
+
+    // ─── Limit light ───
+
+    fn publish_light(&self) {
+        let inner = self.0.borrow();
+        let snapshot = inner.light.snapshot(inner.panel.light().enabled);
+        inner.light_tx.send_if_modified(|current| {
+            let changed = *current != snapshot;
+            *current = snapshot;
+            changed
+        });
+    }
+
+    fn note_light(&self, session: &DspSession) {
+        let light = self.0.borrow().panel.light();
+        if !light.enabled {
+            return;
+        }
+        let id = session.id();
+        let ignore = light.ignore.get(&id).cloned().unwrap_or_default();
+        let watched = watched_outputs(&session.state(), &ignore);
+        self.0.borrow_mut().light.note(&id, &watched, session.dynamics(), tokio::time::Instant::now());
+        self.publish_light();
+    }
+
+    fn panel_message(&self) -> Value {
+        json!({"t": msg::PANEL, "data": self.panel().to_json()})
+    }
+
+    // ─── Network search ───
+
+    /// Search the given networks (or the server's own and those of the
+    /// configured DSPs) and answer [client] with a scanResult.
+    fn start_scan(&self, client: u64, message: &Value) -> Option<String> {
+        if self.0.borrow().scanning {
+            return Some("A network search is already running".into());
+        }
+        let mut networks = Vec::new();
+        match message.get("networks").filter(|v| !v.is_null()) {
+            Some(list) => {
+                let Some(list) = list.as_array() else { return Some("networks must be a list".into()) };
+                for n in list {
+                    match n.as_str().and_then(scan::parse_network) {
+                        Some(net) => networks.push(net),
+                        None => return Some(format!("Not a network: {n}")),
+                    }
+                }
+            }
+            None => {
+                networks.extend(scan::own_network());
+                for s in self.sessions() {
+                    networks.extend(scan::network_of_host(&s.config().host));
+                }
+            }
+        }
+        let mut unique = Vec::new();
+        for n in networks {
+            if !unique.contains(&n) {
+                unique.push(n);
+            }
+        }
+        unique.truncate(scan::MAX_NETWORKS);
+        if unique.is_empty() {
+            return Some("No network to search – enter one, e.g. 192.168.1.0/24".into());
+        }
+        // A DSP takes one connection: the ones the panel talks to are known.
+        let mut skip = HashSet::new();
+        let mut known: HashMap<String, (String, bool)> = HashMap::new();
+        for s in self.sessions() {
+            let config = s.config();
+            let connected = matches!(
+                s.status(),
+                DspStatus::Connecting | DspStatus::Initializing | DspStatus::Ready | DspStatus::Busy
+            );
+            if connected {
+                skip.insert(config.host.clone());
+            }
+            known.insert(config.host.clone(), (config.name.clone(), connected));
+        }
+        self.0.borrow_mut().scanning = true;
+        let weak = self.0.borrow().weak.clone();
+        let texts: Vec<String> = unique.iter().map(|n| scan::network_text(*n)).collect();
+        log::info(format!("Network search: {}", texts.join(", ")));
+        spawn_local(async move {
+            let found = scan::scan(&unique, &skip, scan::DSP_PORT, ScanTiming::default()).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let hub = Hub(inner);
+            hub.0.borrow_mut().scanning = false;
+            let mut list: Vec<Value> = found
+                .into_iter()
+                .map(|f| {
+                    let known_as = known.get(&f.host).map(|(name, _)| name.clone());
+                    json!({"host": f.host, "port": f.port, "info": f.info, "model": f.model, "known": known_as, "connected": false})
+                })
+                .collect();
+            // The DSPs the panel is connected to were not probed.
+            for (host, (name, connected)) in known {
+                if connected && scan::network_of_host(&host).is_some_and(|n| texts.contains(&scan::network_text(n))) {
+                    list.push(json!({"host": host, "port": scan::DSP_PORT, "info": "", "model": null,
+                        "known": name, "connected": true}));
+                }
+            }
+            list.sort_by_key(|v| v["host"].as_str().and_then(|h| h.parse::<std::net::Ipv4Addr>().ok()));
+            hub.send_to(client, &json!({"t": msg::SCAN_RESULT, "found": list, "networks": texts}));
+        });
+        None
+    }
+
+    // ─── Copy between DSPs ───
+
+    fn copy_to(&self, message: &Value) -> Option<String> {
+        let Some(source) = self.session(message.get("dsp")) else { return Some("Unknown DSP".into()) };
+        let Some(from) = message.get("from").and_then(Value::as_str) else { return Some("from missing".into()) };
+        let Some(parts) = string_list(message.get("parts")).filter(|p| !p.is_empty()) else {
+            return Some("Choose what to copy".into());
+        };
+        let Some(targets) = message.get("targets").and_then(Value::as_array).filter(|t| !t.is_empty()) else {
+            return Some("No channel to copy to".into());
+        };
+        if !source.config_readable() || source.status() == DspStatus::Disconnected {
+            return Some("The settings of this DSP are not known".into());
+        }
+        let source_state = source.state();
+        let source_id = source.id();
+        let mut changed = 0;
+        for t in targets {
+            let (Some(dsp), Some(ch)) = (t.get("dsp").and_then(Value::as_str), t.get("ch").and_then(Value::as_str)) else {
+                return Some("Invalid target".into());
+            };
+            if dsp == source_id && ch == from {
+                continue;
+            }
+            let Some(target) = self.session(Some(&Value::from(dsp))) else { return Some("Unknown DSP".into()) };
+            if target.status() != DspStatus::Ready {
+                return Some(format!("{} is not ready", target.config().name));
+            }
+            let list = match ops::copy_parts(&source_state, from, &target.state(), ch, &parts) {
+                Ok(list) => list,
+                Err(e) => return Some(e),
+            };
+            for op in list {
+                if let Some(error) = target.apply_op_with(&op.to_json(), None, false) {
+                    return Some(format!("{}: {error}", target.config().name));
+                }
+                changed += 1;
+            }
+        }
+        log::info(format!("Copied {} of {from} ({changed} values)", parts.join(", ")));
+        None
     }
 
     // ─── Clients ───
@@ -181,7 +396,12 @@ impl Hub {
     fn handle_connection(&self, id: u64, remote: String, out: mpsc::UnboundedSender<String>) {
         let hello = {
             let inner = self.0.borrow();
-            json!({"t": msg::HELLO, "dsps": inner.sessions.values().map(|s| s.info()).collect::<Vec<_>>()})
+            json!({
+                "t": msg::HELLO,
+                "dsps": inner.sessions.values().map(|s| s.info()).collect::<Vec<_>>(),
+                "muteAll": inner.safety.mute_all(),
+                "panel": inner.panel.to_json(),
+            })
         };
         let presets = self.preset_list_message();
         let client = Client { out, remote: remote.clone(), subscriptions: HashSet::new() };
@@ -259,6 +479,34 @@ impl Hub {
                 let Some(target) = target else { return Some("Unknown DSP".into()) };
                 return target.apply_full_state(&state, &name);
             }
+            Some(msg::MUTE_ALL) => {
+                return match message.get("on").and_then(Value::as_bool) {
+                    Some(on) => {
+                        self.set_mute_all(on);
+                        None
+                    }
+                    None => Some("on missing".into()),
+                };
+            }
+            Some(msg::SCAN) => return self.start_scan(client, message),
+            Some(msg::COPY_TO) => return self.copy_to(message),
+            Some(msg::LIMITER_SETUP) => {
+                let Some(setup) = message.get("setup") else { return Some("setup missing".into()) };
+                let error = self.panel().set_limiter(setup).err();
+                self.broadcast(&self.panel_message());
+                return error;
+            }
+            Some(msg::LIGHT_SETTINGS) => {
+                let Some(settings) = message.get("settings") else { return Some("settings missing".into()) };
+                let error = self.panel().set_light(settings).err();
+                if !self.panel().light().enabled {
+                    self.0.borrow_mut().light = LightTracker::default();
+                }
+                self.publish_light();
+                self.update_meter_polling();
+                self.broadcast(&self.panel_message());
+                return error;
+            }
             _ => {}
         }
 
@@ -294,10 +542,36 @@ impl Hub {
                 let Some(op) = message.get("op").filter(|o| o.is_object()) else {
                     return Some("op missing".into());
                 };
-                let error = session.apply_op(op, Some(client));
+                let force = message.get("force") == Some(&Value::Bool(true));
+                let error = session.apply_op_with(op, Some(client), force);
                 if error.is_some() {
                     // The client already applied the op locally — resynchronise it.
                     self.send_to(client, &json!({"t": msg::STATE, "dsp": id, "state": session.state_json()}));
+                } else if let Ok(Op::Mute { ch, on: false }) = Op::parse(op) {
+                    self.opened_during_mute_all(&session, &ch);
+                }
+                error
+            }
+            Some(msg::GAIN_CAP) => {
+                let Some(ch) = message.get("ch").and_then(Value::as_str) else {
+                    return Some("ch missing".into());
+                };
+                match message.get("db") {
+                    None | Some(Value::Null) => session.set_gain_cap(ch, None),
+                    Some(db) => match db.as_f64() {
+                        Some(db) => session.set_gain_cap(ch, Some(db)),
+                        None => Some("db must be a number".into()),
+                    },
+                }
+            }
+            Some(msg::TEST_LEVEL) => {
+                let error = match message.get("db").and_then(Value::as_f64) {
+                    Some(db) => session.set_test_level(db),
+                    None => Some("db missing".into()),
+                };
+                if error.is_some() {
+                    // The client moved its fader already.
+                    self.send_to(client, &json!({"t": msg::DSP_INFO, "info": session.info()}));
                 }
                 error
             }
@@ -316,6 +590,22 @@ impl Hub {
                     (Some(from), Some(to)) => session.copy_channels(from, &to),
                     _ => Some("from/to missing".into()),
                 }
+            }
+            Some(msg::PRESET_UNDO) => session.undo_load(),
+            Some(msg::LINK_NAME) => {
+                let members = string_list(message.get("members"));
+                let name = message.get("name").and_then(Value::as_str);
+                let (Some(members), Some(name)) = (members, name) else { return Some("members/name missing".into()) };
+                let model = session.model();
+                if members.iter().any(|m| !model.has_channel(m)) {
+                    return Some("Unknown channel".into());
+                }
+                let mut members = members;
+                members.sort_by_key(|m| model.channels().position(|c| c == m));
+                members.dedup();
+                let error = self.panel().set_link_name(&id, &members, name).err();
+                self.broadcast(&self.panel_message());
+                error
             }
             Some(msg::LOAD_PRESET) => match json_int(message.get("index")) {
                 Some(index) => session.load_preset(index),
@@ -520,7 +810,16 @@ impl Hub {
         }
         let name = session.config().name;
         spawn_local(async move { session.dispose().await });
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.statuses.remove(&id);
+            inner.safety.remove_dsp(&id);
+            inner.panel.remove_dsp(&id);
+            inner.light.forget(&id);
+        }
+        self.publish_light();
         self.broadcast(&json!({"t": msg::DSP_REMOVED, "id": id}));
+        self.broadcast(&self.panel_message());
         self.schedule_save();
         log::info(format!("DSP removed: {name}"));
         None
@@ -531,7 +830,18 @@ impl Hub {
     fn on_session_event(&self, id: &str, event: SessionEvent) {
         let Some(session) = self.session(Some(&Value::from(id))) else { return };
         match event {
-            SessionEvent::InfoChanged => self.broadcast(&json!({"t": msg::DSP_INFO, "info": session.info()})),
+            SessionEvent::InfoChanged => {
+                self.broadcast(&json!({"t": msg::DSP_INFO, "info": session.info()}));
+                let status = session.status();
+                let previous = self.0.borrow_mut().statuses.insert(id.to_string(), status);
+                if status == DspStatus::Ready && previous != Some(DspStatus::Ready) {
+                    self.became_ready(&session);
+                }
+                if !matches!(status, DspStatus::Ready | DspStatus::Busy) {
+                    self.0.borrow_mut().light.forget(id);
+                    self.publish_light();
+                }
+            }
             SessionEvent::StateReplaced => {
                 self.to_subscribers(id, &json!({"t": msg::STATE, "dsp": id, "state": session.state_json()}), None)
             }
@@ -543,6 +853,12 @@ impl Hub {
                 let (tx, rx) = session.packets();
                 let m = json!({"t": msg::METERS, "dsp": id, "v": values, "dyn": session.dynamics(), "tx": tx, "rx": rx});
                 self.to_subscribers(id, &m, None);
+                self.note_light(&session);
+            }
+            // To everyone: a preset is often loaded from the preset page,
+            // without showing the DSP.
+            SessionEvent::Notice { text, error } => {
+                self.broadcast(&json!({"t": msg::NOTICE, "dsp": id, "message": text, "error": error}))
             }
             SessionEvent::LogAppended { entries, reset } => {
                 let entries: Vec<Value> = entries.iter().map(LogEntry::to_json).collect();
@@ -568,6 +884,73 @@ impl Hub {
             let text = text.get_or_insert_with(|| message.to_string());
             let _ = c.out.send(text.clone());
         }
+    }
+
+    // ─── Mute all ───
+
+    /// Switch mute all on or off for every DSP (any client may do both).
+    pub fn set_mute_all(&self, on: bool) {
+        let safety = self.safety();
+        safety.set_mute_all(on);
+        for session in self.sessions() {
+            if on {
+                self.mute_dsp(&session);
+            } else {
+                self.unmute_dsp(&session);
+            }
+        }
+        self.broadcast(&json!({"t": msg::MUTE_ALL, "on": on}));
+        log::info(if on { "Mute all on" } else { "Mute all released" });
+    }
+
+    /// Mute every open channel of [session] and remember them (in addition to
+    /// those remembered before: the DSP may have been muted earlier).
+    fn mute_dsp(&self, session: &DspSession) {
+        let Some(open) = session.mute_open_channels() else { return };
+        let safety = self.safety();
+        let id = session.id();
+        let mut list = safety.unmute_list(&id);
+        for ch in open {
+            if !list.contains(&ch) {
+                list.push(ch);
+            }
+        }
+        safety.set_unmute_list(&id, list);
+    }
+
+    /// Unmute the remembered channels of [session]; they stay remembered if
+    /// it is not ready.
+    fn unmute_dsp(&self, session: &DspSession) {
+        let safety = self.safety();
+        let id = session.id();
+        let list = safety.unmute_list(&id);
+        if !list.is_empty() && session.unmute_channels(&list) {
+            safety.set_unmute_list(&id, Vec::new());
+        }
+    }
+
+    /// A DSP is ready (connected, or a job ended): mute it while mute all is
+    /// on, or unmute what it still owes from a release.
+    fn became_ready(&self, session: &DspSession) {
+        if self.safety().mute_all() {
+            self.mute_dsp(session);
+        } else {
+            self.unmute_dsp(session);
+        }
+    }
+
+    /// A client opened [ch] while mute all is on: it is no longer the release's
+    /// business (a later mute of it stays).
+    fn opened_during_mute_all(&self, session: &DspSession, ch: &str) {
+        let safety = self.safety();
+        if !safety.mute_all() {
+            return;
+        }
+        let id = session.id();
+        let group = ops::edit_group_of(&session.state(), ch);
+        let mut list = safety.unmute_list(&id);
+        list.retain(|c| !group.contains(c));
+        safety.set_unmute_list(&id, list);
     }
 
     // ─── Persistence ───

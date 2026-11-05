@@ -1,14 +1,19 @@
 //! The list of configured DSPs, persisted as devices.json in the data
-//! directory (same format as the Dart server).
+//! directory (same format as the Dart server, plus "gainCaps").
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dsp_core::protocol::{MAX_DEVICE_ID, MIN_DEVICE_ID};
+use dsp_core::protocol::{MAX_DEVICE_ID, MIN_DEVICE_ID, quantize_gain};
 use dsp_core::{DEFAULT_REFRESH_MS, DeviceModel};
 use serde_json::{Map, Value, json};
 
+/// Range of a channel's max level (the gain range).
+pub const GAIN_CAP_MIN_DB: f64 = -60.0;
+pub const GAIN_CAP_MAX_DB: f64 = 12.0;
+
 /// Persistent settings of one DSP.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DspConfig {
     pub id: String,
     pub name: String,
@@ -22,6 +27,9 @@ pub struct DspConfig {
     pub device_id: i64,
     /// Password of a locked DSP (4 characters) or "".
     pub password: String,
+    /// Max level per channel in dB, enforced by the server (the DSP does not
+    /// know it).
+    pub gain_caps: BTreeMap<String, f64>,
 }
 
 impl DspConfig {
@@ -36,6 +44,7 @@ impl DspConfig {
             model: "auto".into(),
             device_id: 1,
             password: String::new(),
+            gain_caps: BTreeMap::new(),
         }
     }
 
@@ -51,6 +60,9 @@ impl DspConfig {
         m.insert("deviceId".into(), json!(self.device_id));
         if !self.password.is_empty() {
             m.insert("password".into(), json!(self.password));
+        }
+        if !self.gain_caps.is_empty() {
+            m.insert("gainCaps".into(), json!(self.gain_caps));
         }
         Value::Object(m)
     }
@@ -72,6 +84,13 @@ impl DspConfig {
             model: if is_valid_model_setting(&model) { model } else { "auto".into() },
             device_id: int("deviceId").unwrap_or(1).clamp(MIN_DEVICE_ID as i64, MAX_DEVICE_ID as i64),
             password: if is_valid_password(&password) { password.to_uppercase() } else { String::new() },
+            gain_caps: json
+                .get("gainCaps")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(ch, db)| db.as_f64().filter(|d| is_valid_gain_cap(*d)).map(|d| (ch.clone(), quantize_gain(d))))
+                .collect(),
         })
     }
 
@@ -129,6 +148,10 @@ fn refresh_from_json(value: Option<i64>) -> i64 {
 /// editor's lock password.
 pub fn is_valid_password(password: &str) -> bool {
     password.is_empty() || (password.encode_utf16().count() == 4 && password.chars().all(|c| ('!'..='~').contains(&c)))
+}
+
+pub fn is_valid_gain_cap(db: f64) -> bool {
+    db.is_finite() && (GAIN_CAP_MIN_DB..=GAIN_CAP_MAX_DB).contains(&db)
 }
 
 pub fn is_valid_model_setting(model: &str) -> bool {

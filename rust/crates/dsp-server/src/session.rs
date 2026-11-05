@@ -18,6 +18,16 @@
 //!   client shows the DSP, the session sends the idle heartbeat (0x12)
 //!   instead.
 //!
+//! Live safety:
+//! - Gains are capped by the channel's max level (`DspConfig::gain_caps`):
+//!   never above max(cap, current gain), unless a client forces the value.
+//! - The DSP test generator (0x39) runs in a safe mode: the output gains are
+//!   saved (safety.json) and every output is lowered before the generator
+//!   starts; switching it off stops the generator first and then restores the
+//!   gains. Meanwhile only mutes and the test controls are accepted. After a
+//!   reconnect a DSP that still plays goes back into this mode, one that is
+//!   back on the analog input gets its saved gains back.
+//!
 //! Like the Dart server, everything runs on one thread (a tokio `LocalSet`):
 //! the session state lives in an `Rc<RefCell<…>>` and is never borrowed across
 //! an `.await`.
@@ -29,8 +39,9 @@ use std::future::Future;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use dsp_core::api::{DspInfo, DspStatus, LogEntry};
+use dsp_core::api::{DspInfo, DspStatus, LogEntry, TEST_LEVEL_MAX_DB, TEST_LEVEL_MIN_DB, TEST_START_LEVEL_DB};
 use dsp_core::describe::{describe, describe_rx};
+use dsp_core::diff;
 use dsp_core::ops::{self, Op};
 use dsp_core::protocol::{self as p, Frame, Message, Protocol, format_as_ascii, format_as_hex, with_device_id};
 use dsp_core::{ConfigDump, DeviceModel, DeviceState, FrameDecoder};
@@ -43,7 +54,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, spawn_local};
 
 use crate::log;
-use crate::registry::DspConfig;
+use crate::registry::{DspConfig, is_valid_gain_cap};
+use crate::safety::SafetyStore;
+
+pub use dsp_core::api::TEST_RUNNING;
 
 /// Something about the session changed.
 #[derive(Clone, Debug)]
@@ -58,7 +72,12 @@ pub enum SessionEvent {
     LogAppended { entries: Vec<LogEntry>, reset: bool },
     /// Persistent settings changed (refresh interval, address, …).
     ConfigChanged,
+    /// Result of a job for the clients (e.g. values a preset load missed).
+    Notice { text: String, error: bool },
 }
+
+/// States kept for undoing preset loads.
+pub const MAX_UNDO: usize = 5;
 
 /// Timeouts and delays (the defaults are the original editor's).
 #[derive(Clone, Debug)]
@@ -232,6 +251,14 @@ struct Inner {
     meters_wanted: bool,
     /// Last time a request was sent or answered.
     last_activity: Instant,
+    /// Saved output gains of the test generator mode (and mute all, used by
+    /// the hub).
+    safety: SafetyStore,
+    /// Level of all outputs while the DSP test generator runs; `None` while
+    /// it is off.
+    test_level: Option<f64>,
+    /// Device states before preset loads (label, state), newest last.
+    undo: Vec<(String, DeviceState)>,
 }
 
 /// Handle to a DSP session (cheap to clone; single-threaded).
@@ -247,7 +274,12 @@ fn host_for_connect(host: &str) -> &str {
 }
 
 impl DspSession {
+    /// A session whose saved test gains are not written to disk.
     pub fn new(config: DspConfig, timing: Timing) -> Self {
+        Self::with_safety(config, timing, SafetyStore::memory())
+    }
+
+    pub fn with_safety(config: DspConfig, timing: Timing, safety: SafetyStore) -> Self {
         let model = configured_model(&config).unwrap_or(DeviceModel::DSP408);
         DspSession(Rc::new_cyclic(|weak| {
             RefCell::new(Inner {
@@ -289,6 +321,9 @@ impl DspSession {
                 log_pending: Vec::new(),
                 meters_wanted: true,
                 last_activity: Instant::now(),
+                safety,
+                test_level: None,
+                undo: Vec::new(),
             })
         }))
     }
@@ -371,7 +406,15 @@ impl DspSession {
             config_readable: i.config_readable,
             device_id: i.config.device_id,
             has_password: !i.config.password.is_empty(),
+            gain_caps: i.config.gain_caps.clone(),
+            test_level: i.test_level,
+            undo: i.undo.iter().map(|(label, _)| label.clone()).collect(),
         }
+    }
+
+    /// Level of all outputs while the DSP test generator runs.
+    pub fn test_level(&self) -> Option<f64> {
+        self.0.borrow().test_level
     }
 
     // ─── Lifecycle ───
@@ -479,6 +522,7 @@ impl DspSession {
                             i.start_keepalive();
                             i.pump();
                         }
+                        self.resume_test_mode();
                         let _ = closed.await;
                         if self.active(generation) {
                             let mut i = self.0.borrow_mut();
@@ -941,35 +985,263 @@ impl DspSession {
 
     /// Validate and apply an op from a client. Returns an error message.
     pub fn apply_op(&self, op: &Value, origin: Option<u64>) -> Option<String> {
+        self.apply_op_with(op, origin, false)
+    }
+
+    /// Like [apply_op]; [force] sets a gain above the channel's max level
+    /// (the client asked "Set anyway").
+    pub fn apply_op_with(&self, op: &Value, origin: Option<u64>, force: bool) -> Option<String> {
+        let op = {
+            let i = self.0.borrow();
+            if let Some(error) = ops::validate(op, &i.state.model) {
+                return Some(error);
+            }
+            if let Some(error) = i.not_ready() {
+                return Some(error);
+            }
+            match Op::parse(op) {
+                Ok(op) => op,
+                Err(e) => return Some(e),
+            }
+        };
+        let running = self.0.borrow().test_level.is_some();
+        match op {
+            Op::TestTone { tone_type, param } if tone_type != 0 && !running => return self.start_test(tone_type, param),
+            Op::TestTone { tone_type: 0, param } if running => return self.stop_test(param),
+            _ => {}
+        }
         let mut i = self.0.borrow_mut();
-        if let Some(error) = ops::validate(op, &i.state.model) {
+        if running && !ops::allowed_during_test(&op) {
+            return Some(TEST_RUNNING.into());
+        }
+        let (op, origin) = match op {
+            Op::Gain { ch, db } if !force => {
+                let capped = i.capped_gain(&ch, db);
+                // A capped value goes back to the sender as well.
+                let origin = if capped < db { None } else { origin };
+                (Op::Gain { ch, db: capped }, origin)
+            }
+            other => (other, origin),
+        };
+        i.queue_op(&op, origin, None)
+    }
+
+    // ─── Live safety ───
+
+    /// Change the max level of [ch] and of the channels linked with it
+    /// (`None` removes it). The current gains are not touched.
+    pub fn set_gain_cap(&self, ch: &str, db: Option<f64>) -> Option<String> {
+        let mut i = self.0.borrow_mut();
+        if !i.state.model.has_channel(ch) {
+            return Some("Unknown channel".into());
+        }
+        if db.is_some_and(|d| !is_valid_gain_cap(d)) {
+            return Some("The max level must be between -60 and +12 dB".into());
+        }
+        for c in ops::link_group_of(&i.state, ch) {
+            match db {
+                Some(db) => i.config.gain_caps.insert(c, p::quantize_gain(db)),
+                None => i.config.gain_caps.remove(&c),
+            };
+        }
+        let text = match db {
+            Some(db) => format!("Max level of {ch}: {} dB", p::quantize_gain(db)),
+            None => format!("Max level of {ch} removed"),
+        };
+        i.add_status_log(text);
+        i.emit(SessionEvent::ConfigChanged);
+        i.emit(SessionEvent::InfoChanged);
+        None
+    }
+
+    /// Mute every open channel (mute all), ahead of other queued changes.
+    /// Returns the channels that were open, or `None` if the DSP is not ready.
+    pub fn mute_open_channels(&self) -> Option<Vec<String>> {
+        let mut i = self.0.borrow_mut();
+        if i.not_ready().is_some() {
+            return None;
+        }
+        let model = i.state.model;
+        let is_open = |s: &DeviceState, c: &str| !s.mutes.get(c).copied().unwrap_or(false);
+        let open: Vec<String> = model.channels().filter(|c| is_open(&i.state, c)).map(String::from).collect();
+        let mut position = 0;
+        for ch in &open {
+            // Linked channels may have been muted with their group already.
+            if is_open(&i.state, ch) {
+                i.queue_op(&Op::mute(ch, true), None, Some(position));
+                position += 1;
+            }
+        }
+        if !open.is_empty() {
+            i.add_status_log(format!("Mute all: {} channel(s) muted", open.len()));
+        }
+        Some(open)
+    }
+
+    /// Unmute [channels] (mute all released). False if the DSP is not ready.
+    pub fn unmute_channels(&self, channels: &[String]) -> bool {
+        let mut i = self.0.borrow_mut();
+        if i.not_ready().is_some() {
+            return false;
+        }
+        let model = i.state.model;
+        for ch in channels.iter().filter(|c| model.has_channel(c)) {
+            if i.state.mutes.get(ch).copied().unwrap_or(false) {
+                i.queue_op(&Op::mute(ch, false), None, None);
+            }
+        }
+        i.add_status_log(format!("Mute all released: {} channel(s) unmuted", channels.len()));
+        true
+    }
+
+    /// Set every output to [db] (within the max levels) while the DSP test
+    /// generator runs.
+    pub fn set_test_level(&self, db: f64) -> Option<String> {
+        let mut i = self.0.borrow_mut();
+        if i.test_level.is_none() {
+            return Some("The DSP test generator is not running".into());
+        }
+        if let Some(error) = i.not_ready() {
             return Some(error);
         }
-        if i.status != DspStatus::Ready {
-            return Some(if i.status == DspStatus::Busy { "DSP is busy" } else { "DSP is not connected" }.into());
+        if !db.is_finite() {
+            return Some("db must be a number".into());
         }
-        let op = match Op::parse(op) {
-            Ok(op) => op,
-            Err(e) => return Some(e),
-        };
-        // Like the original editor: the change goes to the device once, for
-        // the edited channel; linked channels follow in the state (the DSP is
-        // expected to apply the change to them itself).
-        for expanded in ops::expand_linked(&i.state, &op) {
-            ops::apply(&mut i.state, &expanded);
-            i.emit(SessionEvent::OpApplied { op: expanded, origin });
+        let level = p::quantize_gain(db.clamp(TEST_LEVEL_MIN_DB, TEST_LEVEL_MAX_DB));
+        i.test_level = Some(level);
+        for out in i.state.model.outputs {
+            let op = Op::gain(out, i.capped_gain(out, level));
+            i.queue_op(&op, None, None);
         }
-        // A newer value for a key replaces the queued one but keeps its place.
-        match ops::commands(&i.state, &op) {
-            Ok(commands) => {
-                for (key, frames) in commands {
-                    i.pending_ops.insert(key, frames);
+        i.emit(SessionEvent::InfoChanged);
+        None
+    }
+
+    /// Switch the generator on: save the output gains (to disk first), lower
+    /// every output, then start it.
+    fn start_test(&self, tone_type: i64, param: i64) -> Option<String> {
+        let mut i = self.0.borrow_mut();
+        let id = i.config.id.clone();
+        // Gains saved by a run that did not end cleanly are the real ones.
+        if i.safety.test_gains(&id).is_none() {
+            let gains = i.output_gains();
+            if let Err(e) = i.safety.set_test_gains(&id, Some(gains)) {
+                return Some(format!("The output gains could not be saved – generator not started ({e})"));
+            }
+        }
+        i.test_level = Some(TEST_START_LEVEL_DB);
+        i.emit(SessionEvent::InfoChanged);
+        drop(i);
+        self.test_job("Starting the test generator …".into(), Some((tone_type, param)));
+        None
+    }
+
+    /// Lower every output to the test level (on a reconnect: the generator is
+    /// still running), then start the generator if [start] is given.
+    fn test_job(&self, label: String, start: Option<(i64, i64)>) {
+        let s = self.clone();
+        let body = async move {
+            let conn = s.conn_id();
+            let outputs = s.model().outputs;
+            let mut steps = StepCounter { total: outputs.len() + 1, done: 0, status: DspStatus::Busy };
+            for out in outputs {
+                let frames = {
+                    let mut i = s.0.borrow_mut();
+                    let level = i.test_level.unwrap_or(TEST_START_LEVEL_DB);
+                    let op = Op::gain(out, i.capped_gain(out, level));
+                    i.apply_now(&op)?
+                };
+                for frame in frames {
+                    s.require(conn, frame, None).await?;
+                }
+                s.step(&mut steps);
+            }
+            if let Some((tone_type, param)) = start {
+                let frames = s.0.borrow_mut().apply_now(&Op::test_tone(tone_type, param))?;
+                for frame in frames {
+                    s.require(conn, frame, None).await?;
                 }
             }
-            Err(e) => return Some(e.to_string()),
-        }
-        i.pump();
+            s.step(&mut steps);
+            let mut i = s.0.borrow_mut();
+            let text = format!("Test generator running – outputs at {} dB", i.test_level.unwrap_or(TEST_START_LEVEL_DB));
+            i.add_status_log(text);
+            Ok(())
+        };
+        self.spawn_exclusive_job(label, true, body);
+    }
+
+    /// Switch the generator off first, then restore the saved output gains.
+    fn stop_test(&self, param: i64) -> Option<String> {
+        self.restore_job("Stopping the test generator …".into(), Some(param));
         None
+    }
+
+    /// Restore the saved output gains (after sending "analog input" if
+    /// [stop_param] is given) and leave the test mode.
+    fn restore_job(&self, label: String, stop_param: Option<i64>) {
+        let s = self.clone();
+        let body = async move {
+            let conn = s.conn_id();
+            let (id, saved) = {
+                let i = s.0.borrow();
+                (i.config.id.clone(), i.safety.test_gains(&i.config.id).unwrap_or_default())
+            };
+            let mut steps = StepCounter { total: saved.len() + 1, done: 0, status: DspStatus::Busy };
+            if let Some(param) = stop_param {
+                let frames = s.0.borrow_mut().apply_now(&Op::test_tone(0, param))?;
+                for frame in frames {
+                    s.require(conn, frame, None).await?;
+                }
+            }
+            s.step(&mut steps);
+            let model = s.model();
+            for (ch, db) in saved.iter().filter(|(ch, _)| model.is_output(ch)) {
+                let frames = s.0.borrow_mut().apply_now(&Op::gain(ch, *db))?;
+                for frame in frames {
+                    s.require(conn, frame, None).await?;
+                }
+                s.step(&mut steps);
+            }
+            let mut i = s.0.borrow_mut();
+            if let Err(e) = i.safety.set_test_gains(&id, None) {
+                i.add_status_log(format!("Error: {e}"));
+            }
+            i.test_level = None;
+            i.add_status_log("Test generator off – output gains restored");
+            i.emit(SessionEvent::InfoChanged);
+            Ok(())
+        };
+        self.spawn_exclusive_job(label, true, body);
+    }
+
+    /// After (re)connecting: a DSP whose generator still runs goes back into
+    /// the test mode; one that is back on the analog input gets its saved
+    /// output gains back.
+    fn resume_test_mode(&self) {
+        let mut i = self.0.borrow_mut();
+        let id = i.config.id.clone();
+        let saved = i.safety.test_gains(&id).is_some();
+        if i.state.test_tone_type != 0 {
+            if !saved {
+                // Started by other software: save what is there now.
+                let gains = i.output_gains();
+                if let Err(e) = i.safety.set_test_gains(&id, Some(gains)) {
+                    i.add_status_log(format!("Error: {e}"));
+                }
+            }
+            if i.test_level.is_none() {
+                i.test_level = Some(TEST_START_LEVEL_DB);
+            }
+            i.emit(SessionEvent::InfoChanged);
+            drop(i);
+            self.test_job("Test generator running – lowering the outputs …".into(), None);
+        } else if saved {
+            drop(i);
+            self.restore_job("Restoring the output gains …".into(), None);
+        } else if i.test_level.take().is_some() {
+            i.emit(SessionEvent::InfoChanged);
+        }
     }
 
     /// Link [slaves] to [master] like the original editor's link dialog: every
@@ -981,6 +1253,9 @@ impl DspSession {
             let i = self.0.borrow();
             if i.status != DspStatus::Ready {
                 return Some("DSP is not ready".into());
+            }
+            if i.test_level.is_some() {
+                return Some(TEST_RUNNING.into());
             }
             let change = match ops::link_change(&i.state, master, slaves) {
                 Ok(change) => change,
@@ -1025,6 +1300,9 @@ impl DspSession {
             if i.status != DspStatus::Ready {
                 return Some("DSP is not ready".into());
             }
+            if i.test_level.is_some() {
+                return Some(TEST_RUNNING.into());
+            }
             if targets.is_empty() {
                 return Some("No channel to copy to".into());
             }
@@ -1066,14 +1344,45 @@ impl DspSession {
         self.spawn_exclusive_job(label, true, body);
     }
 
-    /// Send every value of [target] to the device (loading a preset stored on
-    /// the server), like the original editor loads a preset file: the name
-    /// (0x26), every value as a single command, then the heartbeat.
+    /// Bring the device to [target] (loading a preset stored on the server)
+    /// like the original editor loads a preset file: the name (0x26), the
+    /// values as single commands, the heartbeat. Only the values that differ
+    /// are sent, unless the link masks differ (then all of them, in the
+    /// editor's order). The values before are kept for [undo_load]; the
+    /// configuration is read back afterwards and compared with [target].
     pub fn apply_full_state(&self, target: &DeviceState, label: &str) -> Option<String> {
-        {
+        self.load_state(target, label, true)
+    }
+
+    /// Back to the values before the last preset load.
+    pub fn undo_load(&self) -> Option<String> {
+        let (label, state) = {
             let mut i = self.0.borrow_mut();
             if i.status != DspStatus::Ready {
                 return Some("DSP is not ready".into());
+            }
+            match i.undo.pop() {
+                Some(entry) => entry,
+                None => return Some("Nothing to undo".into()),
+            }
+        };
+        let error = self.load_state(&state, &label, false);
+        if error.is_some() {
+            self.0.borrow_mut().undo.push((label, state));
+        } else {
+            self.0.borrow_mut().emit(SessionEvent::InfoChanged);
+        }
+        error
+    }
+
+    fn load_state(&self, target: &DeviceState, label: &str, keep_undo: bool) -> Option<String> {
+        let (list, all) = {
+            let mut i = self.0.borrow_mut();
+            if i.status != DspStatus::Ready {
+                return Some("DSP is not ready".into());
+            }
+            if i.test_level.is_some() {
+                return Some(TEST_RUNNING.into());
             }
             if target.model != i.state.model {
                 return Some(format!(
@@ -1081,16 +1390,33 @@ impl DspSession {
                     target.model.name, i.state.model.name
                 ));
             }
+            // The preset's gains stay within the max levels too.
+            let mut target = target.clone();
+            for (ch, db) in target.gains.clone() {
+                target.gains.insert(ch.clone(), i.capped_gain(&ch, db));
+            }
+            if keep_undo && i.config_readable {
+                let before = format!("Before \"{label}\"");
+                let state = i.state.clone();
+                i.undo.push((before, state));
+                if i.undo.len() > MAX_UNDO {
+                    i.undo.remove(0);
+                }
+            }
             i.pending_ops.clear();
             i.batch.clear();
-        }
-        let list = ops::full_state(target);
+            match diff::changes(&i.state, &target) {
+                Some(list) => (list, target),
+                None => (ops::full_state(&target), target),
+            }
+        };
         let label = label.to_string();
         let s = self.clone();
         let job_label = format!("Loading \"{label}\" …");
         let body = async move {
             let conn = s.conn_id();
-            let mut steps = StepCounter { total: list.len() + 2, done: 0, status: DspStatus::Busy };
+            let chunks = ConfigDump::new(s.model()).chunk_count();
+            let mut steps = StepCounter { total: list.len() + 2 + chunks, done: 0, status: DspStatus::Busy };
             s.require(conn, p::build_store_preset_name_command(&label), None).await?;
             s.step(&mut steps);
             for op in &list {
@@ -1108,13 +1434,43 @@ impl DspSession {
             }
             s.optional(conn, p::build_heartbeat_command()).await?;
             s.step(&mut steps);
+            // Read back what the device took.
+            let stream = s.read_config(conn, &mut steps).await;
             let mut i = s.0.borrow_mut();
+            i.chunks = None;
+            let read_back = match stream {
+                Ok(stream) => {
+                    drop(i);
+                    s.apply_dump(&stream);
+                    i = s.0.borrow_mut();
+                    i.config_readable
+                }
+                Err(_) => false,
+            };
             i.state.current_preset = label.clone();
             i.emit(SessionEvent::StateReplaced);
-            i.add_status_log(format!("Server preset \"{label}\" loaded ({} settings)", list.len()));
+            i.add_status_log(format!("\"{label}\" loaded ({} changed settings)", list.len()));
+            if read_back {
+                let missing = diff::mismatches(&all, &i.state);
+                if missing.is_empty() {
+                    i.emit(SessionEvent::Notice { text: format!("\"{label}\" loaded and checked"), error: false });
+                } else {
+                    let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
+                    let text = format!(
+                        "\"{label}\": {} value{} did not take: {}{}",
+                        missing.len(),
+                        if missing.len() == 1 { "" } else { "s" },
+                        shown.join(", "),
+                        if missing.len() > shown.len() { ", …" } else { "" }
+                    );
+                    i.add_status_log(text.clone());
+                    i.emit(SessionEvent::Notice { text, error: true });
+                }
+            }
             Ok(())
         };
         self.spawn_exclusive_job(job_label, false, body);
+        self.0.borrow_mut().emit(SessionEvent::InfoChanged);
         None
     }
 
@@ -1124,6 +1480,9 @@ impl DspSession {
             let mut i = self.0.borrow_mut();
             if i.status != DspStatus::Ready {
                 return Some("DSP is not ready".into());
+            }
+            if i.test_level.is_some() {
+                return Some(TEST_RUNNING.into());
             }
             if !(0..p::PRESET_COUNT as i64).contains(&index) {
                 return Some("Invalid preset".into());
@@ -1175,6 +1534,9 @@ impl DspSession {
     pub fn save_preset(&self, index: i64, name: &str) -> Option<String> {
         if self.status() != DspStatus::Ready {
             return Some("DSP is not ready".into());
+        }
+        if self.test_level().is_some() {
+            return Some(TEST_RUNNING.into());
         }
         if !(0..p::PRESET_COUNT as i64).contains(&index) {
             return Some("Invalid preset".into());
@@ -1290,6 +1652,68 @@ impl DspSession {
 impl Inner {
     fn proto(&self) -> Protocol {
         Protocol::with_id(self.state.model, self.config.device_id as u8)
+    }
+
+    /// Why the DSP cannot take a change now, if it cannot.
+    fn not_ready(&self) -> Option<String> {
+        match self.status {
+            DspStatus::Ready => None,
+            DspStatus::Busy => Some("DSP is busy".into()),
+            _ => Some("DSP is not connected".into()),
+        }
+    }
+
+    /// [db] for [ch] within the channel's max level.
+    fn capped_gain(&self, ch: &str, db: f64) -> f64 {
+        let current = self.state.gains.get(ch).copied().unwrap_or(0.0);
+        ops::capped_gain(db, current, ops::group_cap(&self.state, &self.config.gain_caps, ch))
+    }
+
+    fn output_gains(&self) -> BTreeMap<String, f64> {
+        self.state.model.outputs.iter().map(|o| (o.to_string(), self.state.gains.get(*o).copied().unwrap_or(0.0))).collect()
+    }
+
+    /// Apply [op] (and its linked copies) to the state, tell the clients and
+    /// queue its commands; [at] puts them at that place of the queue instead
+    /// of the end (mute all goes first).
+    fn queue_op(&mut self, op: &Op, origin: Option<u64>, at: Option<usize>) -> Option<String> {
+        // Like the original editor: the change goes to the device once, for
+        // the edited channel; linked channels follow in the state (the DSP is
+        // expected to apply the change to them itself).
+        for expanded in ops::expand_linked(&self.state, op) {
+            ops::apply(&mut self.state, &expanded);
+            self.emit(SessionEvent::OpApplied { op: expanded, origin });
+        }
+        // A newer value for a key replaces the queued one but keeps its place.
+        match ops::commands(&self.state, op) {
+            Ok(commands) => {
+                for (key, frames) in commands {
+                    match at {
+                        Some(at) => {
+                            // An existing key is moved, a new one inserted.
+                            let len = self.pending_ops.len();
+                            let max = if self.pending_ops.contains_key(&key) { len - 1 } else { len };
+                            self.pending_ops.shift_insert(at.min(max), key, frames);
+                        }
+                        None => {
+                            self.pending_ops.insert(key, frames);
+                        }
+                    }
+                }
+            }
+            Err(e) => return Some(e.to_string()),
+        }
+        self.pump();
+        None
+    }
+
+    /// Apply [op] to the state of this channel only, tell the clients and
+    /// return its frames (sent by an exclusive job).
+    fn apply_now(&mut self, op: &Op) -> SResult<Vec<Frame>> {
+        ops::apply(&mut self.state, op);
+        self.emit(SessionEvent::OpApplied { op: op.clone(), origin: None });
+        let commands = ops::commands(&self.state, op).map_err(|e| SessionError::Failure(e.to_string()))?;
+        Ok(commands.into_iter().flat_map(|(_, frames)| frames).collect())
     }
 
     fn emit(&self, event: SessionEvent) {

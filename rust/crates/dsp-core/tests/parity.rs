@@ -50,6 +50,30 @@ fn check_ops_result(expected: &Value, result: Result<Vec<Op>, String>, what: &st
     }
 }
 
+/// Like [check_ops_result] for linkSlaves/unlink, apart from one deliberate
+/// change since the Dart version: released slaves with link word 0 are reset
+/// to their own bit too (the DSP ignores changes on them otherwise).
+fn check_link_ops_result(state: &DeviceState, expected: &Value, result: Result<Vec<Op>, String>, what: &str) {
+    let result = result.map(|list| {
+        let first_link = list.iter().position(|o| o.to_json()["op"] == "link").unwrap_or(list.len());
+        list.into_iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                let json = o.to_json();
+                let zero_reset = json["op"] == "link"
+                    && json["ch"].as_str().is_some_and(|ch| state.link_mask(ch) == 0);
+                !(*i > first_link && zero_reset)
+            })
+            .map(|(_, o)| o)
+            .collect()
+    });
+    let (ops, error) = ops_result(result);
+    assert_eq!(error.as_deref(), expected.get("error").and_then(Value::as_str), "{what}: error");
+    if let Some(ops) = ops {
+        assert_eq!(&ops, &expected["ops"], "{what}: ops");
+    }
+}
+
 #[test]
 fn op_sequences() {
     let mut checked = 0;
@@ -94,9 +118,10 @@ fn op_sequences() {
                 }
                 let ls = &step["linkSlaves"];
                 let result = ops::link_slaves(&state, ls["master"].as_str().unwrap(), &strings(&ls["slaves"]));
-                check_ops_result(ls, result, &format!("{what}: linkSlaves"));
+                check_link_ops_result(&state, ls, result, &format!("{what}: linkSlaves"));
                 let ul = &step["unlink"];
-                check_ops_result(ul, ops::unlink(&state, ul["ch"].as_str().unwrap()), &format!("{what}: unlink"));
+                let result = ops::unlink(&state, ul["ch"].as_str().unwrap());
+                check_link_ops_result(&state, ul, result, &format!("{what}: unlink"));
                 let cp = &step["copy"];
                 let result = ops::copy_channel(&state, cp["from"].as_str().unwrap(), cp["to"].as_str().unwrap());
                 check_ops_result(cp, result, &format!("{what}: copyChannel"));
@@ -132,7 +157,8 @@ fn device_answers() {
     for case in fixture()["rx"].as_array().unwrap() {
         let frame = hex_to_bytes(case["frame"].as_str().unwrap()).unwrap();
         let rx = case["rx"].as_bool().unwrap();
-        for model in DeviceModel::ALL {
+        // The Dart code knows only these two models.
+        for model in [DeviceModel::DSP408, DeviceModel::DSP206] {
             let text = if rx { describe_rx(&frame, &model, 1) } else { describe(&frame, &model) };
             assert_eq!(text, case[format!("describe_{}", model.id)].as_str().unwrap(), "{}", case["frame"]);
             if let Some(expected) = case.get(format!("meters_{}", model.id)) {
