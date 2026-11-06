@@ -1,10 +1,43 @@
 //! Small building blocks shared by the pages.
 
-use dsp_core::ops;
+use std::collections::BTreeMap;
+
+use dsp_core::panel::{group_key, link_groups};
+use dsp_core::{DeviceModel, DeviceState, ops};
 use leptos::prelude::*;
 
 use crate::icons::{I, Icon};
-use crate::store::{Device, alias_in};
+use crate::store::{Device, alias_in, app};
+
+// ─── Link groups ───
+
+/// Model and link masks (channel order) of [device]: changes only when a link
+/// changes, not on every fader move.
+pub fn link_masks(device: Device) -> Memo<(DeviceModel, Vec<i64>)> {
+    Memo::new(move |_| device.state.with(|s| (s.model, s.model.channels().map(|c| s.link_mask(c)).collect())))
+}
+
+/// A state that holds only [model] and the link [masks] (channel order), for
+/// the link functions of `ops` and `panel`.
+pub fn links_only(model: DeviceModel, masks: &[i64]) -> DeviceState {
+    let mut state = DeviceState::new(model);
+    state.links = model.channels().zip(masks).map(|(c, m)| (c.to_string(), *m)).collect();
+    state
+}
+
+/// Link groups of [device] (two or more channels, members in channel order);
+/// reads only the model and the link masks.
+pub fn link_groups_memo(device: Device) -> Memo<Vec<Vec<String>>> {
+    let masks = link_masks(device);
+    Memo::new(move |_| masks.with(|(model, masks)| link_groups(&links_only(*model, masks))))
+}
+
+/// Names of the link groups of [device] by group key (panel data of the
+/// server).
+pub fn link_names_memo(device: Device) -> Memo<BTreeMap<String, String>> {
+    let id = device.id();
+    Memo::new(move |_| app().panel.with(|p| p.link_names.get(&id).cloned().unwrap_or_default()))
+}
 
 /// Card with a small title row.
 #[component]
@@ -147,9 +180,22 @@ pub fn MenuButton(
     }
 }
 
+/// What one channel chip shows.
+#[derive(Clone, PartialEq)]
+struct Chip {
+    ch: String,
+    name: String,
+    input: bool,
+    active: bool,
+    partner: bool,
+    linked: bool,
+    title: Option<String>,
+}
+
 /// Single-select channel chips; inputs and outputs are visually separated.
 /// Channels linked with the selected one are highlighted too: a change on the
-/// page applies to all of them.
+/// page applies to all of them. The tooltip of a linked chip names its master
+/// or slaves and the name of the link group.
 #[component]
 pub fn ChannelSelector(
     device: Device,
@@ -158,45 +204,83 @@ pub fn ChannelSelector(
     #[prop(default = true)] inputs: bool,
     #[prop(default = true)] outputs: bool,
 ) -> impl IntoView {
-    let chips = move || {
+    // Only what the chips show (links, channel names, group names): a value
+    // dragged elsewhere on the page does not re-render them.
+    let masks = link_masks(device);
+    let aliases =
+        Memo::new(move |_| device.state.with(|s| s.model.channels().map(|c| alias_in(s, c)).collect::<Vec<_>>()));
+    let names = link_names_memo(device);
+    let chips = Memo::new(move |_| {
         let sel = selected.get();
-        device.state.with(|s| {
-            let partners = ops::linked_with(s, &sel);
-            let chip = |ch: &str| {
-                let is_input = s.model.is_input(ch);
-                let color = if is_input { "var(--input)" } else { "var(--output)" };
-                let active = ch == sel;
-                let partner = partners.iter().any(|p| p == ch);
-                let linked = !ops::linked_with(s, ch).is_empty();
-                let title = if linked {
-                    match ops::master_of(s, ch) {
-                        Some(m) => format!("Linked to {}", alias_in(s, &m)),
-                        None => format!(
-                            "Master of {}",
-                            ops::linked_with(s, ch).iter().map(|c| alias_in(s, c)).collect::<Vec<_>>().join(", ")
-                        ),
-                    }
-                } else {
-                    String::new()
-                };
-                let name = alias_in(s, ch);
-                let ch = ch.to_string();
-                view! {
-                    <button
-                        class="chip"
-                        class:active=active
-                        class:partner=partner
-                        style=format!("--chip:{color}")
-                        title=title
-                        on:click=move |_| on_select.run(ch.clone())
-                    >
-                        {name}
-                        {linked.then(|| view! { <Icon icon=I::Link size=12/> })}
-                    </button>
-                }
-            };
-            let ins = if inputs { s.model.inputs.iter().map(|c| chip(c)).collect_view().into_any() } else { ().into_any() };
-            let outs = if outputs { s.model.outputs.iter().map(|c| chip(c)).collect_view().into_any() } else { ().into_any() };
+        masks.with(|(model, masks)| {
+            let s = links_only(*model, masks);
+            let groups = link_groups(&s);
+            let partners = ops::linked_with(&s, &sel);
+            aliases.with(|aliases| {
+                names.with(|names| {
+                    let alias = |ch: &str| {
+                        model.channels().position(|c| c == ch).and_then(|i| aliases.get(i)).cloned().unwrap_or_else(|| ch.to_string())
+                    };
+                    model
+                        .channels()
+                        .filter(|ch| if model.is_input(ch) { inputs } else { outputs })
+                        .map(|ch| {
+                            let linked_with = ops::linked_with(&s, ch);
+                            let linked = !linked_with.is_empty();
+                            let title = linked.then(|| {
+                                let base = match ops::master_of(&s, ch) {
+                                    Some(m) => format!("Linked to {}", alias(&m)),
+                                    None => format!(
+                                        "Master of {}",
+                                        linked_with.iter().map(|c| alias(c)).collect::<Vec<_>>().join(", ")
+                                    ),
+                                };
+                                let group_name = groups
+                                    .iter()
+                                    .find(|g| g.iter().any(|m| m == ch))
+                                    .and_then(|g| names.get(&group_key(g)));
+                                match group_name {
+                                    Some(name) => format!("{base} · \"{name}\""),
+                                    None => base,
+                                }
+                            });
+                            Chip {
+                                ch: ch.to_string(),
+                                name: alias(ch),
+                                input: model.is_input(ch),
+                                active: ch == sel,
+                                partner: partners.iter().any(|p| p == ch),
+                                linked,
+                                title,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+    });
+
+    let chip = move |c: Chip| {
+        let color = if c.input { "var(--input)" } else { "var(--output)" };
+        let Chip { ch, name, active, partner, linked, title, .. } = c;
+        view! {
+            <button
+                class="chip"
+                class:active=active
+                class:partner=partner
+                style=format!("--chip:{color}")
+                title=title
+                on:click=move |_| on_select.run(ch.clone())
+            >
+                {name}
+                {linked.then(|| view! { <Icon icon=I::Link size=12/> })}
+            </button>
+        }
+    };
+    let content = move || {
+        chips.with(|list| {
+            let ins = list.iter().filter(|c| c.input).cloned().map(chip).collect_view();
+            let outs = list.iter().filter(|c| !c.input).cloned().map(chip).collect_view();
             view! {
                 {ins}
                 {(inputs && outputs).then(|| view! { <span class="chip-sep"></span> })}
@@ -204,7 +288,7 @@ pub fn ChannelSelector(
             }
         })
     };
-    view! { <div class="channel-selector">{chips}</div> }
+    view! { <div class="channel-selector">{content}</div> }
 }
 
 /// Segmented button (one of several).

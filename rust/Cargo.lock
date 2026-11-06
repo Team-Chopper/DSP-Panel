@@ -605,7 +605,7 @@ checksum = "669a445ee724c5c69b1b06fe0b63e70a1c84bc9bb7d9696cd4f4e3ec45050408"
 
 [[package]]
 name = "dsp-core"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "dsp-server"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "dsp-web"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 dependencies = [
  "console_error_panic_hook",
  "dsp-core",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "fake-dsp"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 dependencies = [
  "clap",
  "dsp-core",

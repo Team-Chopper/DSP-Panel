@@ -97,8 +97,13 @@ now and how to capture what is missing.
 
 - Whole-device backup (0x19, 0x1A, 0x24, 0x25, 0x28, 0x04), factory reset
   (0x23), lock and PTS setup (0x2F, 0x2E): left to the original editor.
-- USB HID (VID 0x0168, PID 0x0821), serial and UDP discovery. The panel only
-  talks TCP port 9761.
+- USB HID (VID 0x0168, PID 0x0821) and serial. The panel only talks TCP port
+  9761; its network search (Rust, since 1.0.0-alpha.3) probes that port on
+  the /24 networks of the server and of the configured DSPs (handshake and
+  device info, then 0x11), not the editor's UDP discovery. *From the other
+  project, tested on a DSP 204 (macOS):* every HID report carries one frame
+  from byte 0, sent with report ID 0 and zero-padded to 64 bytes; the frames
+  are the same as on TCP.
 
 ## Sources
 

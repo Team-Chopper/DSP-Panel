@@ -7,7 +7,7 @@ Rewrite of the DSP panel in Rust, built next to the Dart/Flutter version
 |---|---|
 | `crates/dsp-core` | Protocol, frame decoder, config dump, device state, ops/linking, packet descriptions, web API types, EQ math. Port of `packages/dsp_core` (byte-for-byte identical, see the parity test). |
 | `crates/dsp-server` | The panel server: TCP to the DSPs, HTTP(S), WebSocket, login, server presets. Port of `server/` with the same API and data files. |
-| `crates/fake-dsp` | Simulated DSP 408 / 206 for development and tests. |
+| `crates/fake-dsp` | Simulated DSP 408 / 206 / 204 for development and tests. |
 | `crates/dsp-web` | The web client in Leptos (WebAssembly, built with trunk). Same pages as the Flutter client; the RTA runs in an AudioWorklet + WebAssembly. |
 
 The WebSocket API, `config.yaml`, `devices.json`, `presets.json`, `auth.json`
@@ -21,13 +21,33 @@ restored after it stops). `safety.json` in the data directory keeps what mute
 all has to unmute again and the output gains saved for the generator, so both
 survive a crash or restart.
 
+More additions of the Rust panel (since 1.0.0-alpha.3):
+
+- DSP 204 as a third model (layout as measured by another project, not yet
+  seen by this panel on hardware).
+- Loading a server preset sends only the values that differ (all of them when
+  the link masks differ), reads the DSP back and reports values that did not
+  take; the values before are kept (up to 5 loads) and can be restored
+  (`presetUndo`).
+- Copy parts of a channel (level, filters, EQ, dynamics, routing) to channels
+  of other DSPs, network search for DSPs (TCP 9761 on the /24 networks of the
+  server and of the configured DSPs).
+- `panel.json` in the data directory: limiter calculator (amplifiers and the
+  amplifier behind each output), names of link groups, and the limit light.
+- Limit light: `/limit` (off by default, no login) shows one lamp that lights
+  while the limiter of a watched output acts; `/limit/events` streams `{on,
+  ready}`. While it is on, the server polls the meters of every DSP.
+- EQ page: phase view, a compared channel, filter settings files of
+  measurement programs as a proposal. View-only mode per browser tab (phones
+  and tablets start in it).
+
 ## Develop
 
 ```powershell
 cd rust
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel"   # build outside the network share
 cargo test --workspace
-cargo run -p fake-dsp -- --port 19761 --models 408,206
+cargo run -p fake-dsp -- --port 19761 --models 408,206,204
 cd crates\dsp-web; trunk build --release; cd ..\..                  # web client -> crates/dsp-web/dist
 cargo run -p dsp-server -- serve --no-tls --no-auth --port 8090 --data-dir <dir> --web-root crates\dsp-web\dist
 ```

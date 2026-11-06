@@ -91,7 +91,8 @@ pub fn RtaPage() -> impl IntoView {
     view! {
         <div class="rta-page">
             <RtaGraph rta=rta/>
-            <div class="rta-controls wrap-row">
+            // The RTA and the browser generator only look and listen: allowed in view-only mode.
+            <div class="rta-controls wrap-row" data-view-ok>
                 <button class="btn compact" style=move || format!("background:{};color:var(--bg-deep)",
                         if on() { "var(--danger)" } else { "var(--accent)" })
                     on:click=move |_| if on() { rta.stop() } else { rta.start() }>
@@ -105,7 +106,7 @@ pub fn RtaPage() -> impl IntoView {
                 <span class="small muted">"Auto-EQ: GEQ page (inputs) or EQ page (any channel)"</span>
             </div>
             <div class="gen-box">
-                <div class="gen-line">
+                <div class="gen-line" data-view-ok>
                     <span class="gen-title" title="Plays through the audio output of this computer/phone">"Browser generator"</span>
                     <ToneGeneratorPanel/>
                 </div>

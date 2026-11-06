@@ -37,6 +37,9 @@ enum Ask {
     Name { title: String, initial: String, max_length: u32, action: &'static str, hint: Option<String>, done: Callback<String> },
     Apply { preset: ServerPresetInfo, dsp_id: String, dsp_name: String, done: Callback<()> },
     Delete { preset: ServerPresetInfo },
+    /// Back to the values before the last server preset load; [label] is the
+    /// newest kept state, [steps] how many are kept.
+    Undo { dsp_id: String, dsp_name: String, label: String, steps: usize, done: Callback<()> },
 }
 
 /// The question dialogs on top of a presets dialog.
@@ -77,6 +80,12 @@ fn AskDialog(ask: RwSignal<Option<Ask>>) -> impl IntoView {
             }
             Ask::Apply { preset, dsp_id, dsp_name, done } => {
                 let id = preset.id.clone();
+                // The server keeps the values before only if it could read them.
+                let undo = if app().device(&dsp_id).is_none_or(|d| d.info.with_untracked(|i| i.config_readable)) {
+                    "The load can be undone with \"Undo last load\" in the presets dialog of the DSP."
+                } else {
+                    "The configuration of this DSP could not be read, so this load cannot be undone."
+                };
                 view! {
                     <Modal title="Load server preset" on_close=close actions=view! {
                         <button class="btn text" on:click=move |_| ask.set(None)>"Cancel"</button>
@@ -86,9 +95,35 @@ fn AskDialog(ask: RwSignal<Option<Ask>>) -> impl IntoView {
                             done.run(());
                         }>"Load"</button>
                     }.into_any()>
-                        <div class="note-text">{format!("Send all values of \"{}\" to {dsp_name}?", preset.name)}</div>
+                        <div class="note-text">{format!("Load \"{}\" onto {dsp_name}?", preset.name)}</div>
                         <div class="note-text">
-                            "The current settings of the DSP are replaced. The presets U01–U20 stored on the DSP are not changed."
+                            "Only the values that differ are sent (all of them if the channel links differ), then the DSP is read back and checked. "
+                            {undo}
+                        </div>
+                        <div class="note">"The presets U01–U20 stored on the DSP are not changed."</div>
+                    </Modal>
+                }
+                .into_any()
+            }
+            Ask::Undo { dsp_id, dsp_name, label, steps, done } => {
+                let more = match steps.saturating_sub(1) {
+                    0 => String::new(),
+                    1 => " 1 more step can be undone afterwards.".to_string(),
+                    n => format!(" {n} more steps can be undone afterwards."),
+                };
+                view! {
+                    <Modal title="Undo last load" on_close=close actions=view! {
+                        <button class="btn text" on:click=move |_| ask.set(None)>"Cancel"</button>
+                        <button class="btn filled" on:click=move |_| {
+                            ask.set(None);
+                            app().undo_preset_load(&dsp_id);
+                            done.run(());
+                        }>"Undo"</button>
+                    }.into_any()>
+                        <div class="note-text">{format!("Undo the last preset load on {dsp_name}?")}</div>
+                        <div class="undo-ask-step"><Icon icon=I::Undo size=18/><span>{label}</span></div>
+                        <div class="note">
+                            {format!("Only the values that differ are sent, then the DSP is read back and checked. This step cannot be redone.{more}")}
                         </div>
                     </Modal>
                 }
@@ -160,6 +195,7 @@ pub fn PresetsDialog() -> impl IntoView {
                 </div>
                 {tabs}
                 <div class="presets-body">{body}</div>
+                {(!offline).then(|| view! { <UndoLoad device=device ask=ask close=close/> })}
             </div>
         </div>
         <AskDialog ask=ask/>
@@ -184,6 +220,51 @@ fn PresetRow(
             </div>
             {current.then(|| view! { <span class="preset-current">"current"</span> })}
             {children()}
+        </div>
+    }
+}
+
+// ─── Undo the last server preset load ───
+
+/// The server keeps the DSP's values before each server preset load (newest
+/// last); this goes back one step.
+#[component]
+fn UndoLoad(device: Device, ask: RwSignal<Option<Ask>>, close: Callback<()>) -> impl IntoView {
+    let undo = Memo::new(move |_| device.info.with(|i| i.undo.clone()));
+    let ready = Memo::new(move |_| device.info.with(|i| i.status == DspStatus::Ready));
+    let steps = move || undo.with(Vec::len);
+    let label = move || undo.with(|u| u.last().cloned()).unwrap_or_else(|| "No preset load to undo".into());
+    let sub = move || match steps() {
+        0 => "Loading a server preset keeps the values from before.".to_string(),
+        1 => "1 step kept".to_string(),
+        n => format!("{n} steps kept"),
+    };
+    let hint = move || {
+        if !ready.get() {
+            "The DSP is not ready"
+        } else {
+            "Back to the values before the last server preset load"
+        }
+    };
+    let start = move |_| {
+        let Some(label) = undo.with_untracked(|u| u.last().cloned()) else { return };
+        ask.set(Some(Ask::Undo {
+            dsp_id: device.id(),
+            dsp_name: device.info.with_untracked(|i| i.name.clone()),
+            label,
+            steps: undo.with_untracked(Vec::len),
+            done: close,
+        }));
+    };
+    view! {
+        <div class="preset-undo">
+            <div class="preset-text">
+                <div class="preset-title" class:muted=move || steps() == 0>{label}</div>
+                <div class="preset-sub">{sub}</div>
+            </div>
+            <button class="btn outlined compact" title=hint prop:disabled=move || !ready.get() || steps() == 0 on:click=start>
+                <Icon icon=I::Undo size=16/>"Undo last load"
+            </button>
         </div>
     }
 }
@@ -436,6 +517,10 @@ pub fn ApplyPresetDialog(preset_id: String) -> impl IntoView {
             <button class="btn text" on:click=move |_| close.run(())>"Cancel"</button>
         }.into_any()>
             <div class="col">{targets}</div>
+            <div class="note">
+                "Only the values that differ are sent, then the DSP is read back and checked. "
+                "The load can be undone in the presets dialog of the DSP."
+            </div>
         </Modal>
         <AskDialog ask=ask/>
     }

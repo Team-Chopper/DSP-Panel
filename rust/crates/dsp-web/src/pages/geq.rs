@@ -239,7 +239,7 @@ pub fn GeqPage() -> impl IntoView {
                 <button class="action-button" on:click=move |_| device.reset_geq(&channel.get_untracked())>"Flat"</button>
                 <button class="action-button" class:on=move || bypass.get()
                     on:click=move |_| device.set_geq_bypass(&channel.get_untracked(), !bypass.get_untracked())>"Bypass"</button>
-                <button class="action-button" class:on=rta_on on:click=toggle_rta>"RTA"</button>
+                <button class="action-button" data-view-ok class:on=rta_on on:click=toggle_rta>"RTA"</button>
                 <button class="action-button" class:on=move || auto_eq.get() on:click=toggle_auto_eq>"Auto-EQ"</button>
             </div>
             {auto_eq_panel}

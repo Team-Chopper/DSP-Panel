@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use dsp_core::DeviceModel;
 use dsp_core::api::msg;
 use dsp_core::ops::Op;
 use dsp_core::protocol::SILENCE_DB;
@@ -340,6 +341,106 @@ fn server_presets_save_from_a_dsp_edit_offline_load_onto_the_dsp() {
 
         a.send(json!({"t": msg::PRESET_DELETE, "preset": hall["id"]}));
         b.wait_for(|m| m["t"] == msg::PRESETS && m["presets"].as_array().unwrap().len() == 1).await;
+        setup.stop().await;
+    });
+}
+
+#[test]
+fn panel_data_limit_light_copy_between_dsps_and_undo() {
+    run(async {
+        let setup = Setup::new("panel").await;
+        let mut second = FakeDsp::new(FakeOptions { model: DeviceModel::DSP206, ..FakeOptions::default() });
+        second.start(0).await.unwrap();
+        let cookie = setup.login().await;
+        let a = setup.connect(&cookie, None).await.unwrap();
+        let b = setup.connect(&cookie, None).await.unwrap();
+        let hello = a.wait_for(|m| m["t"] == msg::HELLO).await;
+        assert_eq!(hello["panel"]["light"]["enabled"], false);
+
+        // The limit light page exists only while it is switched on.
+        let page = format!("http://{}/limit", setup.base);
+        assert_eq!(reqwest::get(&page).await.unwrap().status(), 404);
+        a.send(json!({"t": msg::LIGHT_SETTINGS, "settings": {"enabled": true, "ignore": {}}}));
+        b.wait_for(|m| m["t"] == msg::PANEL && m["data"]["light"]["enabled"] == true).await;
+        let html = reqwest::get(&page).await.unwrap();
+        assert_eq!(html.status(), 200);
+        assert!(html.text().await.unwrap().contains("/limit/events"));
+        let mut events = reqwest::get(format!("{page}/events")).await.unwrap();
+        assert_eq!(events.headers()["content-type"], "text/event-stream");
+        let first = tokio::time::timeout(Duration::from_secs(5), events.chunk()).await.unwrap().unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains(r#""on":false"#));
+        drop(events);
+
+        // Limiter calculator and link group names are kept for every client.
+        let setup_json = json!({"amps": [{"id": "a1", "name": "Amp", "watts8": 500.0, "watts4": 800.0, "watts2": 0.0,
+            "sensitivityV": 1.4}], "outputs": {"x/Out 1": {"amp": "a1", "ohms": 8.0, "speakerW": 300.0}}});
+        a.send(json!({"t": msg::LIMITER_SETUP, "setup": setup_json}));
+        b.wait_for(|m| m["t"] == msg::PANEL && m["data"]["limiter"]["amps"].as_array().is_some_and(|l| l.len() == 1)).await;
+
+        a.send(json!({"t": msg::ADD_DSP, "name": "FOH", "host": "127.0.0.1", "port": setup.fake.port()}));
+        a.send(json!({"t": msg::ADD_DSP, "name": "Delay", "host": "127.0.0.1", "port": second.port()}));
+        a.wait_until(|| a.of_type(msg::DSP_INFO).iter().filter(|m| m["info"]["status"] == "ready").count() >= 2).await;
+        let ids: Vec<(String, String)> = setup
+            .server
+            .hub
+            .sessions()
+            .iter()
+            .map(|s| (s.config().name, s.id()))
+            .collect();
+        let id_of = |name: &str| ids.iter().find(|(n, _)| n == name).unwrap().1.clone();
+        let (foh, delay) = (id_of("FOH"), id_of("Delay"));
+
+        a.send(json!({"t": msg::LINK_NAME, "dsp": foh, "members": ["Out 2", "Out 1"], "name": "Tops"}));
+        b.wait_for(|m| m["t"] == msg::PANEL && m["data"]["linkNames"][foh.as_str()]["Out 1+Out 2"] == "Tops").await;
+        a.send(json!({"t": msg::LINK_NAME, "dsp": foh, "members": ["Out 1"], "name": "x"}));
+        a.wait_for(|m| m["t"] == msg::ERROR).await;
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(setup.dir.join("panel.json")).unwrap()).unwrap();
+        assert_eq!(saved["light"]["enabled"], true);
+        assert_eq!(saved["linkNames"][foh.as_str()]["Out 1+Out 2"], "Tops");
+
+        // Copy level and routing of a 408 output to an output of the 206.
+        a.send(json!({"t": msg::OP, "dsp": foh, "op": Op::gain("Out 1", -9.0).to_json()}));
+        a.send(json!({"t": msg::OP, "dsp": foh, "op": Op::matrix_route("Out 1", 0b0010).to_json()}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        b.send(json!({"t": msg::SUBSCRIBE, "dsp": delay}));
+        a.send(json!({"t": msg::COPY_TO, "dsp": foh, "from": "Out 1", "parts": ["level", "routing"],
+            "targets": [{"dsp": delay, "ch": "Out 5"}]}));
+        b.wait_for(|m| m["t"] == msg::OP && m["dsp"] == delay.as_str() && m["op"] == Op::gain("Out 5", -9.0).to_json()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        {
+            let d = second.device();
+            assert_eq!(d.state.gains["Out 5"], -9.0);
+            assert_eq!(d.state.matrix_routing["Out 5"], 0b0010);
+        }
+        a.send(json!({"t": msg::COPY_TO, "dsp": foh, "from": "Out 1", "parts": ["mute"],
+            "targets": [{"dsp": delay, "ch": "Out 5"}]}));
+        a.wait_until(|| a.of_type(msg::ERROR).len() >= 2).await;
+
+        // Loading a server preset reports the result; the load can be undone.
+        a.send(json!({"t": msg::PRESET_UNDO, "dsp": foh}));
+        a.wait_for(|m| m["t"] == msg::ERROR && m["message"] == "Nothing to undo").await;
+        a.send(json!({"t": msg::PRESET_CREATE, "name": "Snap", "fromDsp": foh}));
+        let list = a.wait_for(|m| m["t"] == msg::PRESETS && !m["presets"].as_array().unwrap().is_empty()).await;
+        let preset = list["presets"][0]["id"].as_str().unwrap().to_string();
+        a.send(json!({"t": msg::OP, "dsp": foh, "op": Op::gain("Out 1", -20.0).to_json()}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        a.send(json!({"t": msg::PRESET_APPLY, "preset": preset, "dsp": foh}));
+        let notice = b.wait_for(|m| m["t"] == msg::NOTICE).await;
+        assert_eq!(notice["error"], false, "{notice}");
+        assert_eq!(setup.fake.device().state.gains["Out 1"], -9.0);
+        a.wait_for(|m| m["t"] == msg::DSP_INFO && m["info"]["undo"].as_array().is_some_and(|u| u.len() == 1)).await;
+        a.send(json!({"t": msg::PRESET_UNDO, "dsp": foh}));
+        a.wait_until(|| setup.fake.device().state.gains["Out 1"] == -20.0).await;
+
+        // A network search answers the client that asked.
+        a.send(json!({"t": msg::SCAN, "networks": ["not a network"]}));
+        a.wait_for(|m| m["t"] == msg::ERROR && m["message"].as_str().is_some_and(|t| t.starts_with("Not a network"))).await;
+        a.send(json!({"t": msg::SCAN, "networks": ["127.0.0.0/24"]}));
+        let result = a.wait_for(|m| m["t"] == msg::SCAN_RESULT).await;
+        assert_eq!(result["networks"], json!(["127.0.0.0/24"]));
+        assert!(b.of_type(msg::SCAN_RESULT).is_empty());
+
+        second.stop().await;
         setup.stop().await;
     });
 }

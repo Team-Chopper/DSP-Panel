@@ -4,13 +4,17 @@
 //!
 //! The value ranges are those of the original editor: attack 1 … 999 ms,
 //! release 10 … 3000 ms, gate hold 10 … 999 ms, knee 0 … 12 dB.
+//!
+//! The Limit page of a real DSP also has the limiter calculator and the
+//! settings of the limit light page below the parameters.
 
+use dsp_core::limiter_calc::LimiterSetup;
 use dsp_core::protocol as p;
 use dsp_core::{CompressorState, GateState, LimiterState};
 use leptos::html;
 use leptos::prelude::*;
 
-use crate::components::common::{ChannelSelector, PanelCard};
+use crate::components::common::{ChannelSelector, Check, PanelCard};
 use crate::components::fader::Fader;
 use crate::components::size::use_size;
 use crate::components::value_field::ValueField;
@@ -18,7 +22,8 @@ use crate::fmt::{fixed, format_db_value, parse_number};
 use crate::icons::{I, Icon};
 use crate::meters::Led;
 use crate::pages::dsp::ui;
-use crate::store::Device;
+use crate::pages::limiter_calc::LimiterCalcCard;
+use crate::store::{Device, app, filter_of};
 use crate::taper::Taper;
 
 // Times in ms (raw + 1) of the original editor.
@@ -232,8 +237,10 @@ fn DynamicsPage(kind: Kind) -> impl IntoView {
         selection.get().filter(|c| group.contains(&c.as_str())).unwrap_or_else(|| group[0].to_string())
     });
     let color = if inputs { "var(--input)" } else { "var(--output)" };
+    // The extra cards make the page taller than the screen: it scrolls.
+    let page_class = if kind == Kind::Limiter && !device.offline { "dyn-page has-extras" } else { "dyn-page" };
     view! {
-        <div class="dyn-page">
+        <div class=page_class>
             <ChannelSelector device=device selected=channel inputs=inputs outputs=!inputs
                 on_select=Callback::new(move |c: String| selection.set(Some(c)))/>
             {move || {
@@ -254,7 +261,8 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
         ch.with_value(|c| next.send(device, c));
     };
     let defaults = Dyn::default_of(kind);
-    let title = Signal::derive(move || {
+    // Memo: the alias reads the device state, the title changes only with it.
+    let title = Memo::new(move |_| {
         let name = match kind {
             Kind::Gate => "Gate",
             Kind::Compressor => "Compressor",
@@ -316,6 +324,7 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
         }
         .into_any(),
     };
+    let extras = (kind == Kind::Limiter && !device.offline).then(|| limit_extras(device, ch, state, set));
 
     view! {
         <div class="dyn-body">
@@ -326,7 +335,125 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
                 </div>
             </PanelCard>
             <PanelCard class="dyn-params">{params}</PanelCard>
+            {extras}
         </div>
+    }
+}
+
+// ─── Limit page extras (real DSPs only) ───
+
+/// Below the limiter parameters: the limiter calculator for this output and
+/// the limit light settings.
+fn limit_extras(
+    device: Device,
+    ch: StoredValue<String>,
+    state: Memo<Dyn>,
+    set: impl Fn(Field, i64) + Copy + Send + Sync + 'static,
+) -> AnyView {
+    let panel = app().panel;
+    let setup = Memo::new(move |_| panel.with(|data| data.limiter.clone()));
+    let threshold_raw = Memo::new(move |_| state.with(|s| s.get(Field::Threshold)));
+    // Read only when the timing button is pressed (not tracked by a view).
+    let low_hz = Signal::derive(move || {
+        ch.with_value(|c| {
+            device.state.with(|s| {
+                let hpf = filter_of(s, c, true);
+                if hpf.enabled() { p::peq_freq_to_hz(hpf.freq_raw) } else { 20.0 }
+            })
+        })
+    });
+    let on_change = Callback::new(move |setup: LimiterSetup| app().set_limiter_setup(setup));
+    let on_threshold = Callback::new(move |raw: i64| set(Field::Threshold, raw));
+    // Attack and release in ms, one change of the limiter.
+    let on_timing = Callback::new(move |(attack, release): (i64, i64)| {
+        let mut next = state.get_untracked();
+        next.set(Field::Attack, p::time_ms_to_raw(attack.clamp(ATTACK_MS.0, ATTACK_MS.1)));
+        next.set(Field::Release, p::time_ms_to_raw(release.clamp(RELEASE_MS.0, RELEASE_MS.1)));
+        ch.with_value(|c| next.send(device, c));
+    });
+    view! {
+        <div class="limit-extras">
+            <LimiterCalcCard dsp=device.id() channel=ch.get_value() setup=setup on_change=on_change
+                threshold_raw=threshold_raw on_threshold=on_threshold low_hz=low_hz on_timing=on_timing/>
+            <LimitLightCard device=device/>
+        </div>
+    }
+    .into_any()
+}
+
+/// Settings of the limit light page (/limit, without login): the page on or
+/// off, and which outputs of this DSP it watches.
+#[component]
+fn LimitLightCard(device: Device) -> impl IntoView {
+    let panel = app().panel;
+    let model = ui().model;
+    let dsp = StoredValue::new(device.id());
+    let light = Memo::new(move |_| panel.with(|data| data.light.clone()));
+    let enabled = Memo::new(move |_| light.with(|l| l.enabled));
+    let url = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .map_or_else(|| "/limit".to_string(), |origin| format!("{origin}/limit"));
+
+    let set_enabled = move |ev: web_sys::Event| {
+        let mut next = light.get_untracked();
+        next.enabled = event_target_checked(&ev);
+        app().set_light_settings(next);
+    };
+    // Watched = not in the ignore list of this DSP.
+    let toggle = move |ch: &'static str| {
+        let mut next = light.get_untracked();
+        let id = dsp.get_value();
+        let order = model.get_untracked().outputs;
+        let list = next.ignore.entry(id.clone()).or_default();
+        match list.iter().position(|c| c == ch) {
+            Some(i) => {
+                list.remove(i);
+            }
+            None => list.push(ch.to_string()),
+        }
+        list.sort_by_key(|c| order.iter().position(|o| *o == c.as_str()));
+        if list.is_empty() {
+            next.ignore.remove(&id);
+        }
+        app().set_light_settings(next);
+    };
+    let outputs = move || {
+        model
+            .get()
+            .outputs
+            .iter()
+            .map(|&ch| {
+                let watched = Memo::new(move |_| {
+                    dsp.with_value(|d| light.with(|l| !l.ignore.get(d).is_some_and(|v| v.iter().any(|c| c == ch))))
+                });
+                let label = Memo::new(move |_| device.alias(ch));
+                let on_toggle = Callback::new(move |_| toggle(ch));
+                view! { <Check checked=watched label=label color="var(--output)" on_toggle=on_toggle/> }
+            })
+            .collect_view()
+    };
+
+    view! {
+        <PanelCard title=Signal::derive(|| "Limit light".to_string()) accent="var(--warning)" class="light-card"
+            trailing=view! {
+                <label class="light-switch" title="Serve the limit light page">
+                    <input type="checkbox" role="switch" aria-label="Limit light page"
+                        prop:checked=move || enabled.get() on:change=set_enabled/>
+                    <span class="light-switch-track"></span>
+                </label>
+            }.into_any()>
+            <div class="light-body">
+                <Show when=move || enabled.get()
+                    fallback=|| view! { <div class="small muted">"The page is off."</div> }>
+                    <a class="light-link mono" href="/limit" target="_blank" rel="noopener" data-view-ok>{url.clone()}</a>
+                </Show>
+                <div class="light-help">
+                    "A page without login, e.g. for the DJ booth: one lamp that lights while a watched limiter acts. Muted outputs never count."
+                </div>
+                <div class="small muted">"Watched outputs"</div>
+                <div class="light-outputs">{outputs}</div>
+            </div>
+        </PanelCard>
     }
 }
 

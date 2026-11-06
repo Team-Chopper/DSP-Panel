@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/dsp-core", "crates/fake-dsp", "crates/dsp-server", "crates/dsp-web"]
 
 [workspace.package]
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
