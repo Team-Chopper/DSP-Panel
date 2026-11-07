@@ -473,6 +473,12 @@ impl ChannelEq {
         }
     }
 
+    /// The same without the GEQ (as the PEQ graph draws a channel).
+    pub fn without_geq(mut self) -> ChannelEq {
+        self.geq = None;
+        self
+    }
+
     /// Phase in degrees (−180 … 180) at [freq]: PEQ bands (all-passes
     /// included), HPF/LPF and the polarity; delay and GEQ are left out.
     pub fn phase_deg(&self, freq: f64) -> f64 {

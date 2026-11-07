@@ -484,7 +484,8 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
     let accent = if inputs { "var(--input)" } else { "var(--output)" };
     view! {
         <PanelCard title=Signal::derive(move || title.to_string()) accent=accent>
-            <div class="eq-overview" node_ref=svg on:click=on_click>
+            // Opening the EQ page and hiding curves only change the view.
+            <div class="eq-overview" data-view-ok node_ref=svg on:click=on_click>
                 <svg viewBox=format!("0 0 {W} {H}") preserveAspectRatio="none">
                     {grid}
                     {db_lines}
@@ -493,7 +494,7 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
                 </svg>
                 {labels}
             </div>
-            <div class="legend">{legend}</div>
+            <div class="legend" data-view-ok>{legend}</div>
         </PanelCard>
     }
 }

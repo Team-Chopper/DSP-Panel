@@ -165,18 +165,19 @@ pub fn EqPage() -> impl IntoView {
         import.set(None);
         proposal.set(None);
     });
-    let compare_options = move || {
+    // (channel, name) of the other channels: changes only with names or model.
+    let compare_choices = Memo::new(move |_| {
         let ch = channel.get();
-        let m = model.get();
         device.state.with(|s| {
-            m.channels()
-                .filter(|c| *c != ch)
-                .map(|c| {
-                    let name = alias_in(s, c);
-                    view! { <option value=c selected=move || compare.get().as_deref() == Some(c)>{name}</option> }
-                })
-                .collect_view()
+            s.model.channels().filter(|c| *c != ch).map(|c| (c, alias_in(s, c))).collect::<Vec<(&'static str, String)>>()
         })
+    });
+    let compare_options = move || {
+        compare_choices
+            .get()
+            .into_iter()
+            .map(|(c, name)| view! { <option value=c selected=move || compare.get().as_deref() == Some(c)>{name}</option> })
+            .collect_view()
     };
     let tools = view! {
         <div class="eq-graph-tools">
@@ -401,7 +402,8 @@ fn BandRow(device: Device, channel: String, index: usize, selected: RwSignal<usi
     let edit5 = edit.clone();
     view! {
         <div class="band-row" class:active=active style=format!("--bc:{color}") on:click=move |_| selected.set(index)>
-            <span class="band-index">
+            // Selecting a band only changes the view (the row's controls stay guarded).
+            <span class="band-index" data-view-ok>
                 <span class="dot" style=move || format!("background:{}", if band.with(|b| b.bypass) { "var(--muted)" } else { color })></span>
                 <span class="mono">{index + 1}</span>
             </span>
@@ -897,7 +899,8 @@ pub fn PeqGraph(
             }
             let delay = |c: &str| p::delay_raw_to_ms(s.delays.get(c).copied().unwrap_or(0));
             let color = if s.model.is_input(&other) { "var(--input)" } else { "var(--output)" };
-            Some(Compared { eq: ChannelEq::of(s, &other), delay_ms: delay(&other) - delay(&ch), color })
+            // Like the shown channel: PEQ and filters, no GEQ.
+            Some(Compared { eq: ChannelEq::of(s, &other).without_geq(), delay_ms: delay(&other) - delay(&ch), color })
         })
     });
     let drawn = Memo::new(move |_| {

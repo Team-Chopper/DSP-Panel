@@ -1,9 +1,9 @@
 //! Network search for DSPs: every address of a few /24 networks is tried on
-//! TCP 9761 with the handshake and the device-info request. By default the
-//! networks are the server's own and those of the configured DSPs. A DSP
-//! takes one connection at a time, so addresses the panel is connected to are
-//! not probed; a found DSP gets the disconnect command (0x11) like from the
-//! original editor.
+//! TCP 9761 with the handshake and the device-info request, then the
+//! connection is closed (no disconnect command: if the DSP serves another
+//! controller, 0x11 might end that session). By default the networks are the
+//! server's own and those of the configured DSPs. A DSP takes one connection
+//! at a time, so addresses the panel is connected to are not probed.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -49,15 +49,45 @@ impl Default for ScanTiming {
     }
 }
 
-/// The first three octets of the IPv4 address the server reaches the LAN
-/// with (no packet is sent), if any.
-pub fn own_network() -> Option<[u8; 3]> {
+/// The server's own /24 networks: the one of the address it reaches the
+/// internet with (no packet is sent), and on Linux every directly connected
+/// /24 from the routing table – a venue LAN often has no default route.
+pub fn own_networks() -> Vec<[u8; 3]> {
+    let mut list: Vec<[u8; 3]> = default_route_network().into_iter().collect();
+    if let Ok(table) = std::fs::read_to_string("/proc/net/route") {
+        for net in connected_networks(&table) {
+            if !list.contains(&net) {
+                list.push(net);
+            }
+        }
+    }
+    list
+}
+
+fn default_route_network() -> Option<[u8; 3]> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => network_of(ip),
         _ => None,
     }
+}
+
+/// Directly connected /24 networks in a Linux /proc/net/route table
+/// (destination and mask as little-endian hex, gateway 0).
+fn connected_networks(table: &str) -> Vec<[u8; 3]> {
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok().map(|v| v.to_le_bytes());
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (dest, gateway, mask) = (hex(f.get(1)?)?, hex(f.get(2)?)?, hex(f.get(7)?)?);
+            let ip = Ipv4Addr::from(dest);
+            (gateway == [0; 4] && mask == [255, 255, 255, 0] && !ip.is_loopback() && !ip.is_unspecified())
+                .then(|| [dest[0], dest[1], dest[2]])
+        })
+        .collect()
 }
 
 fn network_of(ip: Ipv4Addr) -> Option<[u8; 3]> {
@@ -129,9 +159,6 @@ pub async fn probe(ip: Ipv4Addr, port: u16, timing: ScanTiming) -> Option<Found>
                 }
             }
         }
-        if !info.is_empty() {
-            let _ = stream.write_all(&p::build_disconnect_command()).await;
-        }
     }
     let _ = stream.shutdown().await;
     let model = DeviceModel::detect(&info).map(|m| m.id.to_string());
@@ -152,5 +179,15 @@ mod tests {
         assert_eq!(network_of_host("10.21.0.123"), Some([10, 21, 0]));
         assert_eq!(network_of_host("dsp.local"), None);
         assert_eq!(network_text([10, 21, 0]), "10.21.0.0/24");
+    }
+
+    #[test]
+    fn connected_networks_from_the_routing_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t0100150A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+            eth0\t0000150A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            eth1\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            eth2\t0000A8C0\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        assert_eq!(connected_networks(table), [[10, 21, 0], [192, 168, 1]]);
     }
 }

@@ -434,9 +434,10 @@ fn panel_data_limit_light_copy_between_dsps_and_undo() {
 
         // A network search answers the client that asked.
         a.send(json!({"t": msg::SCAN, "networks": ["not a network"]}));
-        a.wait_for(|m| m["t"] == msg::ERROR && m["message"].as_str().is_some_and(|t| t.starts_with("Not a network"))).await;
+        let failed = a.wait_for(|m| m["t"] == msg::SCAN_RESULT).await;
+        assert!(failed["error"].as_str().is_some_and(|t| t.starts_with("Not a network")), "{failed}");
         a.send(json!({"t": msg::SCAN, "networks": ["127.0.0.0/24"]}));
-        let result = a.wait_for(|m| m["t"] == msg::SCAN_RESULT).await;
+        let result = a.wait_for(|m| m["t"] == msg::SCAN_RESULT && m["error"].is_null()).await;
         assert_eq!(result["networks"], json!(["127.0.0.0/24"]));
         assert!(b.of_type(msg::SCAN_RESULT).is_empty());
 

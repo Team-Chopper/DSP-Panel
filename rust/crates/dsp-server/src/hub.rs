@@ -227,6 +227,8 @@ impl Hub {
             inner.session_tasks.insert(id, task.abort_handle());
         }
         session.set_meters_wanted(false);
+        // The limit light needs the meters of every DSP.
+        self.update_meter_polling();
         session.start();
     }
 
@@ -289,7 +291,7 @@ impl Hub {
                 }
             }
             None => {
-                networks.extend(scan::own_network());
+                networks.extend(scan::own_networks());
                 for s in self.sessions() {
                     networks.extend(scan::network_of_host(&s.config().host));
                 }
@@ -364,7 +366,8 @@ impl Hub {
         }
         let source_state = source.state();
         let source_id = source.id();
-        let mut changed = 0;
+        // Check every target before anything is changed.
+        let mut plan = Vec::new();
         for t in targets {
             let (Some(dsp), Some(ch)) = (t.get("dsp").and_then(Value::as_str), t.get("ch").and_then(Value::as_str)) else {
                 return Some("Invalid target".into());
@@ -373,13 +376,20 @@ impl Hub {
                 continue;
             }
             let Some(target) = self.session(Some(&Value::from(dsp))) else { return Some("Unknown DSP".into()) };
+            let name = target.config().name;
             if target.status() != DspStatus::Ready {
-                return Some(format!("{} is not ready", target.config().name));
+                return Some(format!("{name} is not ready"));
             }
-            let list = match ops::copy_parts(&source_state, from, &target.state(), ch, &parts) {
-                Ok(list) => list,
+            if target.test_level().is_some() {
+                return Some(format!("{name}: {}", dsp_core::api::TEST_RUNNING));
+            }
+            match ops::copy_parts(&source_state, from, &target.state(), ch, &parts) {
+                Ok(list) => plan.push((target, list)),
                 Err(e) => return Some(e),
-            };
+            }
+        }
+        let mut changed = 0;
+        for (target, list) in plan {
             for op in list {
                 if let Some(error) = target.apply_op_with(&op.to_json(), None, false) {
                     return Some(format!("{}: {error}", target.config().name));
@@ -488,7 +498,14 @@ impl Hub {
                     None => Some("on missing".into()),
                 };
             }
-            Some(msg::SCAN) => return self.start_scan(client, message),
+            // Errors of the search go to the dialog that started it.
+            Some(msg::SCAN) => {
+                if let Some(error) = self.start_scan(client, message) {
+                    let answer = json!({"t": msg::SCAN_RESULT, "found": [], "networks": [], "error": error});
+                    self.send_to(client, &answer);
+                }
+                return None;
+            }
             Some(msg::COPY_TO) => return self.copy_to(message),
             Some(msg::LIMITER_SETUP) => {
                 let Some(setup) = message.get("setup") else { return Some("setup missing".into()) };
@@ -797,6 +814,10 @@ impl Hub {
 
     fn remove_dsp(&self, message: &Value) -> Option<String> {
         let id = message.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        // The saved output gains would be lost while the outputs stay lowered.
+        if self.session(Some(&Value::from(id.as_str()))).is_some_and(|s| s.test_level().is_some()) {
+            return Some("Switch the DSP test generator off before removing the DSP".into());
+        }
         let (session, task) = {
             let mut inner = self.0.borrow_mut();
             let Some(session) = inner.sessions.shift_remove(&id) else { return Some("Unknown DSP".into()) };

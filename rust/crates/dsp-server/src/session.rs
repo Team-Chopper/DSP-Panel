@@ -1121,6 +1121,10 @@ impl DspSession {
     /// every output, then start it.
     fn start_test(&self, tone_type: i64, param: i64) -> Option<String> {
         let mut i = self.0.borrow_mut();
+        // The output gains to restore afterwards would be guesses.
+        if !i.config_readable {
+            return Some("The configuration of this DSP could not be read – the generator cannot be started safely".into());
+        }
         let id = i.config.id.clone();
         // Gains saved by a run that did not end cleanly are the real ones.
         if i.safety.test_gains(&id).is_none() {
@@ -1217,12 +1221,14 @@ impl DspSession {
 
     /// After (re)connecting: a DSP whose generator still runs goes back into
     /// the test mode; one that is back on the analog input gets its saved
-    /// output gains back.
+    /// output gains back. With an unreadable configuration the generator
+    /// state is not known: with saved gains it counts as still running.
     fn resume_test_mode(&self) {
         let mut i = self.0.borrow_mut();
         let id = i.config.id.clone();
         let saved = i.safety.test_gains(&id).is_some();
-        if i.state.test_tone_type != 0 {
+        let running = if i.config_readable { i.state.test_tone_type != 0 } else { saved };
+        if running {
             if !saved {
                 // Started by other software: save what is there now.
                 let gains = i.output_gains();
@@ -1261,6 +1267,9 @@ impl DspSession {
                 Ok(change) => change,
                 Err(e) => return Some(e),
             };
+            if let Some(error) = change.added.iter().find_map(|s| i.copy_over_cap(master, s)) {
+                return Some(error);
+            }
             let proto = i.proto();
             let mut frames = Vec::new();
             for s in &change.added {
@@ -1309,6 +1318,9 @@ impl DspSession {
             if targets.iter().any(|t| t == from) {
                 return Some(format!("{from} cannot be copied to itself"));
             }
+            if let Some(error) = targets.iter().find_map(|t| i.copy_over_cap(from, t)) {
+                return Some(error);
+            }
             let proto = i.proto();
             let mut frames = Vec::new();
             for to in targets {
@@ -1351,10 +1363,10 @@ impl DspSession {
     /// editor's order). The values before are kept for [undo_load]; the
     /// configuration is read back afterwards and compared with [target].
     pub fn apply_full_state(&self, target: &DeviceState, label: &str) -> Option<String> {
-        self.load_state(target, label, true)
+        self.load_state(target, label, &format!("\"{label}\""), true)
     }
 
-    /// Back to the values before the last preset load.
+    /// Back to the values (and the preset name) before the last preset load.
     pub fn undo_load(&self) -> Option<String> {
         let (label, state) = {
             let mut i = self.0.borrow_mut();
@@ -1366,7 +1378,8 @@ impl DspSession {
                 None => return Some("Nothing to undo".into()),
             }
         };
-        let error = self.load_state(&state, &label, false);
+        let name = state.current_preset.clone();
+        let error = self.load_state(&state, &name, &format!("Undo ({label})"), false);
         if error.is_some() {
             self.0.borrow_mut().undo.push((label, state));
         } else {
@@ -1375,9 +1388,11 @@ impl DspSession {
         error
     }
 
-    fn load_state(&self, target: &DeviceState, label: &str, keep_undo: bool) -> Option<String> {
-        let (list, all) = {
-            let mut i = self.0.borrow_mut();
+    /// [name]: the preset name sent with 0x26 and shown as the current one;
+    /// [what]: how the messages call this load.
+    fn load_state(&self, target: &DeviceState, name: &str, what: &str, keep_undo: bool) -> Option<String> {
+        {
+            let i = self.0.borrow();
             if i.status != DspStatus::Ready {
                 return Some("DSP is not ready".into());
             }
@@ -1390,34 +1405,51 @@ impl DspSession {
                     target.model.name, i.state.model.name
                 ));
             }
-            // The preset's gains stay within the max levels too.
-            let mut target = target.clone();
-            for (ch, db) in target.gains.clone() {
-                target.gains.insert(ch.clone(), i.capped_gain(&ch, db));
-            }
-            if keep_undo && i.config_readable {
-                let before = format!("Before \"{label}\"");
-                let state = i.state.clone();
-                i.undo.push((before, state));
-                if i.undo.len() > MAX_UNDO {
-                    i.undo.remove(0);
-                }
-            }
-            i.pending_ops.clear();
-            i.batch.clear();
-            match diff::changes(&i.state, &target) {
-                Some(list) => (list, target),
-                None => (ops::full_state(&target), target),
-            }
-        };
-        let label = label.to_string();
+        }
+        let (target, name, what) = (target.clone(), name.to_string(), what.to_string());
         let s = self.clone();
-        let job_label = format!("Loading \"{label}\" …");
+        let job_label = format!("Loading {what} …");
+        // Runs after the queued changes reached the device, so the difference
+        // is taken against what the device really has.
         let body = async move {
+            let (list, all) = {
+                let mut i = s.0.borrow_mut();
+                let mut target = target;
+                // The preset's gains stay within the max levels too.
+                for (ch, db) in target.gains.clone() {
+                    target.gains.insert(ch.clone(), i.capped_gain(&ch, db));
+                }
+                // Mute all stays on: everything is loaded muted, and its release
+                // opens what the preset has open.
+                if i.safety.mute_all() {
+                    let model = target.model;
+                    let open: Vec<String> = model
+                        .channels()
+                        .filter(|c| !target.mutes.get(*c).copied().unwrap_or(false))
+                        .map(String::from)
+                        .collect();
+                    let id = i.config.id.clone();
+                    i.safety.set_unmute_list(&id, open);
+                    for ch in model.channels() {
+                        target.mutes.insert(ch.to_string(), true);
+                    }
+                }
+                if keep_undo && i.config_readable {
+                    let state = i.state.clone();
+                    i.undo.push((format!("Before {what}"), state));
+                    if i.undo.len() > MAX_UNDO {
+                        i.undo.remove(0);
+                    }
+                    i.emit(SessionEvent::InfoChanged);
+                }
+                // Unknown values on the device (unreadable configuration): send all.
+                let changes = if i.config_readable { diff::changes(&i.state, &target) } else { None };
+                (changes.unwrap_or_else(|| ops::full_state(&target)), target)
+            };
             let conn = s.conn_id();
             let chunks = ConfigDump::new(s.model()).chunk_count();
             let mut steps = StepCounter { total: list.len() + 2 + chunks, done: 0, status: DspStatus::Busy };
-            s.require(conn, p::build_store_preset_name_command(&label), None).await?;
+            s.require(conn, p::build_store_preset_name_command(&name), None).await?;
             s.step(&mut steps);
             for op in &list {
                 let frames = {
@@ -1447,17 +1479,17 @@ impl DspSession {
                 }
                 Err(_) => false,
             };
-            i.state.current_preset = label.clone();
+            i.state.current_preset = name.clone();
             i.emit(SessionEvent::StateReplaced);
-            i.add_status_log(format!("\"{label}\" loaded ({} changed settings)", list.len()));
+            i.add_status_log(format!("{what} loaded ({} changed settings)", list.len()));
             if read_back {
                 let missing = diff::mismatches(&all, &i.state);
                 if missing.is_empty() {
-                    i.emit(SessionEvent::Notice { text: format!("\"{label}\" loaded and checked"), error: false });
+                    i.emit(SessionEvent::Notice { text: format!("{what} loaded and checked"), error: false });
                 } else {
                     let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
                     let text = format!(
-                        "\"{label}\": {} value{} did not take: {}{}",
+                        "{what}: {} value{} did not take: {}{}",
                         missing.len(),
                         if missing.len() == 1 { "" } else { "s" },
                         shown.join(", "),
@@ -1469,8 +1501,7 @@ impl DspSession {
             }
             Ok(())
         };
-        self.spawn_exclusive_job(job_label, false, body);
-        self.0.borrow_mut().emit(SessionEvent::InfoChanged);
+        self.spawn_exclusive_job(job_label, true, body);
         None
     }
 
@@ -1505,6 +1536,52 @@ impl DspSession {
                 s.0.borrow_mut().state.current_preset_number = index + 1;
                 let stream = s.read_config(conn, &mut steps).await?;
                 s.apply_dump(&stream);
+                // During mute all, releasing it opens what the loaded preset
+                // has open (the hub mutes those again when the job ends).
+                {
+                    let i = s.0.borrow();
+                    if i.safety.mute_all() && i.config_readable {
+                        let open: Vec<String> = i
+                            .state
+                            .model
+                            .channels()
+                            .filter(|c| !i.state.mutes.get(*c).copied().unwrap_or(false))
+                            .map(String::from)
+                            .collect();
+                        i.safety.set_unmute_list(&i.config.id, open);
+                    }
+                }
+                // The preset comes from the DSP's memory: bring channels above
+                // their max level down to it.
+                let over: Vec<(String, f64)> = {
+                    let i = s.0.borrow();
+                    if !i.config_readable {
+                        Vec::new()
+                    } else {
+                        i.state
+                            .model
+                            .channels()
+                            .filter_map(|c| {
+                                let cap = ops::group_cap(&i.state, &i.config.gain_caps, c)?;
+                                let gain = i.state.gains.get(c).copied().unwrap_or(0.0);
+                                (gain > cap).then(|| (c.to_string(), cap))
+                            })
+                            .collect()
+                    }
+                };
+                for (ch, cap) in &over {
+                    let frames = s.0.borrow_mut().apply_now(&Op::gain(ch, *cap))?;
+                    for frame in frames {
+                        s.require(conn, frame, None).await?;
+                    }
+                }
+                if !over.is_empty() {
+                    let list: Vec<String> = over.iter().map(|(c, cap)| format!("{c} to {cap} dB")).collect();
+                    let text = format!("Max level: lowered {} after loading {label}", list.join(", "));
+                    let mut i = s.0.borrow_mut();
+                    i.add_status_log(text.clone());
+                    i.emit(SessionEvent::Notice { text, error: false });
+                }
                 for _ in 0..2 {
                     s.optional(conn, p::build_heartbeat_command()).await?;
                     s.step(&mut steps);
@@ -1663,10 +1740,22 @@ impl Inner {
         }
     }
 
-    /// [db] for [ch] within the channel's max level.
+    /// [db] for [ch] within the channel's max level. With an unreadable
+    /// configuration the current gain is not known: the cap alone counts.
     fn capped_gain(&self, ch: &str, db: f64) -> f64 {
-        let current = self.state.gains.get(ch).copied().unwrap_or(0.0);
+        let current =
+            if self.config_readable { self.state.gains.get(ch).copied().unwrap_or(0.0) } else { f64::NEG_INFINITY };
         ops::capped_gain(db, current, ops::group_cap(&self.state, &self.config.gain_caps, ch))
+    }
+
+    /// Why the device copy (0x2A) of [from] onto [to] is refused: it would set
+    /// [to] above its max level.
+    fn copy_over_cap(&self, from: &str, to: &str) -> Option<String> {
+        let gain = self.state.gains.get(from).copied().unwrap_or(0.0);
+        let capped = self.capped_gain(to, gain);
+        (capped < gain).then(|| {
+            format!("{to} has a max level of {capped} dB, {from} is at {gain} dB – lower {from} or the max level first")
+        })
     }
 
     fn output_gains(&self) -> BTreeMap<String, f64> {

@@ -22,7 +22,7 @@ async fn a_dsp_answers_with_its_model_and_free_ports_are_skipped() {
         found,
         Some(Found { host: "127.0.0.1".into(), port, info: "DSP204 V0104P".into(), model: Some("dsp204".into()) })
     );
-    // The fake got the disconnect and accepts the next connection.
+    // The connection was closed: the fake accepts the next one.
     assert!(probe(Ipv4Addr::LOCALHOST, port, timing()).await.is_some());
     fake.stop().await;
     assert_eq!(probe(Ipv4Addr::LOCALHOST, port, timing()).await, None);

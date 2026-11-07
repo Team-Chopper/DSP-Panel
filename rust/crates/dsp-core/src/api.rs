@@ -53,7 +53,8 @@
 //! Server → client
 //!   {t: hello,      dsps: [DspInfo], muteAll, panel}
 //!   {t: panel,      data}                     panel data changed
-//!   {t: scanResult, found: [{host, port, info, model}], networks: [..]}
+//!   {t: scanResult, found: [{host, port, info, model, known, connected}],
+//!                   networks: [..], error?}  answer to scan, only to the asking client
 //!   {t: notice,     dsp?, message, error}     result of a job (e.g. values a load missed)
 //!   {t: dspInfo,    info: DspInfo}        added or changed
 //!   {t: dspRemoved, id}

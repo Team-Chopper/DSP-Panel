@@ -280,7 +280,7 @@ fn RangeMenu(chosen: RwSignal<Option<f64>>, current: Signal<f64>, unit: Memo<Uni
         view! { {auto}{fixed} }
     };
     view! {
-        <label class="range-menu" title="Range of the speakers and faders">
+        <label class="range-menu" data-view-ok title="Range of the speakers and faders">
             <Icon icon=I::ZoomIn size=14/>
             <select class="mono" on:change=move |ev| {
                 let value = event_target_value(&ev);

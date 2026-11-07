@@ -4,10 +4,10 @@
 //! server does not know it).
 //!
 //! One capture-phase filter on the window swallows the events that change
-//! something inside the page content and the DSP actions (presets, connect)
-//! before any handler sees them. Allowed are navigation (sections, channel
-//! chips), whatever carries `data-view-ok`, the header (DSP tabs, menu, mute
-//! all) and dialogs.
+//! something inside the page content and the DSP actions (presets, connect,
+//! stopping the DSP generator) before any handler sees them. Allowed are
+//! navigation (sections, channel chips), whatever carries `data-view-ok`, the
+//! header (DSP tabs, menu, mute all) and dialogs.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -16,8 +16,9 @@ use web_sys::{Element, Event, KeyboardEvent};
 
 use crate::store::app;
 
-/// Where events are swallowed in view-only mode …
-const GUARDED: &str = ".page, .section-bar .btn";
+/// Where events are swallowed in view-only mode (page content, presets and
+/// connect/disconnect, stopping the DSP generator) …
+const GUARDED: &str = ".page, .section-bar .btn, .connect-overlay .btn, .test-banner .btn";
 /// … except here.
 const ALLOWED: &str = "[data-view-ok], .channel-selector, .section-button";
 

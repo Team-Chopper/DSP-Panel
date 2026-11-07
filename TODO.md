@@ -100,7 +100,9 @@ now and how to capture what is missing.
 - USB HID (VID 0x0168, PID 0x0821) and serial. The panel only talks TCP port
   9761; its network search (Rust, since 1.0.0-alpha.3) probes that port on
   the /24 networks of the server and of the configured DSPs (handshake and
-  device info, then 0x11), not the editor's UDP discovery. *From the other
+  device info, then the connection is closed without 0x11), not the editor's
+  UDP discovery. *Check on hardware:* what a DSP does with such a short
+  connection while another controller is connected to it. *From the other
   project, tested on a DSP 204 (macOS):* every HID report carries one frame
   from byte 0, sent with report ID 0 and zero-padded to 64 bytes; the frames
   are the same as on TCP.

@@ -516,9 +516,12 @@ fn time_row(
         .filter(|m| *m >= min_ms as f64 && *m <= max_ms as f64)
         .collect();
     let fader = view! {
+        // Steps in whole ms that grow with the time: a step of the log travel
+        // would round back to the same ms at short times.
         <Fader vertical=false value=Signal::derive(move || ms.get().clamp(min_ms, max_ms) as f64)
             taper=Taper::Log(min_ms as f64, max_ms as f64) marks=marks
             label={time_label as fn(f64) -> String} color=color
+            step=Signal::derive(move || match ms.get() { v if v < 100 => 1.0, v if v < 1000 => 10.0, _ => 100.0 })
             reset=p::time_raw_to_ms(default_raw) as f64 on_change=Callback::new(put)/>
     }
     .into_any();

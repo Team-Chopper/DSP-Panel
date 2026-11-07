@@ -110,6 +110,8 @@ pub struct FoundDsp {
 pub struct ScanResult {
     pub found: Vec<FoundDsp>,
     pub networks: Vec<String>,
+    /// Why the search did not run (e.g. not a network).
+    pub error: Option<String>,
 }
 
 pub fn app() -> App {
@@ -209,50 +211,77 @@ impl App {
     }
 
     /// Mute every channel of every DSP, or release (the server unmutes only
-    /// what was open before).
+    /// what was open before). The button follows the server's answer, so it
+    /// never shows "muted" when the message did not get through.
     pub fn set_mute_all(&self, on: bool) {
-        self.mute_all.set(on);
-        send(json!({"t": msg::MUTE_ALL, "on": on}));
+        if self.require_connection() {
+            send(json!({"t": msg::MUTE_ALL, "on": on}));
+        }
+    }
+
+    /// False (with an error toast) while the server is not connected: a
+    /// message sent now would be lost.
+    fn require_connection(&self) -> bool {
+        let connected = self.server.get_untracked() == ServerState::Connected;
+        if !connected {
+            self.toast("No connection to the server – nothing was changed", true);
+        }
+        connected
     }
 
     // ─── Panel data, several DSPs ───
 
     /// Search the LAN for DSPs; [networks] empty: the server's own network
     /// and those of the configured DSPs.
-    pub fn scan_network(&self, networks: &[String]) {
+    /// False if it could not be sent (no connection).
+    pub fn scan_network(&self, networks: &[String]) -> bool {
+        if !self.require_connection() {
+            return false;
+        }
         self.scan.set(None);
         let mut message = json!({"t": msg::SCAN});
         if !networks.is_empty() {
             message["networks"] = json!(networks);
         }
         send(message);
+        true
     }
 
     pub fn set_limiter_setup(&self, setup: LimiterSetup) {
-        self.panel.update(|p| p.limiter = setup.clone());
-        send(json!({"t": msg::LIMITER_SETUP, "setup": setup}));
+        if self.require_connection() {
+            self.panel.update(|p| p.limiter = setup.clone());
+            send(json!({"t": msg::LIMITER_SETUP, "setup": setup}));
+        }
     }
 
     /// Name a link group of [dsp] ("" removes the name).
     pub fn set_link_name(&self, dsp: &str, members: &[String], name: &str) {
-        send(json!({"t": msg::LINK_NAME, "dsp": dsp, "members": members, "name": name}));
+        if self.require_connection() {
+            send(json!({"t": msg::LINK_NAME, "dsp": dsp, "members": members, "name": name}));
+        }
     }
 
     pub fn set_light_settings(&self, settings: LightSettings) {
-        self.panel.update(|p| p.light = settings.clone());
-        send(json!({"t": msg::LIGHT_SETTINGS, "settings": settings}));
+        if self.require_connection() {
+            self.panel.update(|p| p.light = settings.clone());
+            send(json!({"t": msg::LIGHT_SETTINGS, "settings": settings}));
+        }
     }
 
     /// Copy [parts] (api::COPY_PARTS) of [from] on [dsp] to [targets] (DSP id,
     /// channel), also on other DSPs.
     pub fn copy_to(&self, dsp: &str, from: &str, parts: &[String], targets: &[(String, String)]) {
-        let targets: Vec<Value> = targets.iter().map(|(d, c)| json!({"dsp": d, "ch": c})).collect();
-        send(json!({"t": msg::COPY_TO, "dsp": dsp, "from": from, "parts": parts, "targets": targets}));
+        if self.require_connection() {
+            let targets: Vec<Value> = targets.iter().map(|(d, c)| json!({"dsp": d, "ch": c})).collect();
+            send(json!({"t": msg::COPY_TO, "dsp": dsp, "from": from, "parts": parts, "targets": targets}));
+        }
     }
 
     /// Back to the values before the last preset load on [dsp].
     pub fn undo_preset_load(&self, dsp: &str) {
-        send(json!({"t": msg::PRESET_UNDO, "dsp": dsp}));
+        if self.require_connection() {
+            send(json!({"t": msg::PRESET_UNDO, "dsp": dsp}));
+        }
     }
 
     // ─── Server presets ───
@@ -456,7 +485,8 @@ impl App {
                     message.get("found").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
                 let networks: Vec<String> =
                     message.get("networks").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default();
-                self.scan.set(Some(ScanResult { found, networks }));
+                let error = message.get("error").and_then(Value::as_str).map(String::from);
+                self.scan.set(Some(ScanResult { found, networks, error }));
             }
             _ => {}
         }
@@ -743,7 +773,8 @@ impl Device {
         if let Some(t) = edit.peq_type
             && t != b.peq_type {
                 b.peq_type = t;
-                if p::max_q_raw_for_type(t) < p::Q_RAW_MAX {
+                // Like the original editor – unless the edit brings its own Q.
+                if p::max_q_raw_for_type(t) < p::Q_RAW_MAX && edit.q_raw.is_none() {
                     b.q_raw = p::Q_RAW_TYPE_RESET;
                 }
             }

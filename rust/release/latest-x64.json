@@ -1,11 +1,11 @@
 {
     "name":  "dsp-panel-rs",
-    "version":  "1.0.0-alpha.2",
+    "version":  "1.0.0-alpha.3",
     "arch":  "x64",
     "file":  "dsp-panel-rs-linux-x64.tar.gz",
-    "folder":  "dsp-panel-rs-1.0.0-alpha.2-linux-x64",
-    "sha256":  "d7cca26275f95b9ffad50803c880b0b25ce44d422f2c9786a77a03fd149618b3",
-    "size":  4418259,
-    "built":  "2026-10-23T03:49:09Z",
+    "folder":  "dsp-panel-rs-1.0.0-alpha.3-linux-x64",
+    "sha256":  "50a8736a8cf5aab25a9c97d1a591c9b651531411767f2f195cde380ebd7c1a8b",
+    "size":  4845921,
+    "built":  "2026-11-06T12:25:10Z",
     "install":  "sudo bash install.sh [--import-from /var/lib/dsp-panel]"
 }

@@ -620,6 +620,49 @@ fn a_server_preset_sends_what_differs_reads_back_and_can_be_undone() {
 }
 
 #[test]
+fn a_preset_loaded_during_mute_all_stays_muted_and_the_release_opens_what_it_has_open() {
+    run(async {
+        let fake = fake(DeviceModel::DSP206).await;
+        let safety = dsp_server::safety::SafetyStore::memory();
+        safety.set_mute_all(true);
+        safety.set_unmute_list("test", vec!["Out 1".into(), "Out 2".into()]);
+        let s = DspSession::with_safety(config(&fake, 300, "auto"), timing(), safety.clone());
+        s.start();
+        wait_for(&s, || s.status() == DspStatus::Ready).await;
+        let mut target = s.state();
+        for ch in DeviceModel::DSP206.channels() {
+            ops::apply(&mut target, &Op::mute(ch, ch == "Out 1"));
+        }
+        assert_eq!(s.apply_full_state(&target, "Hall"), None);
+        wait_for_within(&s, Duration::from_secs(30), || s.status() == DspStatus::Ready).await;
+        assert!(fake.device().state.mutes.values().all(|m| *m), "everything stays muted");
+        let list = safety.unmute_list("test");
+        assert!(!list.contains(&"Out 1".to_string()), "muted in the preset");
+        assert!(list.contains(&"Out 2".to_string()) && list.contains(&"In A".to_string()));
+        s.dispose().await;
+    });
+}
+
+#[test]
+fn the_device_copy_does_not_go_above_a_max_level() {
+    run(async {
+        let fake = fake(DeviceModel::DSP408).await;
+        let s = session(&fake, 300);
+        s.start();
+        wait_for(&s, || s.status() == DspStatus::Ready).await;
+        assert_eq!(s.apply_op(&op(&Op::gain("Out 3", 0.0)), None), None);
+        assert_eq!(s.apply_op(&op(&Op::gain("Out 4", -20.0)), None), None);
+        assert_eq!(s.set_gain_cap("Out 4", Some(-10.0)), None);
+        let error = s.copy_channels("Out 3", &["Out 4".to_string()]).unwrap();
+        assert!(error.contains("max level"), "{error}");
+        assert!(s.link_channels("Out 3", &["Out 4".to_string()]).is_some());
+        assert_eq!(s.set_gain_cap("Out 4", None), None);
+        assert_eq!(s.copy_channels("Out 3", &["Out 4".to_string()]), None);
+        s.dispose().await;
+    });
+}
+
+#[test]
 fn a_server_preset_with_other_links_is_loaded_like_a_preset_file() {
     run(async {
         let fake = fake(DeviceModel::DSP408).await;

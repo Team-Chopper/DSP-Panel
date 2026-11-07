@@ -44,6 +44,12 @@
     events.onmessage = (e) => { try { show(JSON.parse(e.data)); } catch (_) {} };
     events.onerror = () => {
       body.className = ""; word.textContent = "—"; text.textContent = "No connection to the panel server.";
+      // The browser gives up after an error answer (page switched off, too
+      // many pages): try again in a few seconds.
+      if (events.readyState === EventSource.CLOSED) {
+        events.close();
+        setTimeout(connect, 5000);
+      }
     };
   }
   connect();

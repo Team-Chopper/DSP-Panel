@@ -114,12 +114,9 @@ pub fn DspDialog(initial: Option<DspInfo>, on_close: Callback<()>) -> impl IntoV
     let scan_invalid = RwSignal::new(false);
     // A search was started from this dialog; its result arrives in app.scan.
     let scan_requested = RwSignal::new(false);
+    // No answer at all (the server's own errors come with the result).
     let scan_error = RwSignal::new(None::<String>);
     let scan_seq = RwSignal::new(0u32);
-    // Newest toast before the search and the error of the previous search: an
-    // error the server answers with arrives as a toast (a repeated text is not
-    // shown twice, so a visible one with the same text counts too).
-    let scan_mark = StoredValue::new((0u64, None::<String>));
     let searching = move || scan_requested.get() && app.scan.with(Option::is_none) && scan_error.with(Option::is_none);
     let search = move || {
         let Some(networks) = typed_networks(&scan_text.get_untracked()) else {
@@ -127,13 +124,13 @@ pub fn DspDialog(initial: Option<DspInfo>, on_close: Callback<()>) -> impl IntoV
             return;
         };
         scan_invalid.set(false);
-        let newest = app.toasts.with_untracked(|t| t.iter().map(|x| x.id).max().unwrap_or(0));
-        scan_mark.set_value((newest, scan_error.get_untracked()));
+        if !app.scan_network(&networks) {
+            return;
+        }
         scan_error.set(None);
         let seq = scan_seq.get_untracked() + 1;
         scan_seq.set(seq);
         scan_requested.set(true);
-        app.scan_network(&networks);
         // A search of four networks takes about 30 s at most.
         set_timeout(
             move || {
@@ -148,27 +145,14 @@ pub fn DspDialog(initial: Option<DspInfo>, on_close: Callback<()>) -> impl IntoV
             Duration::from_secs(60),
         );
     };
-    if adding {
-        Effect::new(move |_| {
-            if !scan_requested.get() || app.scan.with(Option::is_some) || scan_error.with(Option::is_some) {
-                return;
-            }
-            let (newest, previous) = scan_mark.get_value();
-            let error = app.toasts.with(|t| {
-                t.iter()
-                    .find(|x| x.error && (x.id > newest || previous.as_ref() == Some(&x.text)))
-                    .map(|x| x.text.clone())
-            });
-            if error.is_some() {
-                scan_error.set(error);
-            }
-        });
-    }
     let scan_results = move || {
         if !scan_requested.get() {
             return ().into_any();
         }
         if let Some(result) = app.scan.get() {
+            if let Some(error) = result.error {
+                return view! { <div class="scan-status error">{error}</div> }.into_any();
+            }
             return scan_list(result, name, host, port, model).into_any();
         }
         match scan_error.get() {
@@ -198,7 +182,9 @@ pub fn DspDialog(initial: Option<DspInfo>, on_close: Callback<()>) -> impl IntoV
                                 }
                             }/>
                     </div>
-                    <button type="button" class="btn outlined" prop:disabled=searching on:click=move |_| search()>
+                    <button type="button" class="btn outlined" prop:disabled=searching on:click=move |_| search()
+                        title="Connects briefly to every address on TCP port 9761. A DSP that other control software \
+                               is connected to may drop that connection – search before the show, not during it.">
                         <Icon icon=I::Search size=18/>"Search network"
                     </button>
                 </div>
@@ -674,22 +660,25 @@ fn store_copy_parts(input: bool, parts: &BTreeSet<String>) {
 }
 
 /// The channels of the kind of [from] (inputs or outputs) on every DSP that is
-/// ready, the DSP [source] first; [from] itself is left out.
+/// ready, the DSP [source] first; [from] itself is left out. The channels come
+/// from the model the server reports (the client only holds the state of the
+/// DSPs it showed); the names from that state where it matches the model.
 fn copy_targets(app: App, source: &str, from: &str, input: bool) -> Vec<CopyTargets> {
     let mut ids = app.dsps.get();
     ids.sort_by_key(|id| id.as_str() != source);
     ids.iter()
         .filter_map(|id| {
             let device = app.device(id)?;
-            let (ready, name) = device.info.with(|i| (i.status == DspStatus::Ready, i.name.clone()));
+            let (ready, name, model) =
+                device.info.with(|i| (i.status == DspStatus::Ready, i.name.clone(), DeviceModel::by_id(Some(&i.model))));
             if !ready {
                 return None;
             }
             let channels: Vec<(String, String)> = device.state.with(|s| {
-                s.model
+                model
                     .channels()
-                    .filter(|c| s.model.is_input(c) == input && !(id.as_str() == source && *c == from))
-                    .map(|c| (c.to_string(), alias_in(s, c)))
+                    .filter(|c| model.is_input(c) == input && !(id.as_str() == source && *c == from))
+                    .map(|c| (c.to_string(), if s.model == model { alias_in(s, c) } else { c.to_string() }))
                     .collect()
             });
             (!channels.is_empty()).then(|| CopyTargets { dsp: id.clone(), name, channels })
