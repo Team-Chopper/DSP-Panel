@@ -1,5 +1,0 @@
-/target
-/dist
-/crates/dsp-web/dist
-/tool/parity/.dart_tool
-/tool/parity/pubspec.lock

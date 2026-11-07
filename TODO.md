@@ -20,9 +20,11 @@ now and how to capture what is missing.
 5. Inspect the capture with the decoder of this repository:
 
    ```
-   cd packages/dsp_core
-   dart run tool/inspect_capture.dart <capture.txt> [--model dsp206]
+   cargo run -p dsp-core --bin inspect-capture -- <capture.txt> [--model dsp206]
    ```
+
+   (The old Dart decoder does the same: `cd dart/packages/dsp_core`,
+   `dart run tool/inspect_capture.dart …`.)
 
    It prints every frame, decodes a config dump if the capture contains one,
    lists implausible values and shows the unknown words of every channel
@@ -32,7 +34,7 @@ now and how to capture what is missing.
 
 - [x] **Config dump layout and length** (928 bytes, 19 chunks), from the 206
       editor. *Still worth a capture:* connect the 206 editor and run
-      `inspect_capture.dart --model dsp206` to see it on hardware.
+      `inspect-capture --model dsp206` to see it on hardware.
 - [ ] **Startup answers** 0x2C (lock/PTS status), 0x22 (slot table) and 0x14
       (current preset): does the 206 answer them like the 408? The panel
       tolerates missing answers.
@@ -116,8 +118,8 @@ now and how to capture what is missing.
 - "The other project": an independent open-source control app for the DSP
   204/408 (MIT, November 2026). Its protocol notes include measurements on a
   real DSP 204 (firmware V0104P); its DSP 408 and 206 support is untested.
-- Captures of a DSP 408 in this repository: `analyze_pcap.py`
+- Captures of a DSP 408 in this repository (in `dart/`): `analyze_pcap.py`
   ("Default Preset" dump), `pcap_error.txt` (full session with the "Test"
   preset), `analyze2.py`–`analyze5.py` ("Forest" preset, partially
-  mis-transcribed). The usable ones are in
-  `packages/dsp_core/lib/src/testing/captured_config.dart`.
+  mis-transcribed). The usable ones are in `crates/dsp-core/src/testing.rs`
+  (and `dart/packages/dsp_core/lib/src/testing/captured_config.dart`).

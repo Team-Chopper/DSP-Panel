@@ -1,28 +1,30 @@
-# DSP web panel – server configuration
-# Installed as /etc/dsp-panel/config.yaml. Restart after changes:
-#   sudo systemctl restart dsp-panel
+# DSP web panel (Rust) – server configuration
+# Installed as /etc/dsp-panel-rs/config.yaml. Restart after changes:
+#   sudo systemctl restart dsp-panel-rs
+# Same format as the Dart server's /etc/dsp-panel/config.yaml.
 
 listen:
   # 0.0.0.0 = all network interfaces
   address: 0.0.0.0
-  # 443 also works (the service is allowed to bind privileged ports)
-  port: 8443
+  # 8444 so it runs next to the Dart panel on 8443; 443 also works
+  port: 8444
 
 tls:
   # HTTPS is required for the RTA microphone in the browser (except on localhost).
   enabled: true
-  # install.sh creates a self-signed certificate here. Replace the files with
-  # your own certificate to avoid the browser warning.
-  cert: /var/lib/dsp-panel/tls/cert.pem
-  key: /var/lib/dsp-panel/tls/key.pem
+  # install.sh creates a self-signed certificate here (or imports the one of
+  # the Dart installation). Replace the files with your own certificate to
+  # avoid the browser warning.
+  cert: /var/lib/dsp-panel-rs/tls/cert.pem
+  key: /var/lib/dsp-panel-rs/tls/key.pem
 
 auth:
-  # true: login with the panel password (set it with: sudo dsp-panel-passwd)
+  # true: login with the panel password (set it with: sudo dsp-panel-rs-passwd)
   # false: everyone who can reach the server can control the DSPs
   enabled: true
 
-# DSP list, password hash and session key
-data_dir: /var/lib/dsp-panel
+# DSP list, presets, password hash and session key
+data_dir: /var/lib/dsp-panel-rs
 
-# Flutter web client
-web_root: /opt/dsp-panel/web
+# Web client
+web_root: /opt/dsp-panel-rs/web

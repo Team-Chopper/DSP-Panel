@@ -833,10 +833,15 @@ since when each part is used.
   checked is 0.4.0.
 
 **Code locations:** the protocol code lives in
-[`packages/dsp_core/lib/src/protocol_service.dart`](packages/dsp_core/lib/src/protocol_service.dart),
-[`config_dump.dart`](packages/dsp_core/lib/src/config_dump.dart),
-[`device_ops.dart`](packages/dsp_core/lib/src/device_ops.dart) and
-[`server/lib/src/dsp_session.dart`](server/lib/src/dsp_session.dart).
+[`crates/dsp-core/src/protocol.rs`](crates/dsp-core/src/protocol.rs),
+[`config_dump.rs`](crates/dsp-core/src/config_dump.rs),
+[`ops.rs`](crates/dsp-core/src/ops.rs) and
+[`crates/dsp-server/src/session.rs`](crates/dsp-server/src/session.rs); in the
+old Dart version (`dart/`, behaviour of 0.9.0) in
+[`protocol_service.dart`](dart/packages/dsp_core/lib/src/protocol_service.dart),
+[`config_dump.dart`](dart/packages/dsp_core/lib/src/config_dump.dart),
+[`device_ops.dart`](dart/packages/dsp_core/lib/src/device_ops.dart) and
+[`dsp_session.dart`](dart/server/lib/src/dsp_session.dart).
 
 ### 15.1 Used the same way
 

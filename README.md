@@ -1,165 +1,165 @@
-# dsp-408-ui
+# DSP Panel
 
-This application presents a neat and easy way to interface with the t.racks 408 Digital Signal Processor
-(DSP). This software communicates over the local intranet and mimics communications sent by the t.racks
-DSP Processor Editor software provided by Thomann. The goal is to turn one of the cheapest and most
-versatile pieces of live music hardware into something that is capable of having robust mixing
-functionality over a wide array of platforms.
+A browser panel for the **DSP 408, DSP 206 and DSP 204** loudspeaker processors, built for live sound on a
+venue network. One small server holds the connections to any number of DSPs; every phone, tablet or laptop on
+the network opens the panel in the browser and controls all DSPs at once. Every change is shown live on all
+devices.
 
-The DSPs are controlled through a **web panel**: a small server (for example on an Ubuntu VM) holds the
-connections to any number of DSPs, and every browser on the network can open the panel and manage the
-DSPs in tabs. All browsers see the same state live.
+- **Works offline.** Fonts and the WebAssembly client come from the panel server – no internet, no CDN.
+- **Server-authoritative.** Only the server talks to the DSPs (TCP 9761); browsers talk to the server over
+  one WebSocket.
+- **Fast.** Rust server, Rust/WebAssembly client with fine-grained updates: faders and meters stay smooth on
+  phones and in Firefox.
+- **Secure by default.** HTTPS with a self-signed certificate, password login (can be switched off for a
+  closed network).
 
 ```
-Browser (Flutter web) ──HTTPS/WebSocket──▶ dsp-server ──TCP 9761──▶ DSP 1
-Browser (Flutter web) ──────────────────▶            ──TCP 9761──▶ DSP 2 …
+Phone / tablet / laptop ──HTTPS + WebSocket──▶ dsp-server ──TCP 9761──▶ DSP 1
+                                                           ──TCP 9761──▶ DSP 2 …
 ```
-
-<img src="image.png" width="600">
-
-<img src="image-1.png" width="600">
-
-<img src="image-2.png" width="600">
-
-## Supported Platforms
-
-**Server:** Linux x64/arm64 (tested on Ubuntu), runs as a systemd service.
-
-**Panel:** any current desktop or mobile browser. The panel works without internet access – everything
-(fonts, Flutter engine) is served by the panel server.
-
-**Devices** (detected automatically, or chosen per DSP):
-- t.racks DSP 408 (4 in / 8 out)
-- t.racks DSP 206 (2 in / 6 out) – protocol from the
-  [FlexiFlizz project](https://github.com/FlexiFlizz/t.racks-DSP-control); the configuration layout
-  comes from the original 206 editor, see [PROTOCOL-RE.md](PROTOCOL-RE.md)
-- t.racks DSP 204 (probably doesn't work yet--will work on this later)
-
-The native apps (Windows, Android, …) in this repository are not adapted to the panel server.
 
 ## Features
 
-Both models, every input and output, one tab per area (Gain · EQ · GEQ · Gate · Comp · Limit · Matrix ·
-Delay · RTA). All faders look like console faders (dB scale, ridged cap) and every value can be typed in
-directly.
+**Every page for every DSP** – one tab per DSP, sections Gain · EQ · GEQ · Gate · Comp · Limit · Matrix ·
+Delay · RTA. Console-style faders (drag, wheel, arrow keys, −/+ steppers with auto-repeat, double-click to
+reset, Shift for fine moves, haptic tick at 0 dB on phones); every value can also be typed.
 
-- **Gain:** EQ overview of all channels above the faders (each EQ block exactly as wide as its fader block;
-  every curve can be hidden with a checkbox, remembered per browser), faders with dB scale, mute and phase –
-  inputs left, outputs right. Segmented level meters in dBFS (dim until the signal lights them up) with peak
-  hold, clip indicator and the limiter status reported by the DSP, polled every 300 ms like the original editor
-  (adjustable) while the DSP is shown
-- **EQ:** channel selection In A … Out 8, PEQ graph over the full width (drag the points, scroll for Q),
-  table of all bands (8 per input, 9 per output) with Freq/Q/Gain faders for the selected band, HPF and LPF
-  (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct) with bypass, EQ bypass for the whole channel, and the
-  channel gain. Frequency, Q and their limits follow the original editor; the PEQ curves are drawn with the same
-  formulas as the original editor (biquads at 48 kHz); bypassed bands show a dashed preview
-- **GEQ** (31 bands, inputs): curve with one fader per band right below its point, bypass, RTA overlay and
-  **Auto-EQ** (measure pink noise with a microphone, review the proposed correction, apply it). The EQ page has
-  an Auto-EQ for every channel (e.g. per output for subs and tops) that uses the free PEQ bands; the other
-  channels are muted while measuring, linked channels are measured together or alone
-- **Gate** (inputs), **Compressor** and **Limiter** (outputs): transfer curve over the whole page,
-  horizontal faders (value ranges and limiter knee like the original editor) and a live indicator while the DSP
-  reduces the gain
-- **Matrix:** routing diagram (inputs → outputs) next to the crossing grid; the gain of every crossing
-  (−60 … 0 dB) is typed into its cell
-- **Delay:** drag a speaker per channel (inputs left, outputs right), fine-tune with faders, ms, m or ft
-  (stored on the DSP), zoomable range
-- **RTA:** browser microphone, 1/24 octave, 16k FFT at 48 kHz, averaging Off/Fast/Slow/Long, peak hold;
-  signal generator in the browser (sine, pink/white noise) and the DSP's own generator
-- Every fader can be moved with the arrow keys after clicking it (Shift: 10 steps, Page Up/Down: 10 %)
-- Channel menu (tap a channel name): rename (stored on the DSP, max. 8 characters), copy settings to other
-  channels (the DSP copies, the panel reads the result back), link channels like the original editor: a master
-  with one or more slaves that first get the master's settings (stored on the DSP). A change is sent once and
-  the DSP applies it to the linked channels – the matrix routing stays per channel, so left/right pairs keep
-  their inputs. Linked channels are highlighted together on every page
-- **Presets:** the 20 presets stored on the DSP (load/store), plus a preset library on the server: save the
-  current settings, edit a preset offline (without a DSP) in its own tab and load it onto any DSP of the
-  same model
-- Connection status per DSP, disconnect/connect without logging out of the panel. Device ID and the password of a
-  DSP locked with the original editor are set per DSP
+- **Gain** – faders with dBFS meters, clip and limiter LEDs, mute and polarity; an EQ overview of all channels
+  above the faders; named link groups shown as brackets.
+- **EQ** – 8 bands per input, 9 per output, HPF/LPF (Butterworth, Bessel, Linkwitz-Riley up to 48 dB/oct).
+  Curves drawn with the same formulas as the original editor; magnitude or **phase** view, another channel can
+  be drawn for comparison. Filter settings files of measurement programs (REW / Equalizer APO text format) are
+  taken over as a proposal.
+- **GEQ** – 31 bands on the inputs with an RTA overlay.
+- **Auto-EQ** – measure pink noise with a microphone, review the proposed GEQ or PEQ correction, apply it.
+- **Gate, compressor, limiter** – transfer curve, live "reducing gain" LEDs from the DSP. A **limiter
+  calculator** turns amplifier data (rated power, sensitivity or gain, load) into the threshold for a wanted
+  power.
+- **Matrix** – routing and crossing gains.
+- **Delay** – draggable speakers, ms / m / ft.
+- **RTA** – 1/24-octave analyser (FFT 16384) with averaging and peak hold, browser and DSP test generator.
+- **Presets** – the DSP's slots U01–U20, and a preset library on the server that can be edited offline.
+  Loading a library preset sends only what differs, reads the DSP back and reports values that did not take;
+  the last five loads can be undone.
+- **Linking and copying** like the original editor; settings can also be copied in parts (level, filters, EQ,
+  dynamics, routing) to channels of other DSPs.
 
-When connecting, the panel reads the complete configuration from the DSP before it shows it, including
-mute, phase, delay, PEQ/EQ/GEQ bypass, the delay unit, the test tone and the matrix crossing gains. How the original
-software works and what the panel does the same way is described in [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md);
-open hardware checks are collected in [TODO.md](TODO.md).
+**Live safety**
 
-## Installing the panel on an Ubuntu server
+- **Mute all** – one button mutes every channel of every DSP; releasing it opens only what was open before
+  (also after a crash, a restart or a preset load).
+- **Max level per channel** – the server never sets a gain above it, also not when a preset is loaded.
+- **Safe test generator** – all outputs are lowered before the DSP generator starts and restored after it
+  stops.
+- **View-only mode** – phones and tablets start in it, so nothing moves by accident; one tap allows changes.
+- **Limit light** – an optional page `/limit` without login (e.g. for the DJ booth): one big lamp that lights
+  while a limiter acts.
 
-1. Build the release package (see below) or download it from the GitHub release:
-   `dsp-panel-<version>-linux-x64.tar.gz`.
-2. Copy it to the server and install:
-   ```
-   $ tar xzf dsp-panel-<version>-linux-x64.tar.gz
-   $ cd dsp-panel-<version>-linux-x64
-   $ sudo ./install.sh
-   ```
-   The installer creates the service user `dsp-panel`, a self-signed TLS certificate, asks for the panel
-   password and starts the `dsp-panel` service. Re-running it updates the program and keeps configuration,
-   DSP list and password.
-3. Open `https://<server-ip>:8443` in a browser. The browser warns once about the self-signed certificate –
-   accept it. Log in and add your DSPs with the **+** next to the DSP tabs (IP address and port 9761).
+**More:** network search for DSPs, device ID and lock password per DSP, debug log of every frame, automatic
+reconnect.
 
-If `ufw` is active: `sudo ufw allow 8443/tcp`. The server needs to reach the DSPs on TCP port 9761.
+## Supported devices
 
-### Configuration
-
-`/etc/dsp-panel/config.yaml` (restart with `sudo systemctl restart dsp-panel` after changes):
-
-| Setting | Default | |
+| Device | Inputs / outputs | Status |
 |---|---|---|
-| `listen.port` | `8443` | `443` works too |
-| `tls.enabled` | `true` | HTTPS is required for the RTA microphone in the browser |
-| `tls.cert`, `tls.key` | self-signed | replace with your own certificate to avoid the browser warning |
-| `auth.enabled` | `true` | `false` disables the login – then everyone on the network can control the DSPs |
+| DSP 408 | 4 / 8 | supported |
+| DSP 206 | 2 / 6 | supported |
+| DSP 204 | 2 / 4 | new, not yet tested on hardware |
 
-- Change the password: `sudo dsp-panel-passwd` (logs out all browsers)
-- Logs: `journalctl -u dsp-panel -f`
-- Data (DSP list, server presets, password hash): `/var/lib/dsp-panel`
-- Uninstall: `sudo ./uninstall.sh` (add `--purge` to also delete configuration and data)
+The model is detected automatically. A DSP accepts only one connection: disconnect other control software
+first. Open questions about the protocol are collected in [TODO.md](TODO.md).
 
-Never expose the panel to the internet: the DSP protocol itself has no protection.
+## Install
+
+The release package contains a static Linux binary (x64), the web client and an install script for systemd.
+
+```bash
+tar xzf dsp-panel-rs-linux-x64.tar.gz
+cd dsp-panel-rs-<version>-linux-x64
+sudo bash install.sh
+```
+
+Then open `https://<server>:8444` and log in. The script installs to `/opt/dsp-panel-rs` (program),
+`/etc/dsp-panel-rs` (configuration, see [deploy/config.example.yaml](deploy/config.example.yaml)) and
+`/var/lib/dsp-panel-rs` (data, certificate), and sets the password (later: `sudo dsp-panel-rs-passwd`).
+Running it again updates the panel and keeps configuration and data; `sudo bash uninstall.sh` removes it
+(`--purge` also deletes configuration and data).
+
+- `--import-from /var/lib/dsp-panel` takes over DSP list, presets, password and certificate of the old Dart
+  panel. Imported DSPs start disconnected – disconnect them in the old panel before connecting them here.
+- **Automatic updates** (e.g. from a VM management tool): fetch [release/latest-x64.json](release/latest-x64.json)
+  from the repository, compare `version` with the installed one, download
+  [release/dsp-panel-rs-linux-x64.tar.gz](release/dsp-panel-rs-linux-x64.tar.gz), check `sha256`, unpack and
+  run `sudo bash <folder>/install.sh`. Without a terminal the script does not ask for a password.
+- The microphone (RTA, Auto-EQ) only works on HTTPS or `localhost` – keep TLS on.
+
+## Data
+
+All data lives in the data directory as JSON/YAML files:
+
+| File | Content |
+|---|---|
+| `devices.json` | the DSPs (address, model, device ID, lock password, max levels) |
+| `presets.json` | the preset library |
+| `auth.json`, `secret.key` | password hash (PBKDF2-SHA256) and session key |
+| `safety.json` | what mute all has to unmute, output gains saved for the test generator |
+| `panel.json` | limiter calculator, link group names, limit light settings |
+
+`devices.json`, `presets.json`, `auth.json` and `secret.key` have the format of the old Dart server, so data can
+be copied between both, and this server also serves the old Flutter client.
 
 ## Development
 
-### Prerequisites
-Ensure that Flutter is installed on your computer and available on your `$PATH`. You will need:
-- Flutter - 3.38.9
-- Dart - 3.10.8
+Needs Rust (stable, see [rust-toolchain.toml](rust-toolchain.toml), with the `wasm32-unknown-unknown` target)
+and [trunk](https://trunkrs.dev) for the web client.
 
-Run setup:
+```powershell
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel"   # keep build output off network shares
+cargo test --workspace
+cargo run -p fake-dsp -- --port 19761 --models 408,206,204          # simulated DSPs on 19761–19763
+cd crates\dsp-web; trunk build --release; cd ..\..                  # web client -> crates/dsp-web/dist
+cargo run -p dsp-server -- serve --no-tls --no-auth --port 8090 --data-dir <dir> --web-root crates\dsp-web\dist
 ```
-$ make setup
+
+Open http://localhost:8090 and add the simulated DSPs (127.0.0.1, ports 19761–19763).
+
+`crates/dsp-core/tests/parity.rs` checks the Rust core byte for byte against reference data of the old Dart
+core. Regenerate it after changing `dart/packages/dsp_core`:
+
+```powershell
+cd tool\parity
+dart pub get --offline
+dart run bin/generate.dart ..\..\crates\dsp-core\tests\fixtures\parity.json
 ```
 
-### Project layout
+### Release
 
-| Folder | Contents |
+Needs zig and cargo-zigbuild (`winget install zig.zig`, `cargo install cargo-zigbuild`). Bump `version` in
+[Cargo.toml](Cargo.toml) first – automatic updates compare it.
+
+```powershell
+.\tool\build_dist.ps1 -Release
+```
+
+writes `release/dsp-panel-rs-linux-x64.tar.gz` and `release/latest-x64.json`; without `-Release` the package
+only goes to `dist/`. `-Arch arm64` builds for ARM.
+
+## Repository
+
+| Path | Content |
 |---|---|
-| `packages/dsp_core` | Pure Dart: DSP 408 protocol (framing, commands, config parser), device state, web-panel API |
-| `server` | Panel server: DSP connections, WebSocket API, login, HTTPS, static web client |
-| `lib` | Flutter web client |
-| `deploy` | Install script, systemd unit, example configuration |
+| [crates/dsp-core](crates/dsp-core) | protocol, config dump, device state, ops and linking, EQ and RTA math, web API types |
+| [crates/dsp-server](crates/dsp-server) | the server: DSP sessions, HTTP(S), WebSocket, login, presets, live safety |
+| [crates/dsp-web](crates/dsp-web) | the web client (Leptos, WebAssembly) |
+| [crates/fake-dsp](crates/fake-dsp) | simulated DSPs for development and tests |
+| [deploy](deploy) | install scripts, systemd unit, example configuration |
+| [tool](tool) | release script, parity reference generator |
+| [release](release) | current release package and manifest |
+| [dart](dart) | the old Dart/Flutter version (v0.9.0), frozen, kept as reference |
+| [PROTOCOL-RE.md](PROTOCOL-RE.md), [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md) | the protocol and how the original editor uses it |
+| [TODO.md](TODO.md) | open checks on real hardware and how to capture them |
 
-### Running locally without hardware
+## License
 
-```
-$ make fake-dsp      # simulated DSP 408 on port 19761 and DSP 206 on port 19762
-$ make build-web
-$ make dev-server    # http://localhost:8080, no TLS, no login
-```
-
-Add the simulated DSPs in the panel with IP `127.0.0.1` and ports `19761` (DSP 408) / `19762` (DSP 206).
-
-### Tests
-
-```
-$ make analyze
-$ make test
-```
-
-### Building the release package
-```
-$ make dist
-```
-The package is at `./dist/dsp-panel-<version>-linux-x64.tar.gz` (use `tool/build_dist.sh arm64` for ARM
-servers). The server binary is cross-compiled, so this also works on Windows (Git Bash) and macOS.
+GPL-3.0-or-later, see [LICENSE](LICENSE). This project started as a fork of dsp-408-ui. It is not affiliated
+with the maker of the devices; the protocol was documented for interoperability only.

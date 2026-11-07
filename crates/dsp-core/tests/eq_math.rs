@@ -1,0 +1,156 @@
+//! Port of dart/test/eq_math_test.dart (the EQ math moved from the Flutter client
+//! into dsp-core).
+
+use dsp_core::PeqBand;
+use dsp_core::eq_math::{
+    ChannelEq, FitLimits, GEQ_CENTER_FREQUENCIES, auto_eq_correction, filter_phase_deg, filter_response_db,
+    fit_peq_correction, free_peq_bands, peq_phase_deg, peq_response_db, wrap_deg,
+};
+use dsp_core::ops::{self, Op};
+use dsp_core::{DeviceModel, DeviceState, FilterState};
+use dsp_core::protocol as p;
+
+fn slope(name: &str) -> i64 {
+    p::CROSSOVER_SLOPE_NAMES.iter().position(|n| *n == name).unwrap() as i64
+}
+
+fn close(actual: f64, expected: f64, tolerance: f64) -> bool {
+    (actual - expected).abs() <= tolerance
+}
+
+#[test]
+fn peq_types() {
+    assert!(close(peq_response_db(1000.0, 1000.0, 2.0, 6.0, 0), 6.0, 0.01), "peak gain at the centre");
+    assert!(close(peq_response_db(20.0, 1000.0, 2.0, 6.0, 0), 0.0, 0.05));
+    assert!(close(peq_response_db(20.0, 1000.0, 0.7, -9.0, 1), -9.0, 0.1), "low shelf below");
+    assert!(close(peq_response_db(20000.0, 1000.0, 0.7, -9.0, 1), 0.0, 0.1));
+    assert!(close(peq_response_db(20000.0, 1000.0, 0.7, 4.0, 2), 4.0, 0.1), "high shelf above");
+    assert!(close(peq_response_db(1000.0, 1000.0, 1.0, 0.0, 3), -3.01, 0.01), "LP -6 at cut-off");
+    // Bilinear at 48 kHz: the frequency axis is pre-warped.
+    assert!(close(peq_response_db(4000.0, 1000.0, 0.707, 0.0, 4), -24.48, 0.05), "LP -12 two octaves up");
+    assert!(close(peq_response_db(250.0, 1000.0, 0.707, 0.0, 6), -24.12, 0.05), "HP -12 two octaves down");
+    assert_eq!(peq_response_db(300.0, 1000.0, 1.0, 0.0, 7), 0.0, "all pass");
+}
+
+#[test]
+fn peaks_and_shelves_like_the_original_editor() {
+    // A cut is the exact inverse of the boost.
+    for f in [100.0, 700.0, 1000.0, 1400.0, 8000.0] {
+        for t in [0, 1, 2] {
+            assert!(close(peq_response_db(f, 1000.0, 2.0, -6.0, t), -peq_response_db(f, 1000.0, 2.0, 6.0, t), 1e-9));
+        }
+    }
+    // Half an octave from the centre a +12 dB, Q 1 band has about 10.4 dB.
+    assert!(close(peq_response_db(1414.0, 1000.0, 1.0, 12.0, 0), 10.37, 0.05));
+    assert!(close(peq_response_db(1414.0, 1000.0, 1.0, -12.0, 0), -10.37, 0.05));
+    // Shelves reach the full gain far from the corner.
+    assert!(close(peq_response_db(20.0, 2000.0, 0.71, 6.0, 1), 6.0, 0.05));
+    assert!(close(peq_response_db(20000.0, 200.0, 0.71, -6.0, 2), -6.0, 0.05));
+}
+
+#[test]
+fn peq_fit_puts_corrections_into_free_bands_only() {
+    // Wanted: -6 dB around 1 kHz (one 1/3-octave band), +4 dB at 100 Hz.
+    let target: Vec<f64> = GEQ_CENTER_FREQUENCIES
+        .iter()
+        .map(|f| if *f == 1000.0 { -6.0 } else if *f == 100.0 { 4.0 } else { 0.0 })
+        .collect();
+    let bands = vec![
+        PeqBand { peq_type: 1, gain_db: 3.0, ..PeqBand::default() }, // low shelf in use: must stay
+        PeqBand::default(),
+        PeqBand::default(),
+        PeqBand::default(),
+    ];
+    let fitted = fit_peq_correction(&target, &GEQ_CENTER_FREQUENCIES, &bands, FitLimits { max_boost: 6.0, ..FitLimits::default() });
+    assert_eq!(fitted[0], bands[0]);
+    assert!(close(p::peq_freq_to_hz(fitted[1].freq_raw), 1000.0, 30.0));
+    assert!(close(fitted[1].gain_db, -6.0, 0.5));
+    assert!(close(p::peq_freq_to_hz(fitted[2].freq_raw), 100.0, 5.0));
+    assert!(fitted[2].gain_db > 2.0);
+    assert_eq!(free_peq_bands(&bands), [1, 2, 3]);
+
+    // No boosts allowed: the +4 dB is left alone.
+    let cuts_only =
+        fit_peq_correction(&target, &GEQ_CENTER_FREQUENCIES, &bands, FitLimits { max_boost: 0.0, ..FitLimits::default() });
+    assert!(cuts_only.iter().skip(1).all(|b| b.gain_db <= 0.0));
+}
+
+#[test]
+fn crossover_slopes() {
+    assert!(close(filter_response_db(1000.0, 1000.0, slope("BW -24"), false), -3.01, 0.01));
+    assert!(close(filter_response_db(1000.0, 1000.0, slope("LK -24"), true), -6.02, 0.01));
+    assert!(close(filter_response_db(1000.0, 1000.0, slope("BL -24"), false), -3.01, 0.05));
+    assert!(close(filter_response_db(4000.0, 1000.0, slope("BW -24"), false), -48.2, 0.3), "24 dB/oct");
+    assert!(close(filter_response_db(100.0, 1000.0, slope("BW -12"), false), 0.0, 0.01));
+    assert_eq!(filter_response_db(100.0, 1000.0, 0, true), 0.0, "bypass");
+}
+
+#[test]
+fn phase_of_peq_types_and_crossovers() {
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 3), -45.0, 0.01), "LP -6 at cut-off");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 5), 45.0, 0.01), "HP -6 at cut-off");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 0.707, 0.0, 4), -90.0, 0.01), "LP -12");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 0.707, 0.0, 6), 90.0, 0.01), "HP -12");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 7), -90.0, 0.01), "allpass 1 at its centre");
+    assert!(close(wrap_deg(peq_phase_deg(1000.0, 1000.0, 1.0, 0.0, 8)), 180.0, 0.01), "allpass 2 at its centre");
+    assert!(close(peq_phase_deg(1000.0, 1000.0, 2.0, 6.0, 0), 0.0, 1e-9), "peak at its centre");
+    assert!(close(peq_phase_deg(800.0, 1000.0, 2.0, -6.0, 0), -peq_phase_deg(800.0, 1000.0, 2.0, 6.0, 0), 1e-9));
+
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -6"), false), -45.0, 0.01));
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -12"), false), -90.0, 0.01));
+    assert!(close(filter_phase_deg(1000.0, 1000.0, slope("BW -12"), true), 90.0, 0.01));
+    assert!(close(wrap_deg(filter_phase_deg(1000.0, 1000.0, slope("LK -24"), false)), 180.0, 0.01), "LR4 at fc");
+    // LR4 low and high pass are in phase at every frequency.
+    for f in [200.0, 700.0, 1000.0, 3000.0] {
+        let lp = filter_phase_deg(f, 1000.0, slope("LK -24"), false);
+        let hp = filter_phase_deg(f, 1000.0, slope("LK -24"), true);
+        assert!(close(wrap_deg(lp - hp), 0.0, 0.01), "LR4 at {f} Hz");
+    }
+    assert!(close(filter_phase_deg(10.0, 1000.0, slope("BL -24"), false), 0.0, 3.0));
+    assert_eq!(filter_phase_deg(100.0, 1000.0, 0, true), 0.0, "bypass");
+    assert_eq!(wrap_deg(-180.0), 180.0);
+    assert_eq!(wrap_deg(540.0), 180.0);
+}
+
+#[test]
+fn channel_phase_adds_polarity_and_all_passes() {
+    let mut state = DeviceState::new(DeviceModel::DSP408);
+    ops::apply(&mut state, &Op::lo_pass("Out 1", FilterState::new(p::peq_hz_to_freq(1000.0), slope("BW -6"))));
+    let lp_only = ChannelEq::of(&state, "Out 1").phase_deg(p::peq_freq_to_hz(p::peq_hz_to_freq(1000.0)));
+    assert!(close(lp_only, -45.0, 0.5));
+    ops::apply(&mut state, &Op::phase("Out 1", true));
+    let inverted = ChannelEq::of(&state, "Out 1").phase_deg(p::peq_freq_to_hz(p::peq_hz_to_freq(1000.0)));
+    assert!(close(inverted, 135.0, 0.5));
+    // An all-pass changes the phase, not the magnitude.
+    let before = ChannelEq::of(&state, "Out 1");
+    let band = dsp_core::PeqBand { peq_type: 7, freq_raw: p::peq_hz_to_freq(500.0), ..dsp_core::PeqBand::default() };
+    ops::apply(&mut state, &Op::peq_band("Out 1", 0, band));
+    let after = ChannelEq::of(&state, "Out 1");
+    assert!(close(after.db(300.0), before.db(300.0), 1e-9));
+    assert!(!close(after.phase_deg(300.0), before.phase_deg(300.0), 1.0));
+}
+
+#[test]
+fn auto_eq_corrects_towards_the_median_inside_the_range() {
+    let centers = GEQ_CENTER_FREQUENCIES;
+    // Flat at -30 dB except a 6 dB peak at 1 kHz (index 17) and a dip below 40 Hz.
+    let mut measured = vec![-30.0; centers.len()];
+    measured[17] = -24.0;
+    measured[0] = -50.0;
+    let current = vec![1.0; centers.len()];
+    let out = auto_eq_correction(&measured, &centers, &current, 6.0);
+    assert_eq!(out[0], 1.0, "outside the range the band keeps its value");
+    assert_eq!(out[17], 1.0 - 3.0, "smoothed: half of the 6 dB peak");
+    assert_eq!(out[16], 1.0 - 1.5);
+    assert_eq!(out[18], 1.0 - 1.5);
+    assert_eq!(out[10], 1.0);
+    // Boost limited by max_boost.
+    let mut dip = vec![-30.0; centers.len()];
+    for d in dip.iter_mut().take(25).skip(10) {
+        *d = -50.0;
+    }
+    let out = auto_eq_correction(&dip, &centers, &vec![0.0; centers.len()], 3.0);
+    assert_eq!(out[15], 0.0, "the median is the dip level, so nothing is boosted there");
+    let out = auto_eq_correction(&measured.iter().map(|m| -m - 60.0).collect::<Vec<_>>(), &centers, &vec![0.0; 31], 0.0);
+    assert!(out.iter().all(|v| *v <= 0.0), "max boost 0 never boosts");
+}
