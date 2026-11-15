@@ -1,34 +1,30 @@
 //! HTTP(S) server.
 //!
 //! ```text
-//! GET  /api/session  {authEnabled, authenticated, passwordSet}
-//! POST /api/login    {password} → sets the session cookie
-//! POST /api/logout   clears the session cookie
 //! GET  /ws           WebSocket (see hub.rs)
-//! GET  /limit        limit light page, no login, only when switched on (light.rs)
+//! GET  /limit        limit light page, only when switched on (light.rs)
 //! GET  /limit/events {on, ready} as server-sent events
 //! GET  /*            web client (static files)
 //! ```
+//!
+//! There is no login: everyone who can reach the server controls the DSPs.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
-use crate::auth::{AuthService, COOKIE_NAME, SESSION_LIFETIME};
 use crate::config::ServerConfig;
 use crate::hub::{HubCommand, MAX_MESSAGE_LENGTH};
 use crate::light::{self, LightSnapshot};
@@ -40,7 +36,6 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 pub struct AppState {
     pub config: ServerConfig,
-    pub auth: Mutex<AuthService>,
     pub hub: mpsc::UnboundedSender<HubCommand>,
     /// State of the limit light, published by the hub.
     pub light: watch::Receiver<LightSnapshot>,
@@ -50,43 +45,21 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         config: ServerConfig,
-        auth: AuthService,
         hub: mpsc::UnboundedSender<HubCommand>,
         light: watch::Receiver<LightSnapshot>,
     ) -> Arc<Self> {
-        Arc::new(AppState { config, auth: Mutex::new(auth), hub, light, next_client: AtomicU64::new(1) })
-    }
-
-    fn auth(&self) -> MutexGuard<'_, AuthService> {
-        self.auth.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn is_authenticated(&self, headers: &HeaderMap) -> bool {
-        let auth = self.auth();
-        !auth.enabled || auth.verify_token(cookie(headers, COOKIE_NAME).as_deref())
-    }
-
-    fn session_cookie(&self, value: &str, max_age: u64) -> String {
-        format!(
-            "{COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{}",
-            if self.config.tls_enabled { "; Secure" } else { "" }
-        )
+        Arc::new(AppState { config, hub, light, next_client: AtomicU64::new(1) })
     }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let api = Router::new()
-        .route("/api/session", get(session))
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
-        .fallback_service(static_files(&state.config))
-        .layer(CompressionLayer::new());
+    let files = Router::new().fallback_service(static_files(&state.config)).layer(CompressionLayer::new());
     // The limit light stream must not go through the compression layer.
     Router::new()
         .route("/ws", get(web_socket))
         .route("/limit", get(light::page))
         .route("/limit/events", get(light::events))
-        .merge(api)
+        .merge(files)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
 }
@@ -125,70 +98,6 @@ async fn security_headers(mut response: Response) -> Response {
     response
 }
 
-fn json_response(status: StatusCode, body: Value, cookie: Option<String>) -> Response {
-    let mut response = (status, body.to_string()).into_response();
-    let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Some(cookie) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
-        headers.insert(header::SET_COOKIE, cookie);
-    }
-    response
-}
-
-async fn session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let authenticated = state.is_authenticated(&headers);
-    let auth = state.auth();
-    let body = json!({"authEnabled": auth.enabled, "authenticated": authenticated, "passwordSet": auth.has_password()});
-    json_response(StatusCode::OK, body, None)
-}
-
-async fn login(State(state): State<Arc<AppState>>, ConnectInfo(remote): ConnectInfo<SocketAddr>, body: Body) -> Response {
-    let client = remote.ip().to_string();
-    {
-        let mut auth = state.auth();
-        if !auth.enabled {
-            return json_response(StatusCode::OK, json!({"ok": true}), None);
-        }
-        if !auth.allow_attempt(&client) {
-            let body = json!({"error": "Too many failed attempts – please wait a minute."});
-            return json_response(StatusCode::TOO_MANY_REQUESTS, body, None);
-        }
-        if !auth.has_password() {
-            let body = json!({"error": "No password has been set yet (run: dsp-server passwd)."});
-            return json_response(StatusCode::SERVICE_UNAVAILABLE, body, None);
-        }
-    }
-
-    let bytes = tokio::time::timeout(Duration::from_secs(5), axum::body::to_bytes(body, 4096)).await;
-    let password = match bytes {
-        Ok(Ok(bytes)) => serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("password").and_then(Value::as_str).map(String::from)),
-        _ => None,
-    };
-    let Some(password) = password else {
-        return json_response(StatusCode::BAD_REQUEST, json!({"error": "Password missing"}), None);
-    };
-
-    // PBKDF2 takes a while: keep it off the runtime thread.
-    let check_state = state.clone();
-    let ok = tokio::task::spawn_blocking(move || check_state.auth().verify_password(&password)).await.unwrap_or(false);
-    let mut auth = state.auth();
-    if !ok {
-        auth.record_failure(&client);
-        log::warn(format!("Failed login from {client}"));
-        return json_response(StatusCode::UNAUTHORIZED, json!({"error": "Wrong password"}), None);
-    }
-    log::info(format!("Login from {client}"));
-    let cookie = state.session_cookie(&auth.issue_token(), SESSION_LIFETIME.as_secs());
-    json_response(StatusCode::OK, json!({"ok": true}), Some(cookie))
-}
-
-async fn logout(State(state): State<Arc<AppState>>) -> Response {
-    json_response(StatusCode::OK, json!({"ok": true}), Some(state.session_cookie("", 0)))
-}
-
 async fn web_socket(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
@@ -199,9 +108,6 @@ async fn web_socket(
         let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or_default();
         log::warn(format!("Rejected WebSocket from foreign origin {origin}"));
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
-    }
-    if !state.is_authenticated(&headers) {
-        return (StatusCode::UNAUTHORIZED, "Not logged in").into_response();
     }
     let id = state.next_client.fetch_add(1, Ordering::Relaxed);
     let hub = state.hub.clone();
@@ -263,8 +169,8 @@ async fn client_loop(socket: WebSocket, hub: mpsc::UnboundedSender<HubCommand>, 
 }
 
 /// Browsers always send Origin on WebSocket requests. It must match the Host
-/// we were addressed with, otherwise another website could drive the panel
-/// with the user's cookie (cross-site WebSocket hijacking).
+/// we were addressed with, otherwise any website open in a browser on the
+/// network could drive the panel (cross-site WebSocket hijacking).
 fn is_same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return true; // non-browser client
@@ -284,12 +190,4 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
         h
     }
     !authority.is_empty() && normalize(authority) == normalize(host)
-}
-
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let header = headers.get(header::COOKIE)?.to_str().ok()?;
-    header.split(';').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key.trim() == name).then(|| value.trim().to_string())
-    })
 }

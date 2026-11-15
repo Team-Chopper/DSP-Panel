@@ -18,12 +18,9 @@ tls:
   cert: /var/lib/dsp-panel-rs/tls/cert.pem
   key: /var/lib/dsp-panel-rs/tls/key.pem
 
-auth:
-  # true: login with the panel password (set it with: sudo dsp-panel-rs-passwd)
-  # false: everyone who can reach the server can control the DSPs
-  enabled: true
+# There is no login: everyone who can reach the server can control the DSPs.
 
-# DSP list, presets, password hash and session key
+# DSP list, presets and panel settings
 data_dir: /var/lib/dsp-panel-rs
 
 # Web client

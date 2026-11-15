@@ -1,13 +1,11 @@
-//! Login state and the WebSocket to the panel server. The web client is always
-//! served by the panel server itself, so all URLs are relative to the page's
-//! own origin.
+//! The WebSocket to the panel server. The web client is always served by the
+//! panel server itself, so the URL is relative to the page's own origin.
 
 use std::cell::RefCell;
 use std::time::Duration;
 
-use gloo_net::http::Request;
 use leptos::prelude::*;
-use serde_json::{Value, json};
+use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{MessageEvent, WebSocket};
@@ -32,57 +30,7 @@ pub fn send(message: Value) {
 }
 
 pub fn start() {
-    leptos::task::spawn_local(check_session());
-}
-
-async fn check_session() {
-    let app = app();
-    app.server.set(ServerState::Checking);
-    let response = Request::get("/api/session").send().await;
-    let json = match response {
-        Ok(r) => r.json::<Value>().await.ok(),
-        Err(_) => None,
-    };
-    let Some(json) = json else {
-        app.server_error.set(Some("Server not reachable".into()));
-        schedule_retry();
-        return;
-    };
-    let auth = json.get("authEnabled").and_then(Value::as_bool).unwrap_or(false);
-    app.auth_enabled.set(auth);
-    app.password_set.set(json.get("passwordSet").and_then(Value::as_bool).unwrap_or(true));
-    if auth && json.get("authenticated") != Some(&Value::Bool(true)) {
-        app.server_error.set(None);
-        app.server.set(ServerState::LoginRequired);
-    } else {
-        connect();
-    }
-}
-
-/// Log in with the panel password. Returns an error message.
-pub async fn login(password: String) -> Option<String> {
-    let request = Request::post("/api/login").header("content-type", "application/json");
-    let response = match request.body(json!({"password": password}).to_string()) {
-        Ok(r) => r.send().await,
-        Err(_) => return Some("Server not reachable".into()),
-    };
-    let Ok(response) = response else { return Some("Server not reachable".into()) };
-    if response.status() != 200 {
-        let json = response.json::<Value>().await.ok();
-        return Some(
-            json.and_then(|j| j.get("error").and_then(Value::as_str).map(String::from))
-                .unwrap_or_else(|| "Login failed".into()),
-        );
-    }
     connect();
-    None
-}
-
-pub async fn logout() {
-    cancel_retry();
-    let _ = Request::post("/api/logout").send().await;
-    close_socket();
-    app().server.set(ServerState::LoginRequired);
 }
 
 fn socket_url() -> String {
@@ -147,8 +95,6 @@ fn connect() {
         }
         SOCKET.with(|s| s.borrow_mut().take());
         let app = app();
-        // The upgrade fails with 401 when the login expired; the retry
-        // checks the session again.
         let was_open = app.server.get_untracked() == ServerState::Connected;
         app.server_error.set(Some(
             if was_open { "Connection to the server lost" } else { "Could not connect to the server" }.into(),
@@ -180,10 +126,6 @@ fn schedule_retry() {
         attempt
     });
     let delay = DELAYS[(attempt as usize).min(DELAYS.len() - 1)];
-    let handle = set_timeout_with_handle(
-        || leptos::task::spawn_local(check_session()),
-        Duration::from_secs(delay),
-    )
-    .ok();
+    let handle = set_timeout_with_handle(connect, Duration::from_secs(delay)).ok();
     RETRY.with(|r| r.borrow_mut().1 = handle);
 }

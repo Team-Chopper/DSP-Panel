@@ -448,7 +448,7 @@ fn LimitLightCard(device: Device) -> impl IntoView {
                     <a class="light-link mono" href="/limit" target="_blank" rel="noopener" data-view-ok>{url.clone()}</a>
                 </Show>
                 <div class="light-help">
-                    "A page without login, e.g. for the DJ booth: one lamp that lights while a watched limiter acts. Muted outputs never count."
+                    "A page of its own, e.g. for the DJ booth:one lamp that lights while a watched limiter acts. Muted outputs never count."
                 </div>
                 <div class="small muted">"Watched outputs"</div>
                 <div class="light-outputs">{outputs}</div>

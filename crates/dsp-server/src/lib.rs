@@ -2,7 +2,6 @@
 //! client and talks to the browsers over one WebSocket. Port of the Dart
 //! server (dart/server/), with the same API, files and behaviour.
 
-pub mod auth;
 pub mod config;
 pub mod http;
 pub mod hub;
@@ -23,7 +22,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::{mpsc, watch};
 use tokio::task::spawn_local;
 
-use crate::auth::AuthService;
 use crate::config::ServerConfig;
 use crate::http::AppState;
 use crate::hub::{Hub, HubStores};
@@ -44,15 +42,7 @@ impl Server {
     /// Load the data, start the DSP sessions and listen. Must run inside a
     /// `LocalSet`.
     pub async fn start(config: ServerConfig, timing: Timing) -> Result<Server, String> {
-        let mut auth = AuthService::new(config.auth_enabled, config.data_dir.clone());
-        auth.init()?;
-        if auth.enabled && !auth.has_password() {
-            log::warn("Login is enabled but no password is set – run \"dsp-server passwd\".");
-        }
-        if !auth.enabled {
-            log::warn("Login is disabled – everyone who can reach this server can control the DSPs.");
-        }
-
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| format!("{}: {e}", config.data_dir.display()))?;
         let registry = DeviceRegistry::new(config.data_dir.join("devices.json"));
         let (light_tx, light_rx) = watch::channel(LightSnapshot::default());
         let stores = HubStores {
@@ -81,7 +71,7 @@ impl Server {
             None
         };
 
-        let app = http::router(AppState::new(config, auth, hub_tx, light_rx))
+        let app = http::router(AppState::new(config, hub_tx, light_rx))
             .into_make_service_with_connect_info::<SocketAddr>();
         let handle = Handle::new();
         let serve_handle = handle.clone();

@@ -323,7 +323,6 @@ impl Setup {
             address: "127.0.0.1".into(),
             port: 0,
             tls_enabled: false,
-            auth_enabled: false,
             data_dir: dir.clone(),
             web_root: dir.join("web"),
             ..ServerConfig::default()

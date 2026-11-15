@@ -1,5 +1,5 @@
-//! Root of the web client: login page or the panel with one tab per DSP and
-//! one per server preset open in the offline editor.
+//! Root of the web client: the panel with one tab per DSP and one per server
+//! preset open in the offline editor.
 
 use dsp_core::DeviceModel;
 use dsp_core::api::{DspStatus, msg};
@@ -14,70 +14,15 @@ use crate::store::{App, ServerState, app};
 
 #[component]
 pub fn Root() -> impl IntoView {
-    let app = App::init();
+    App::init();
     // Panel-wide audio state, owned by the root so it lives as long as the panel.
     crate::rta::RtaSettings::get();
     crate::tone::ToneGenerator::get();
     crate::read_only::install();
     net::start();
     view! {
-        {move || match app.server.get() {
-            ServerState::Checking => view! { <div class="login"><div class="spinner big"></div></div> }.into_any(),
-            ServerState::LoginRequired => view! { <LoginPage/> }.into_any(),
-            _ => view! { <PanelPage/> }.into_any(),
-        }}
+        <PanelPage/>
         <Toasts/>
-    }
-}
-
-#[component]
-fn LoginPage() -> impl IntoView {
-    let app = app();
-    let password = RwSignal::new(String::new());
-    let busy = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-    let submit = move || {
-        let pw = password.get_untracked();
-        if pw.is_empty() || busy.get_untracked() {
-            return;
-        }
-        busy.set(true);
-        error.set(None);
-        leptos::task::spawn_local(async move {
-            let result = net::login(pw).await;
-            busy.set(false);
-            if result.is_some() {
-                password.set(String::new());
-            }
-            error.set(result);
-        });
-    };
-    view! {
-        <div class="login">
-            <form class="login-card" on:submit=move |ev| {
-                ev.prevent_default();
-                submit();
-            }>
-                <h1>"DSP Panel"</h1>
-                <Show when=move || !app.password_set.get()>
-                    <div class="note">
-                        "No password has been set on the server yet."<br/>
-                        "Run \"dsp-server passwd\" on the server first."
-                    </div>
-                </Show>
-                <div class="field" class:invalid=move || error.get().is_some()>
-                    <label for="password">"Password"</label>
-                    <input id="password" type="password" autocomplete="current-password" autofocus
-                        prop:value=move || password.get()
-                        prop:disabled=move || busy.get()
-                        on:input=move |ev| password.set(event_target_value(&ev))/>
-                    {move || error.get().map(|e| view! { <span class="error">{e}</span> })}
-                </div>
-                <button class="btn" type="submit" prop:disabled=move || busy.get()>
-                    {move || if busy.get() { view! { <span class="spinner"></span> }.into_any() } else { "Log in".into_any() }}
-                </button>
-            </form>
-        </div>
     }
 }
 
@@ -113,15 +58,7 @@ fn PanelPage() -> impl IntoView {
     });
 
     let menu_items = Signal::derive(move || {
-        let mut items = vec![(I::Add, "Add DSP".to_string(), Callback::new(move |_| adding.set(true)))];
-        if app.auth_enabled.get() {
-            items.push((
-                I::Logout,
-                "Log out of the panel".to_string(),
-                Callback::new(|_| leptos::task::spawn_local(net::logout())),
-            ));
-        }
-        items
+        vec![(I::Add, "Add DSP".to_string(), Callback::new(move |_| adding.set(true)))]
     });
 
     let dsp_tabs = move || {

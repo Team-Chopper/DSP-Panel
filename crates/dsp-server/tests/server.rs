@@ -10,7 +10,6 @@ use dsp_core::DeviceModel;
 use dsp_core::api::msg;
 use dsp_core::ops::Op;
 use dsp_core::protocol::SILENCE_DB;
-use dsp_server::auth::AuthService;
 use dsp_server::config::ServerConfig;
 use dsp_server::registry::DeviceRegistry;
 use dsp_server::session::Timing;
@@ -43,9 +42,6 @@ impl Setup {
         let mut fake = FakeDsp::new(FakeOptions::default());
         fake.start(0).await.unwrap();
 
-        let mut auth = AuthService::new(true, dir.clone());
-        auth.init().unwrap();
-        auth.set_password("secret-password").unwrap();
         let config = ServerConfig {
             address: "127.0.0.1".into(),
             port: 0,
@@ -65,24 +61,9 @@ impl Setup {
         Setup { dir, fake, server, base }
     }
 
-    async fn login(&self) -> String {
-        let response = reqwest::Client::new()
-            .post(format!("http://{}/api/login", self.base))
-            .body(json!({"password": "secret-password"}).to_string())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let cookie = response.headers()["set-cookie"].to_str().unwrap().to_string();
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
-        cookie.split(';').next().unwrap().to_string()
-    }
-
-    async fn connect(&self, cookie: &str, origin: Option<&str>) -> Result<TestClient, String> {
+    async fn connect(&self, origin: Option<&str>) -> Result<TestClient, String> {
         let mut request = format!("ws://{}/ws", self.base).into_client_request().unwrap();
         let origin = origin.map_or(format!("http://{}", self.base), String::from);
-        request.headers_mut().insert("cookie", cookie.parse().unwrap());
         request.headers_mut().insert("origin", origin.parse().unwrap());
         let (socket, _) = tokio_tungstenite::connect_async(request).await.map_err(|e| e.to_string())?;
         let (mut sink, mut stream) = socket.split();
@@ -157,7 +138,7 @@ fn info_status(m: &Value, status: &str) -> bool {
 }
 
 #[test]
-fn serves_the_web_client_and_session_info_without_login() {
+fn serves_the_web_client_and_the_websocket_without_login() {
     run(async {
         let setup = Setup::new("static").await;
         let index = reqwest::get(format!("http://{}/", setup.base)).await.unwrap();
@@ -165,38 +146,7 @@ fn serves_the_web_client_and_session_info_without_login() {
         assert_eq!(index.headers()["cross-origin-opener-policy"], "same-origin");
         assert!(index.text().await.unwrap().contains("panel"));
 
-        let session: Value =
-            reqwest::get(format!("http://{}/api/session", setup.base)).await.unwrap().json().await.unwrap();
-        assert_eq!(session, json!({"authEnabled": true, "authenticated": false, "passwordSet": true}));
-        setup.stop().await;
-    });
-}
-
-#[test]
-fn login_is_required_for_the_websocket() {
-    run(async {
-        let setup = Setup::new("login").await;
-        let wrong = reqwest::Client::new()
-            .post(format!("http://{}/api/login", setup.base))
-            .body(json!({"password": "nope"}).to_string())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(wrong.status(), 401);
-        assert!(setup.connect("dsp_session=forged.token.value", None).await.is_err());
-
-        let cookie = setup.login().await;
-        let session: Value = reqwest::Client::new()
-            .get(format!("http://{}/api/session", setup.base))
-            .header("cookie", &cookie)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(session["authenticated"], true);
-        let client = setup.connect(&cookie, None).await.unwrap();
+        let client = setup.connect(None).await.unwrap();
         client.wait_for(|m| m["t"] == msg::HELLO).await;
         setup.stop().await;
     });
@@ -206,8 +156,7 @@ fn login_is_required_for_the_websocket() {
 fn websocket_from_a_foreign_origin_is_rejected() {
     run(async {
         let setup = Setup::new("origin").await;
-        let cookie = setup.login().await;
-        assert!(setup.connect(&cookie, Some("https://evil.example")).await.is_err());
+        assert!(setup.connect(Some("https://evil.example")).await.is_err());
         setup.stop().await;
     });
 }
@@ -216,9 +165,8 @@ fn websocket_from_a_foreign_origin_is_rejected() {
 fn two_clients_manage_a_dsp_and_stay_in_sync() {
     run(async {
         let setup = Setup::new("sync").await;
-        let cookie = setup.login().await;
-        let a = setup.connect(&cookie, None).await.unwrap();
-        let b = setup.connect(&cookie, None).await.unwrap();
+        let a = setup.connect(None).await.unwrap();
+        let b = setup.connect(None).await.unwrap();
         a.wait_for(|m| m["t"] == msg::HELLO).await;
 
         a.send(json!({"t": msg::ADD_DSP, "name": "FOH", "host": "127.0.0.1", "port": setup.fake.port()}));
@@ -287,9 +235,8 @@ fn two_clients_manage_a_dsp_and_stay_in_sync() {
 fn server_presets_save_from_a_dsp_edit_offline_load_onto_the_dsp() {
     run(async {
         let setup = Setup::new("presets").await;
-        let cookie = setup.login().await;
-        let a = setup.connect(&cookie, None).await.unwrap();
-        let b = setup.connect(&cookie, None).await.unwrap();
+        let a = setup.connect(None).await.unwrap();
+        let b = setup.connect(None).await.unwrap();
         a.wait_for(|m| m["t"] == msg::PRESETS).await;
 
         a.send(json!({"t": msg::ADD_DSP, "name": "FOH", "host": "127.0.0.1", "port": setup.fake.port()}));
@@ -351,9 +298,8 @@ fn panel_data_limit_light_copy_between_dsps_and_undo() {
         let setup = Setup::new("panel").await;
         let mut second = FakeDsp::new(FakeOptions { model: DeviceModel::DSP206, ..FakeOptions::default() });
         second.start(0).await.unwrap();
-        let cookie = setup.login().await;
-        let a = setup.connect(&cookie, None).await.unwrap();
-        let b = setup.connect(&cookie, None).await.unwrap();
+        let a = setup.connect(None).await.unwrap();
+        let b = setup.connect(None).await.unwrap();
         let hello = a.wait_for(|m| m["t"] == msg::HELLO).await;
         assert_eq!(hello["panel"]["light"]["enabled"], false);
 
@@ -450,7 +396,7 @@ fn panel_data_limit_light_copy_between_dsps_and_undo() {
 fn rejects_invalid_dsp_settings() {
     run(async {
         let setup = Setup::new("invalid").await;
-        let client = setup.connect(&setup.login().await, None).await.unwrap();
+        let client = setup.connect(None).await.unwrap();
         client.send(json!({"t": msg::ADD_DSP, "name": "", "host": "1.2.3.4", "port": 9761}));
         client.send(json!({"t": msg::ADD_DSP, "name": "X", "host": "a b", "port": 9761}));
         client.send(json!({"t": msg::ADD_DSP, "name": "X", "host": "1.2.3.4", "port": 70000}));

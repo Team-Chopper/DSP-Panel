@@ -10,8 +10,8 @@ devices.
   one WebSocket.
 - **Fast.** Rust server, Rust/WebAssembly client with fine-grained updates: faders and meters stay smooth on
   phones and in Firefox.
-- **Secure by default.** HTTPS with a self-signed certificate, password login (can be switched off for a
-  closed network).
+- **No login.** Made for a closed venue network: everyone who can reach the server controls the DSPs. HTTPS
+  with a self-signed certificate is built in, because browsers only allow the microphone there.
 
 ```
 Phone / tablet / laptop ──HTTPS + WebSocket──▶ dsp-server ──TCP 9761──▶ DSP 1
@@ -52,7 +52,7 @@ reset, Shift for fine moves, haptic tick at 0 dB on phones); every value can als
 - **Safe test generator** – all outputs are lowered before the DSP generator starts and restored after it
   stops.
 - **View-only mode** – phones and tablets start in it, so nothing moves by accident; one tap allows changes.
-- **Limit light** – an optional page `/limit` without login (e.g. for the DJ booth): one big lamp that lights
+- **Limit light** – an optional page `/limit` (e.g. for the DJ booth): one big lamp that lights
   while a limiter acts.
 
 **More:** network search for DSPs, device ID and lock password per DSP, debug log of every frame, automatic
@@ -79,18 +79,18 @@ cd dsp-panel-rs-<version>-linux-x64
 sudo bash install.sh
 ```
 
-Then open `https://<server>:8444` and log in. The script installs to `/opt/dsp-panel-rs` (program),
+Then open `https://<server>:8444`. The script installs to `/opt/dsp-panel-rs` (program),
 `/etc/dsp-panel-rs` (configuration, see [deploy/config.example.yaml](deploy/config.example.yaml)) and
-`/var/lib/dsp-panel-rs` (data, certificate), and sets the password (later: `sudo dsp-panel-rs-passwd`).
+`/var/lib/dsp-panel-rs` (data, certificate).
 Running it again updates the panel and keeps configuration and data; `sudo bash uninstall.sh` removes it
 (`--purge` also deletes configuration and data).
 
-- `--import-from /var/lib/dsp-panel` takes over DSP list, presets, password and certificate of the old Dart
+- `--import-from /var/lib/dsp-panel` takes over DSP list, presets and certificate of the old Dart
   panel. Imported DSPs start disconnected – disconnect them in the old panel before connecting them here.
 - **Automatic updates** (e.g. from a VM management tool): fetch [release/latest-x64.json](release/latest-x64.json)
   from the repository, compare `version` with the installed one, download
   [release/dsp-panel-rs-linux-x64.tar.gz](release/dsp-panel-rs-linux-x64.tar.gz), check `sha256`, unpack and
-  run `sudo bash <folder>/install.sh`. Without a terminal the script does not ask for a password.
+  run `sudo bash <folder>/install.sh`. The script asks no questions.
 - The microphone (RTA, Auto-EQ) only works on HTTPS or `localhost` – keep TLS on.
 
 ## Data
@@ -101,12 +101,11 @@ All data lives in the data directory as JSON/YAML files:
 |---|---|
 | `devices.json` | the DSPs (address, model, device ID, lock password, max levels) |
 | `presets.json` | the preset library |
-| `auth.json`, `secret.key` | password hash (PBKDF2-SHA256) and session key |
 | `safety.json` | what mute all has to unmute, output gains saved for the test generator |
 | `panel.json` | limiter calculator, link group names, limit light settings |
 
-`devices.json`, `presets.json`, `auth.json` and `secret.key` have the format of the old Dart server, so data can
-be copied between both, and this server also serves the old Flutter client.
+`devices.json` and `presets.json` have the format of the old Dart server, so data can be copied between both.
+`auth.json` and `secret.key` of an earlier version are no longer used and can be deleted.
 
 ## Development
 
@@ -118,7 +117,7 @@ $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\dsp-panel"   # keep buil
 cargo test --workspace
 cargo run -p fake-dsp -- --port 19761 --models 408,206,204          # simulated DSPs on 19761–19763
 cd crates\dsp-web; trunk build --release; cd ..\..                  # web client -> crates/dsp-web/dist
-cargo run -p dsp-server -- serve --no-tls --no-auth --port 8090 --data-dir <dir> --web-root crates\dsp-web\dist
+cargo run -p dsp-server -- serve --no-tls --port 8090 --data-dir <dir> --web-root crates\dsp-web\dist
 ```
 
 Open http://localhost:8090 and add the simulated DSPs (127.0.0.1, ports 19761–19763).
@@ -149,7 +148,7 @@ only goes to `dist/`. `-Arch arm64` builds for ARM.
 | Path | Content |
 |---|---|
 | [crates/dsp-core](crates/dsp-core) | protocol, config dump, device state, ops and linking, EQ and RTA math, web API types |
-| [crates/dsp-server](crates/dsp-server) | the server: DSP sessions, HTTP(S), WebSocket, login, presets, live safety |
+| [crates/dsp-server](crates/dsp-server) | the server: DSP sessions, HTTP(S), WebSocket, presets, live safety |
 | [crates/dsp-web](crates/dsp-web) | the web client (Leptos, WebAssembly) |
 | [crates/fake-dsp](crates/fake-dsp) | simulated DSPs for development and tests |
 | [deploy](deploy) | install scripts, systemd unit, example configuration |

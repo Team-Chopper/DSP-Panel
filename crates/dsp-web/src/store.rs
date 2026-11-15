@@ -27,10 +27,6 @@ use crate::net::send;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerState {
-    /// Asking the server whether a login is needed.
-    Checking,
-    /// Login required (or the session expired).
-    LoginRequired,
     /// Opening the WebSocket.
     Connecting,
     /// Connected; messages flow.
@@ -65,8 +61,6 @@ fn in_root<T>(f: impl FnOnce() -> T) -> T {
 #[derive(Clone, Copy)]
 pub struct App {
     pub server: RwSignal<ServerState>,
-    pub auth_enabled: RwSignal<bool>,
-    pub password_set: RwSignal<bool>,
     pub server_error: RwSignal<Option<String>>,
     /// DSP ids in the order of the server.
     pub dsps: RwSignal<Vec<String>>,
@@ -121,9 +115,7 @@ pub fn app() -> App {
 impl App {
     pub fn init() -> App {
         let app = App {
-            server: RwSignal::new(ServerState::Checking),
-            auth_enabled: RwSignal::new(false),
-            password_set: RwSignal::new(true),
+            server: RwSignal::new(ServerState::Connecting),
             server_error: RwSignal::new(None),
             dsps: RwSignal::new(Vec::new()),
             loaded: RwSignal::new(false),

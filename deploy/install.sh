@@ -6,10 +6,10 @@
 #   tar xzf dsp-panel-rs-<version>-linux-x64.tar.gz
 #   cd dsp-panel-rs-<version>-linux-x64
 #   sudo ./install.sh                                   # fresh data
-#   sudo ./install.sh --import-from /var/lib/dsp-panel  # copy DSP list, presets, password
+#   sudo ./install.sh --import-from /var/lib/dsp-panel  # copy DSP list, presets, certificate
 #
-# Re-running updates the program and web client; configuration, DSP list,
-# password and certificate are kept (an import is only done on request).
+# Re-running updates the program and web client; configuration, DSP list
+# and certificate are kept (an import is only done on request).
 
 set -euo pipefail
 
@@ -59,12 +59,8 @@ chmod -R u=rwX,go=rX "$PREFIX/web.new"
 rm -rf "$PREFIX/web"
 mv "$PREFIX/web.new" "$PREFIX/web"
 
-# Helper so the password can be set without remembering the paths
-cat > /usr/local/sbin/$NAME-passwd <<EOF
-#!/bin/sh
-exec runuser -u $SERVICE_USER -- $PREFIX/dsp-server passwd --config $CONF_DIR/config.yaml
-EOF
-chmod 755 /usr/local/sbin/$NAME-passwd
+# Earlier versions had a login and installed a helper to set its password
+rm -f /usr/local/sbin/$NAME-passwd
 
 echo "==> Configuration ($CONF_DIR)"
 install -d -m 755 "$CONF_DIR"
@@ -81,7 +77,7 @@ install -d -m 750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR" "$DATA_DIR/t
 if [[ -n "$IMPORT_FROM" ]]; then
   echo "==> Importing data from $IMPORT_FROM"
   systemctl stop $NAME 2>/dev/null || true
-  for f in devices.json presets.json auth.json secret.key; do
+  for f in devices.json presets.json; do
     if [[ -f "$IMPORT_FROM/$f" ]]; then
       install -m 600 -o "$SERVICE_USER" -g "$SERVICE_USER" "$IMPORT_FROM/$f" "$DATA_DIR/$f"
       echo "    $f"
@@ -119,17 +115,6 @@ echo "==> systemd service"
 install -m 644 "$SRC/$NAME.service" /etc/systemd/system/$NAME.service
 systemctl daemon-reload
 
-if [[ ! -f "$DATA_DIR/auth.json" ]] && [[ -t 0 ]]; then
-  echo
-  echo "==> No panel password set yet."
-  read -r -p "    Set it now? [Y/n] " answer
-  if [[ ! "$answer" =~ ^[Nn] ]]; then
-    /usr/local/sbin/$NAME-passwd
-  else
-    echo "    Later: sudo $NAME-passwd (or set auth.enabled: false in $CONF_DIR/config.yaml)"
-  fi
-fi
-
 systemctl enable $NAME >/dev/null 2>&1
 systemctl restart $NAME
 sleep 1
@@ -141,6 +126,7 @@ if systemctl is-active --quiet $NAME; then
   for ip in $(hostname -I 2>/dev/null); do echo "    https://$ip:${PORT:-8444}"; done
   echo
   echo "The browser warns once about the self-signed certificate – accept it to continue."
+  echo "There is no login: everyone who can reach this address controls the DSPs."
   echo "A DSP accepts probably only one connection: disconnect it in the other panel first."
   echo "Firewall (if ufw is active): sudo ufw allow ${PORT:-8444}/tcp"
   echo "Logs: journalctl -u $NAME -f"

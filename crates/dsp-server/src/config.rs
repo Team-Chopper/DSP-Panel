@@ -8,11 +8,11 @@
 //!   enabled: true
 //!   cert: /var/lib/dsp-panel/tls/cert.pem
 //!   key: /var/lib/dsp-panel/tls/key.pem
-//! auth:
-//!   enabled: true
 //! data_dir: /var/lib/dsp-panel
 //! web_root: /opt/dsp-panel/web
 //! ```
+//!
+//! There is no login; an `auth` section of an older file is ignored.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -26,7 +26,6 @@ pub struct ServerConfig {
     pub tls_enabled: bool,
     pub tls_cert: PathBuf,
     pub tls_key: PathBuf,
-    pub auth_enabled: bool,
     pub data_dir: PathBuf,
     /// Directory of the web client; if it does not exist, the client built
     /// into the server binary is served (if any).
@@ -41,7 +40,6 @@ impl Default for ServerConfig {
             tls_enabled: true,
             tls_cert: "/var/lib/dsp-panel/tls/cert.pem".into(),
             tls_key: "/var/lib/dsp-panel/tls/key.pem".into(),
-            auth_enabled: true,
             data_dir: "/var/lib/dsp-panel".into(),
             web_root: "/opt/dsp-panel/web".into(),
         }
@@ -52,11 +50,10 @@ impl fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "listen={}:{} tls={} auth={} data_dir={} web_root={}",
+            "listen={}:{} tls={} data_dir={} web_root={}",
             self.address,
             self.port,
             self.tls_enabled,
-            self.auth_enabled,
             self.data_dir.display(),
             self.web_root.display()
         )
@@ -137,7 +134,6 @@ impl ServerConfig {
 
         let listen = section("listen")?;
         let tls = section("tls")?;
-        let auth = section("auth")?;
         let root = Some(&yaml);
         let port = int(listen, "port")?.unwrap_or(defaults.port as i64);
         if !(1..=65535).contains(&port) {
@@ -149,7 +145,6 @@ impl ServerConfig {
             tls_enabled: boolean(tls, "enabled")?.unwrap_or(defaults.tls_enabled),
             tls_cert: resolve(string(tls, "cert")?.map_or(defaults.tls_cert, PathBuf::from)),
             tls_key: resolve(string(tls, "key")?.map_or(defaults.tls_key, PathBuf::from)),
-            auth_enabled: boolean(auth, "enabled")?.unwrap_or(defaults.auth_enabled),
             data_dir: resolve(string(root, "data_dir")?.map_or(defaults.data_dir, PathBuf::from)),
             web_root: resolve(string(root, "web_root")?.map_or(defaults.web_root, PathBuf::from)),
         })
