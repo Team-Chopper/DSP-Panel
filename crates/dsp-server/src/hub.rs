@@ -25,7 +25,7 @@ use dsp_core::protocol::level_to_db;
 use dsp_core::{DeviceModel, DeviceState, DspStatus, LogEntry};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, spawn_local};
 
 use crate::light::{LightSnapshot, LightTracker, watched_outputs};
@@ -48,6 +48,8 @@ pub enum HubCommand {
     /// A binary frame (not part of the API).
     Binary { id: u64 },
     Disconnected { id: u64 },
+    /// `GET /api/status`: the DSPs for a monitoring hub (see [`Hub::status_json`]).
+    Status { reply: oneshot::Sender<Value> },
 }
 
 struct Client {
@@ -148,6 +150,34 @@ impl Hub {
         self.0.borrow().sessions.values().cloned().collect()
     }
 
+    /// `{version, devices: [{name, kind, state, detail?}]}` for the monitoring
+    /// hub; state is ok, warn, error or offline. A DSP disconnected on purpose
+    /// counts as ok.
+    pub fn status_json(&self) -> Value {
+        let devices: Vec<Value> = self
+            .sessions()
+            .iter()
+            .map(|s| {
+                let (state, detail) = match s.status() {
+                    DspStatus::Ready | DspStatus::Busy if !s.config_readable() => ("warn", Some("Settings not readable".to_string())),
+                    DspStatus::Ready | DspStatus::Busy => {
+                        let preset = s.state().current_preset;
+                        ("ok", (!preset.is_empty() && preset != "Unknown").then(|| format!("Preset {preset}")))
+                    }
+                    DspStatus::Connecting | DspStatus::Initializing => ("warn", Some("Connecting".to_string())),
+                    DspStatus::Error => ("offline", s.message()),
+                    DspStatus::Disconnected => ("ok", Some("Disconnected in the panel".to_string())),
+                };
+                let mut device = json!({"name": s.config().name, "kind": "DSP", "state": state});
+                if let Some(detail) = detail {
+                    device["detail"] = json!(detail);
+                }
+                device
+            })
+            .collect();
+        json!({"version": env!("CARGO_PKG_VERSION"), "devices": devices})
+    }
+
     pub fn client_count(&self) -> usize {
         self.0.borrow().clients.len()
     }
@@ -183,6 +213,9 @@ impl Hub {
                     self.update_meter_polling();
                     log::info(format!("Client disconnected ({}), {} total", client.remote, self.client_count()));
                 }
+            }
+            HubCommand::Status { reply } => {
+                let _ = reply.send(self.status_json());
             }
         }
     }

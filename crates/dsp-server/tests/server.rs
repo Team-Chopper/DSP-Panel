@@ -148,6 +148,16 @@ fn serves_the_web_client_and_the_websocket_without_login() {
 
         let client = setup.connect(None).await.unwrap();
         client.wait_for(|m| m["t"] == msg::HELLO).await;
+
+        // Status for the monitoring hub: no login, one entry per DSP.
+        let url = format!("http://{}/api/status", setup.base);
+        let status: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        assert_eq!(status, json!({"version": env!("CARGO_PKG_VERSION"), "devices": []}));
+        client.send(json!({"t": msg::ADD_DSP, "name": "FOH", "host": "127.0.0.1", "port": setup.fake.port()}));
+        client.wait_for(|m| info_status(m, "ready")).await;
+        let status: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        let device = &status["devices"][0];
+        assert_eq!((device["name"].as_str(), device["kind"].as_str(), device["state"].as_str()), (Some("FOH"), Some("DSP"), Some("ok")));
         setup.stop().await;
     });
 }

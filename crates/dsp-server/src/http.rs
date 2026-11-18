@@ -1,6 +1,7 @@
 //! HTTP(S) server.
 //!
 //! ```text
+//! GET  /api/status   {version, devices: [{name, kind, state, detail?}]} for a monitoring hub
 //! GET  /ws           WebSocket (see hub.rs)
 //! GET  /limit        limit light page, only when switched on (light.rs)
 //! GET  /limit/events {on, ready} as server-sent events
@@ -57,6 +58,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // The limit light stream must not go through the compression layer.
     Router::new()
         .route("/ws", get(web_socket))
+        .route("/api/status", get(status))
         .route("/limit", get(light::page))
         .route("/limit/events", get(light::events))
         .merge(files)
@@ -96,6 +98,17 @@ async fn security_headers(mut response: Response) -> Response {
         set(headers, "cache-control", "no-cache");
     }
     response
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Response {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if state.hub.send(HubCommand::Status { reply }).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(1), answer).await {
+        Ok(Ok(body)) => axum::Json(body).into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn web_socket(

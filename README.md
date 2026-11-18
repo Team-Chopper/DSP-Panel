@@ -91,6 +91,8 @@ Running it again updates the panel and keeps configuration and data; `sudo bash 
   from the repository, compare `version` with the installed one, download
   [release/dsp-panel-rs-linux-x64.tar.gz](release/dsp-panel-rs-linux-x64.tar.gz), check `sha256`, unpack and
   run `sudo bash <folder>/install.sh`. The script asks no questions.
+- `GET /api/status` (no login) lists the DSPs for a monitoring hub: `{version, devices: [{name, kind, state,
+  detail}]}` with state `ok`, `warn` or `offline` and the active preset as detail.
 - The microphone (RTA, Auto-EQ) only works on HTTPS or `localhost` – keep TLS on.
 
 ## Data
