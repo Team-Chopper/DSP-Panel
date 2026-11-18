@@ -87,9 +87,9 @@ Running it again updates the panel and keeps configuration and data; `sudo bash 
 
 - `--import-from /var/lib/dsp-panel` takes over DSP list, presets and certificate of the old Dart
   panel. Imported DSPs start disconnected – disconnect them in the old panel before connecting them here.
-- **Automatic updates** (e.g. from a VM management tool): fetch [release/latest-x64.json](release/latest-x64.json)
-  from the repository, compare `version` with the installed one, download
-  [release/dsp-panel-rs-linux-x64.tar.gz](release/dsp-panel-rs-linux-x64.tar.gz), check `sha256`, unpack and
+- **Automatic updates** (e.g. from a VM management tool): fetch
+  `https://github.com/Team-Chopper/DSP-Panel/releases/latest/download/latest-x64.json`, compare `version` with the
+  installed one, download `…/releases/latest/download/dsp-panel-rs-linux-x64.tar.gz`, check `sha256`, unpack and
   run `sudo bash <folder>/install.sh`. The script asks no questions.
 - `GET /api/status` (no login) lists the DSPs for a monitoring hub: `{version, devices: [{name, kind, state,
   detail}]}` with state `ok`, `warn` or `offline` and the active preset as detail.
@@ -135,15 +135,13 @@ dart run bin/generate.dart ..\..\crates\dsp-core\tests\fixtures\parity.json
 
 ### Release
 
-Needs zig and cargo-zigbuild (`winget install zig.zig`, `cargo install cargo-zigbuild`). Bump `version` in
-[Cargo.toml](Cargo.toml) first – automatic updates compare it.
+GitHub builds the releases ([.github/workflows/release.yml](.github/workflows/release.yml)): bump `version` in
+[Cargo.toml](Cargo.toml) and push to `main`. If there is no release `v<version>` yet, the workflow runs the tests,
+builds the package on Linux and publishes the release with `dsp-panel-rs-linux-x64.tar.gz` and `latest-x64.json`.
+Pushes without a new version build nothing.
 
-```powershell
-.\tool\build_dist.ps1 -Release
-```
-
-writes `release/dsp-panel-rs-linux-x64.tar.gz` and `release/latest-x64.json`; without `-Release` the package
-only goes to `dist/`. `-Arch arm64` builds for ARM.
+A package for testing can still be built locally with `.\tool\build_dist.ps1` (needs zig and cargo-zigbuild:
+`winget install zig.zig`, `cargo install cargo-zigbuild`); it goes to `dist/`, `-Arch arm64` builds for ARM.
 
 ## Repository
 
@@ -154,8 +152,8 @@ only goes to `dist/`. `-Arch arm64` builds for ARM.
 | [crates/dsp-web](crates/dsp-web) | the web client (Leptos, WebAssembly) |
 | [crates/fake-dsp](crates/fake-dsp) | simulated DSPs for development and tests |
 | [deploy](deploy) | install scripts, systemd unit, example configuration |
-| [tool](tool) | release script, parity reference generator |
-| [release](release) | current release package and manifest |
+| [tool](tool) | local package script, parity reference generator |
+| [release](release) | old update location, frozen at 1.0.0-alpha.5 – new releases are GitHub releases |
 | [dart](dart) | the old Dart/Flutter version (v0.9.0), frozen, kept as reference |
 | [PROTOCOL-RE.md](PROTOCOL-RE.md), [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md) | the protocol and how the original editor uses it |
 | [TODO.md](TODO.md) | open checks on real hardware and how to capture them |

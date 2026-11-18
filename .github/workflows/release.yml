@@ -1,0 +1,94 @@
+# Builds the release package on every push to main whose version in
+# Cargo.toml has no GitHub release yet: bump the version, push, done.
+#
+# Release v<version> gets two assets with fixed names, so the newest one is
+# always at .../releases/latest/download/<name>:
+#   dsp-panel-rs-linux-x64.tar.gz   server (static musl), web client, install scripts
+#   latest-x64.json                 {name, version, arch, file, folder, sha256, size, built, install}
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "Release v$version exists – nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Toolchain
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown   # toolchain from rust-toolchain.toml
+          curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.22.0/trunk-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar -xz -C /usr/local/bin trunk
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.version.outputs.skip != 'true'
+
+      - name: Test
+        if: steps.version.outputs.skip != 'true'
+        run: cargo test --workspace --exclude dsp-web && cargo test -p dsp-web
+
+      - name: Build
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          (cd crates/dsp-web && trunk build --release)
+          cargo build --release -p dsp-server --target x86_64-unknown-linux-musl
+
+      - name: Package
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          version=${{ steps.version.outputs.version }}
+          name=dsp-panel-rs-$version-linux-x64
+          file=dsp-panel-rs-linux-x64.tar.gz
+          mkdir -p "dist/$name"
+          install -m 755 target/x86_64-unknown-linux-musl/release/dsp-server "dist/$name/dsp-server"
+          cp -r crates/dsp-web/dist "dist/$name/web"
+          rm -f "dist/$name/web/.trunk-lock"
+          cp deploy/install.sh deploy/uninstall.sh deploy/dsp-panel-rs.service deploy/config.example.yaml "dist/$name/"
+          tar -C dist -czf "dist/$file" "$name"
+          cat > dist/latest-x64.json <<EOF
+          {
+            "name": "dsp-panel-rs",
+            "version": "$version",
+            "arch": "x64",
+            "file": "$file",
+            "folder": "$name",
+            "sha256": "$(sha256sum "dist/$file" | cut -d' ' -f1)",
+            "size": $(stat -c %s "dist/$file"),
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "install": "sudo bash install.sh [--import-from /var/lib/dsp-panel]"
+          }
+          EOF
+          cat dist/latest-x64.json
+
+      - name: Publish
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          version=${{ steps.version.outputs.version }}
+          gh release create "v$version" dist/dsp-panel-rs-linux-x64.tar.gz dist/latest-x64.json \
+            --target "$GITHUB_SHA" --title "DSP Panel $version" --generate-notes --latest

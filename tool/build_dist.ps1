@@ -1,4 +1,5 @@
-# Build the release package of the panel (dsp-panel-rs) on Windows.
+# Build a test package of the panel (dsp-panel-rs) on Windows. Releases are
+# built by GitHub (.github\workflows\release.yml).
 #
 #   .\tool\build_dist.ps1                 x64 package
 #   .\tool\build_dist.ps1 -Arch arm64     arm64 package
@@ -19,11 +20,7 @@
 
 param(
   [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
-  [string]$Web,
-  # Also publish the package as release\dsp-panel-rs-linux-<arch>.tar.gz
-  # with release\latest-<arch>.json (version, sha256) for automatic
-  # installation from the repository.
-  [switch]$Release
+  [string]$Web
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,25 +75,4 @@ foreach ($f in 'install.sh', 'uninstall.sh', 'dsp-panel-rs.service', 'config.exa
 Invoke-Checked { tar -C (Join-Path $root 'dist') -czf $archive $name } 'tar'
 Write-Host "==> dist\$name.tar.gz"
 
-if ($Release) {
-  $releaseDir = Join-Path $root 'release'
-  New-Item -ItemType Directory -Force $releaseDir | Out-Null
-  $file = "dsp-panel-rs-linux-$Arch.tar.gz"
-  Copy-Item $archive (Join-Path $releaseDir $file) -Force
-  $hash = (Get-FileHash -Algorithm SHA256 (Join-Path $releaseDir $file)).Hash.ToLower()
-  $manifest = [ordered]@{
-    name    = 'dsp-panel-rs'
-    version = $version
-    arch    = $Arch
-    file    = $file
-    folder  = $name
-    sha256  = $hash
-    size    = (Get-Item (Join-Path $releaseDir $file)).Length
-    built   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    install = 'sudo bash install.sh [--import-from /var/lib/dsp-panel]'
-  }
-  $json = ($manifest | ConvertTo-Json) -replace "`r`n", "`n"
-  [System.IO.File]::WriteAllText((Join-Path $releaseDir "latest-$Arch.json"), "$json`n", (New-Object System.Text.UTF8Encoding $false))
-  Write-Host "==> release\$file (sha256 $hash)"
-}
 Write-Host "    On the VM (Windows tar does not keep the executable bits): sudo bash install.sh [--import-from /var/lib/dsp-panel]"
