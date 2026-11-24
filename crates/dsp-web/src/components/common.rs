@@ -288,7 +288,12 @@ pub fn ChannelSelector(
             }
         })
     };
-    view! { <div class="channel-selector">{content}</div> }
+    let label = match (inputs, outputs) {
+        (true, false) => "Input",
+        (false, true) => "Output",
+        _ => "Channel",
+    };
+    view! { <div class="channel-selector"><span class="cs-label">{label}</span>{content}</div> }
 }
 
 /// Segmented button (one of several).

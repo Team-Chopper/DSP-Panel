@@ -33,6 +33,9 @@ pub struct PanelData {
     pub link_names: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub light: LightSettings,
+    /// Per DSP id: channels whose curve is hidden in the EQ overview.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hidden_curves: BTreeMap<String, Vec<String>>,
 }
 
 impl PanelData {

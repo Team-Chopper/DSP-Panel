@@ -5,7 +5,8 @@
 //! {
 //!   "limiter": {"amps": [...], "outputs": {"<dsp id>/Out 1": {...}}, "referenceDbu": {}},
 //!   "linkNames": {"<dsp id>": {"Out 1+Out 2": "Tops"}},
-//!   "light": {"enabled": false, "ignore": {"<dsp id>": ["Out 5"]}}
+//!   "light": {"enabled": false, "ignore": {"<dsp id>": ["Out 5"]}},
+//!   "hiddenCurves": {"<dsp id>": ["In B"]}
 //! }
 //! ```
 //!
@@ -16,6 +17,9 @@
 //!   it back.
 //! - `light`: the limit light page (/limit, without login) and the outputs it
 //!   does not watch.
+//! - `hiddenCurves`: channels whose curve the EQ overview of the gain page
+//!   hides (kept here so it survives browser restarts and is the same on
+//!   every client).
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -138,6 +142,23 @@ impl PanelStore {
         Ok(())
     }
 
+    /// Channels of [dsp] whose EQ overview curve is hidden.
+    pub fn set_hidden_curves(&self, dsp: &str, channels: &[String]) -> Result<(), String> {
+        if dsp.len() > 80 || channels.len() > 16 || channels.iter().any(|c| c.len() > 8) {
+            return Err("Invalid hidden curves".into());
+        }
+        {
+            let mut i = self.0.borrow_mut();
+            if channels.is_empty() {
+                i.data.hidden_curves.remove(dsp);
+            } else {
+                i.data.hidden_curves.insert(dsp.to_string(), channels.to_vec());
+            }
+        }
+        self.save();
+        Ok(())
+    }
+
     /// Forget everything about a removed DSP.
     pub fn remove_dsp(&self, dsp: &str) {
         {
@@ -147,6 +168,7 @@ impl PanelStore {
             i.data.limiter.reference_dbu.remove(dsp);
             i.data.link_names.remove(dsp);
             i.data.light.ignore.remove(dsp);
+            i.data.hidden_curves.remove(dsp);
         }
         self.save();
     }

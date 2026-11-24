@@ -1,11 +1,10 @@
 //! Dialogs: add/edit DSP (with the network search), settings, and the channel
-//! menu with rename, copy (also to other DSPs) and link (with group names).
+//! menu with rename, copy (also to other DSPs) and the link matrix.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use dsp_core::api::{COPY_PARTS, DEFAULT_REFRESH_MS};
-use dsp_core::panel::LINK_NAME_MAX;
 use dsp_core::protocol::{MAX_DEVICE_ID, MIN_DEVICE_ID};
 use dsp_core::{DeviceModel, DspInfo, DspStatus, ops};
 use leptos::prelude::*;
@@ -16,7 +15,7 @@ use crate::icons::{I, Icon};
 use crate::local_settings;
 use crate::pages::dsp::{Dialog, ui};
 use crate::rta::RtaSettings;
-use crate::store::{App, ScanResult, alias_in, app};
+use crate::store::{App, Device, ScanResult, alias_in, app};
 
 /// TCP port the DSPs listen on (and the network search probes).
 const DSP_PORT: i64 = 9761;
@@ -433,7 +432,7 @@ pub fn ChannelDialogs(dialog: Dialog) -> impl IntoView {
         Dialog::ChannelMenu(ch) => view! { <ChannelMenu channel=ch/> }.into_any(),
         Dialog::Rename(ch) => view! { <RenameDialog channel=ch/> }.into_any(),
         Dialog::Copy(ch) => view! { <CopyDialog channel=ch/> }.into_any(),
-        Dialog::Link(ch) => view! { <LinkDialog channel=ch/> }.into_any(),
+        Dialog::Link => view! { <LinkDialog/> }.into_any(),
         Dialog::MaxLevel(ch) => view! { <MaxLevelDialog channel=ch/> }.into_any(),
         Dialog::ForceGain(ch, db) => view! { <ForceGainDialog channel=ch db=db/> }.into_any(),
         _ => ().into_any(),
@@ -571,7 +570,7 @@ fn ChannelMenu(channel: String) -> impl IntoView {
             <div class="col" style="gap:2px">
                 {item(I::Edit, "Rename", "Stored on the DSP, max. 8 characters", Dialog::Rename(channel.clone()))}
                 {item(I::Copy, "Copy settings to …", copy_sub, Dialog::Copy(channel.clone()))}
-                {item(I::Link, "Link with …", "Linked channels change together", Dialog::Link(channel.clone()))}
+                {item(I::Link, "Link channels …", "Linked channels change together", Dialog::Link)}
                 {(!device.offline).then(|| item(
                     I::VerticalTop,
                     "Max level …",
@@ -899,175 +898,281 @@ fn CopyDialog(channel: String) -> impl IntoView {
 
 // ─── Link ───
 
-/// Members of the link group [master] + [slaves], in channel order ([group]
-/// is the channel's group of the model).
-fn link_members(group: &[String], master: &str, slaves: &BTreeSet<String>) -> Vec<String> {
-    group.iter().filter(|c| c.as_str() == master || slaves.contains(*c)).cloned().collect()
+/// Pending links of one group (inputs or outputs): per channel (group order)
+/// the index of the channel it follows, `None` for a channel of its own or a
+/// master.
+type Follows = Vec<Option<usize>>;
+
+/// Whether the matrix offers [row] following [col]: like the original editor
+/// only a lower channel can be the master (Out1 column: Out2 … Out8), and a
+/// channel that follows another cannot be a master itself.
+fn can_follow(f: &Follows, row: usize, col: usize) -> bool {
+    col < row && f[col].is_none()
 }
 
-/// Link dialog, master/slave like the original editor: [channel] becomes the
-/// master of the selected channels. A slave cannot be linked further; its
-/// dialog only offers to leave its master. On a DSP the group can be named
-/// (kept by the panel server for exactly these members).
+/// A click on the matrix button of [row] (the channel) in the column of
+/// [col] (its master). The diagonal or a set button frees the row; otherwise
+/// the row follows [col] and takes its own followers along.
+fn follow_click(f: &mut Follows, row: usize, col: usize) {
+    if row == col || f[row] == Some(col) {
+        f[row] = None;
+        return;
+    }
+    if !can_follow(f, row, col) {
+        return;
+    }
+    for k in f.iter_mut() {
+        if *k == Some(row) {
+            *k = Some(col);
+        }
+    }
+    f[row] = Some(col);
+}
+
+fn followers(f: &Follows, master: usize) -> Vec<usize> {
+    (0..f.len()).filter(|k| f[*k] == Some(master)).collect()
+}
+
+/// The link jobs (master, slaves) that turn [old] into [new]: first every
+/// master releases the slaves it loses, then the masters get their new slaves
+/// (a channel is free before it is linked elsewhere).
+fn link_steps(group: &[String], old: &Follows, new: &Follows) -> Vec<(String, Vec<String>)> {
+    let names = |list: &[usize]| list.iter().map(|k| group[*k].clone()).collect::<Vec<_>>();
+    let kept = |m: usize| followers(old, m).into_iter().filter(|k| new[*k] == Some(m)).collect::<Vec<_>>();
+    let mut steps = Vec::new();
+    for (m, master) in group.iter().enumerate() {
+        if kept(m) != followers(old, m) {
+            steps.push((master.clone(), names(&kept(m))));
+        }
+    }
+    for (m, master) in group.iter().enumerate() {
+        let after = followers(new, m);
+        if !after.is_empty() && after != kept(m) {
+            steps.push((master.clone(), names(&after)));
+        }
+    }
+    steps
+}
+
+/// Members (channel order) of the group of [master] in [f], if it has slaves.
+fn group_members(group: &[String], f: &Follows, master: usize) -> Option<Vec<String>> {
+    let list = followers(f, master);
+    (!list.is_empty()).then(|| {
+        group.iter().enumerate().filter(|(k, _)| *k == master || list.contains(k)).map(|(_, c)| c.clone()).collect()
+    })
+}
+
+/// Link matrix like the original editor ("Link Selection"): for the inputs and
+/// for the outputs a grid with a row per channel and a column per channel it
+/// can follow (master/slave). Apply runs the needed link jobs one after the
+/// other; a changed group keeps the name of its master's group.
 #[component]
-fn LinkDialog(channel: String) -> impl IntoView {
+fn LinkDialog() -> impl IntoView {
     let ui = ui();
     let device = ui.device;
     let app = app();
-    let close = Callback::new(move |_| ui.dialog.set(None));
-    let (master, name) = device.state.with_untracked(|s| (ops::master_of(s, &channel), alias_in(s, &channel)));
-    if let Some(master) = master {
-        let master_name = device.alias(&master);
-        let ch = channel.clone();
-        let edit_master = master.clone();
-        let actions = view! {
-            <button class="btn text" on:click=move |_| ui.dialog.set(None)>"Close"</button>
-            <button class="btn text" on:click=move |_| ui.dialog.set(Some(Dialog::Link(edit_master.clone())))>
-                {format!("Edit {master_name} …")}
-            </button>
-            <button class="btn filled" on:click=move |_| {
-                device.unlink(&ch);
-                ui.dialog.set(None);
-            }>"Unlink"</button>
-        }
-        .into_any();
-        let master_name = device.alias(&master);
-        return view! {
-            <Modal title=format!("Link {name}") on_close=close width=380 actions=actions>
-                <div style="font-size:13px;line-height:1.5">{format!(
-                    "{name} is linked to {master_name} (master): changes of the master apply to it. A linked channel \
-                     cannot be linked to other channels – to add more channels, link them to {master_name}."
-                )}</div>
-            </Modal>
-        }
-        .into_any();
-    }
-
-    let (group, current, candidates, reasons) = device.state.with_untracked(|s| {
-        let group: Vec<String> = s.model.group_of(&channel).iter().map(|c| c.to_string()).collect();
-        let current = ops::slaves_of(s, &channel);
-        let candidates = ops::link_candidates(s, &channel);
-        let reasons: Vec<(String, String, Option<String>)> = group
-            .iter()
-            .filter(|c| **c != channel)
-            .map(|c| {
-                let reason = (!candidates.contains(c)).then(|| match ops::master_of(s, c) {
-                    Some(m) => format!("linked to {}", alias_in(s, &m)),
-                    None => format!(
-                        "master of {}",
-                        ops::slaves_of(s, c).iter().map(|x| alias_in(s, x)).collect::<Vec<_>>().join(", ")
-                    ),
-                });
-                (c.clone(), alias_in(s, c), reason)
-            })
-            .collect();
-        (group, current, candidates, reasons)
+    let model = device.model_untracked();
+    let groups: [Vec<String>; 2] =
+        [model.inputs.iter().map(|c| c.to_string()).collect(), model.outputs.iter().map(|c| c.to_string()).collect()];
+    let current: [Follows; 2] = device.state.with_untracked(|s| {
+        groups.clone().map(|g| g.iter().map(|c| ops::master_of(s, c).and_then(|m| g.iter().position(|x| *x == m))).collect())
     });
-    let current_set: BTreeSet<String> = current.iter().cloned().collect();
-    let selection = RwSignal::new(current_set.clone());
-
-    // Group name: the stored name of master + chosen slaves (or, while these
-    // have none, the name of the group as it is now, so it carries over when
-    // channels are added or removed) until the user types one.
-    let dsp_id = device.id();
-    let current_members = link_members(&group, &channel, &current_set);
-    let stored_name = {
-        let (group, master, dsp) = (group.clone(), channel.clone(), dsp_id.clone());
-        Memo::new(move |_| {
-            let members = selection.with(|s| link_members(&group, &master, s));
-            if members.len() < 2 {
-                return String::new();
-            }
-            app.panel.with(|p| {
-                p.link_name(&dsp, &members)
-                    .or_else(|| p.link_name(&dsp, &current_members))
-                    .unwrap_or_default()
-                    .to_string()
-            })
-        })
+    let pending = [RwSignal::new(current[0].clone()), RwSignal::new(current[1].clone())];
+    let changed = {
+        let current = current.clone();
+        Memo::new(move |_| pending[0].with(|p| *p != current[0]) || pending[1].with(|p| *p != current[1]))
     };
-    let typed_name = RwSignal::new(None::<String>);
-    let group_name = move || typed_name.get().unwrap_or_else(|| stored_name.get());
 
-    let ch = channel.clone();
-    let unlink_ch = channel.clone();
-    let has_current = !current.is_empty();
-    let actions = view! {
-        {has_current.then(|| view! {
-            <button class="btn text" on:click=move |_| {
-                device.unlink(&unlink_ch);
-                ui.dialog.set(None);
-            }>"Unlink all"</button>
-        })}
-        <span class="spacer"></span>
-        <button class="btn text" on:click=move |_| ui.dialog.set(None)>"Cancel"</button>
-        <button class="btn filled" on:click=move |_| {
-            let selected = selection.get_untracked();
-            // An unchanged group is not linked again (a rename needs no link job).
-            if selected != current_set {
-                device.set_link_slaves(&ch, group.iter().filter(|c| selected.contains(*c)).cloned().collect());
+    // The remaining jobs while applying, and (started, total).
+    let steps = StoredValue::new(Vec::<(String, Vec<String>)>::new());
+    let progress = RwSignal::new(None::<(usize, usize)>);
+    let ready = Memo::new(move |_| device.info.with(|i| i.status == DspStatus::Ready));
+    let next_step = move || {
+        let next = steps.try_update_value(|s| (!s.is_empty()).then(|| s.remove(0))).flatten();
+        match next {
+            Some((master, slaves)) => {
+                progress.update(|p| {
+                    if let Some((started, _)) = p {
+                        *started += 1;
+                    }
+                });
+                device.set_link_slaves(&master, slaves);
             }
-            if !device.offline {
-                let members = link_members(&group, &ch, &selected);
-                let shown = typed_name.get_untracked().unwrap_or_else(|| stored_name.get_untracked());
-                let shown: String = shown.trim().chars().take(LINK_NAME_MAX).collect();
-                // Compared with the name stored for exactly these members: a
-                // carried-over name is stored for the new group too.
-                let stored = app.panel.with_untracked(|p| p.link_name(&dsp_id, &members).unwrap_or_default().to_string());
-                if members.len() >= 2 && shown != stored {
-                    app.set_link_name(&dsp_id, &members, &shown);
+            None => ui.dialog.set(None),
+        }
+    };
+    // On a DSP every link is a job of its own: the next one starts when the
+    // DSP is ready again after the previous one.
+    Effect::new(move |_| {
+        if ready.get() && progress.get_untracked().is_some() {
+            next_step();
+        }
+    });
+
+    let dsp_id = device.id();
+    let apply = {
+        let (groups, current) = (groups.clone(), current.clone());
+        move || {
+            let mut all = Vec::new();
+            for g in 0..2 {
+                let new = pending[g].get_untracked();
+                all.extend(link_steps(&groups[g], &current[g], &new));
+                if device.offline {
+                    continue;
+                }
+                for m in 0..groups[g].len() {
+                    let before = group_members(&groups[g], &current[g], m);
+                    let after = group_members(&groups[g], &new, m);
+                    let (Some(before), Some(after)) = (before, after) else { continue };
+                    let name = app.panel.with_untracked(|p| {
+                        p.link_name(&dsp_id, &after).is_none().then(|| p.link_name(&dsp_id, &before).map(String::from)).flatten()
+                    });
+                    if let Some(name) = name.filter(|_| before != after) {
+                        app.set_link_name(&dsp_id, &after, &name);
+                    }
                 }
             }
-            ui.dialog.set(None);
-        }>"Apply"</button>
+            if all.is_empty() {
+                ui.dialog.set(None);
+            } else if device.offline {
+                for (master, slaves) in all {
+                    device.set_link_slaves(&master, slaves);
+                }
+                ui.dialog.set(None);
+            } else {
+                progress.set(Some((0, all.len())));
+                steps.set_value(all);
+                next_step();
+            }
+        }
+    };
+
+    let close = Callback::new(move |_| ui.dialog.set(None));
+    let busy = move || progress.with(Option::is_some);
+    let actions = view! {
+        <button class="btn text" prop:disabled=busy on:click=move |_| {
+            for p in pending {
+                p.update(|f| f.iter_mut().for_each(|x| *x = None));
+            }
+        }>"Unlink all"</button>
+        <span class="spacer"></span>
+        {move || progress.get().map(|(started, total)| view! {
+            <span class="small muted">{format!("Linking {started}/{total} …")}</span>
+        })}
+        <button class="btn text" on:click=move |_| ui.dialog.set(None)>"Close"</button>
+        <button class="btn filled" prop:disabled=move || !changed.get() || busy() on:click=move |_| apply()>"Apply"</button>
     }
     .into_any();
-    let name_field = (!device.offline).then(|| {
-        view! {
-            <div class="field link-name-field">
-                <label>"Group name"</label>
-                <input maxlength=LINK_NAME_MAX.to_string() placeholder="e.g. Mains, Subs, Front fill"
-                    prop:disabled=move || selection.with(BTreeSet::is_empty)
-                    prop:value=group_name
-                    on:input=move |ev| typed_name.set(Some(
-                        event_target_value(&ev).chars().filter(|c| !c.is_control()).take(LINK_NAME_MAX).collect(),
-                    ))/>
-                <span class="help">{format!(
-                    "Optional, max. {LINK_NAME_MAX} characters. Kept by the panel server for exactly these channels; \
-                     empty removes it."
-                )}</span>
-            </div>
-        }
-    });
+    let blocks = [("Inputs", "var(--input)"), ("Outputs", "var(--output)")]
+        .into_iter()
+        .enumerate()
+        .map(|(g, (title, color))| {
+            view! { <LinkMatrix device=device group=groups[g].clone() follows=pending[g] color=color title=title/> }
+        })
+        .collect_view();
     view! {
-        <Modal title=format!("Link {name} with …") on_close=close width=380 actions=actions>
-            <div class="note">{format!(
-                "{name} becomes the master, the selected channels follow it. Like the original editor, newly linked \
-                 channels first get the settings of {name} (gain, mute, phase, delay, EQ, filters, dynamics – not \
-                 names or routing). The link is stored on the DSP; a change is sent once and the DSP applies it to \
-                 the linked channels."
-            )}</div>
-            <div class="col" style="gap:2px">
-                {reasons.into_iter().map(|(c, label, reason)| {
-                    let key = c.clone();
-                    let enabled = candidates.contains(&c);
-                    let shown = match reason {
-                        Some(r) => format!("{label} – {r}"),
-                        None => label,
-                    };
-                    view! {
-                        <Check
-                            checked=Signal::derive(move || selection.with(|s| s.contains(&key)))
-                            disabled=Signal::derive(move || !enabled)
-                            on_toggle=Callback::new(move |_| if enabled {
-                                selection.update(|s| if !s.remove(&c) { s.insert(c.clone()); })
-                            })
-                            label=shown/>
-                    }
-                }).collect_view()}
+        <Modal title="Link channels" on_close=close width=1000 actions=actions>
+            <div class="note">
+                "Like the original editor: each column is a master, the lit button of a channel shows the column it \
+                 belongs to. A channel can only follow a lower one, and a linked channel cannot be a master. A click on \
+                 a channel in its own column or on a lit button releases it. Newly linked channels first \
+                 get the settings of their master (gain, mute, phase, delay, EQ, filters, dynamics – not names or \
+                 routing); afterwards a change of the master applies to the whole group. The links are stored on the DSP."
             </div>
-            {name_field}
+            <div class="link-matrices">{blocks}</div>
         </Modal>
     }
-    .into_any()
+}
+
+/// The matrix of one group, laid out like the original editor: a column per
+/// master with a button for itself and every higher channel; the lit button
+/// of a channel shows the column it belongs to (its own column: not linked,
+/// or master).
+#[component]
+fn LinkMatrix(
+    device: Device,
+    group: Vec<String>,
+    follows: RwSignal<Follows>,
+    color: &'static str,
+    title: &'static str,
+) -> impl IntoView {
+    let n = group.len();
+    let names: Vec<String> = group.iter().map(|c| device.alias(c)).collect();
+    let columns = (0..n)
+        .map(|col| {
+            let cells = (0..n)
+                .map(|row| {
+                    // A link to a higher master (older panel versions) is shown so it can be released.
+                    let shown = move || row >= col || follows.with(|f| f[row] == Some(col));
+                    let on = move || follows.with(|f| if row == col { f[row].is_none() } else { f[row] == Some(col) });
+                    let offered = move || row == col || follows.with(|f| f[row] == Some(col) || can_follow(f, row, col));
+                    let tip = if row == col {
+                        format!("{} not linked (or master of its group)", names[row])
+                    } else {
+                        format!("{} follows {}", names[row], names[col])
+                    };
+                    let name = names[row].clone();
+                    view! {
+                        <div class="lm-slot">
+                            <Show when=shown>
+                                <button class="lm-cell" class:on=on prop:disabled=move || !offered() title=tip.clone()
+                                    on:click=move |_| follows.update(|f| follow_click(f, row, col))>
+                                    {name.clone()}
+                                </button>
+                            </Show>
+                        </div>
+                    }
+                })
+                .collect_view();
+            view! {
+                <div class="lm-column">
+                    <div class="lm-head" title=names[col].clone()>{names[col].clone()}</div>
+                    {cells}
+                </div>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="link-matrix" style=format!("--gc:{color}")>
+            <div class="lm-title">{title}</div>
+            <div class="lm-columns">{columns}</div>
+        </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group() -> Vec<String> {
+        ["Out1", "Out2", "Out3", "Out4"].iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn clicks_keep_master_slave_rules() {
+        let mut f: Follows = vec![None; 4];
+        follow_click(&mut f, 2, 1); // Out3 follows Out2
+        follow_click(&mut f, 3, 2); // Out4 → Out3, a slave: refused
+        follow_click(&mut f, 0, 1); // Out1 → Out2, a higher channel: refused
+        assert_eq!(f, vec![None, None, Some(1), None]);
+        follow_click(&mut f, 1, 0); // the master Out2 follows Out1: its slave comes along
+        assert_eq!(f, vec![None, Some(0), Some(0), None]);
+        follow_click(&mut f, 3, 0);
+        follow_click(&mut f, 2, 2); // the diagonal releases
+        follow_click(&mut f, 3, 0); // so does a set button
+        assert_eq!(f, vec![None, Some(0), None, None]);
+    }
+
+    #[test]
+    fn steps_release_before_linking() {
+        let old = vec![None, Some(0), None, None]; // Out1 + Out2
+        let new = vec![None, None, Some(1), None]; // Out2 + Out3
+        let steps = link_steps(&group(), &old, &new);
+        assert_eq!(steps, vec![("Out1".into(), vec![]), ("Out2".into(), vec!["Out3".to_string()])]);
+        // Adding a slave: one job with the whole group, nothing to release.
+        let steps = link_steps(&group(), &old, &vec![None, Some(0), Some(0), None]);
+        assert_eq!(steps, vec![("Out1".into(), vec!["Out2".to_string(), "Out3".to_string()])]);
+        assert!(link_steps(&group(), &old, &old).is_empty());
+        assert_eq!(group_members(&group(), &new, 1), Some(vec!["Out2".to_string(), "Out3".to_string()]));
+    }
 }

@@ -1,5 +1,5 @@
 //! Everything for one DSP (or a server preset in the offline editor): section
-//! bar (Gain · EQ · GEQ · Gate · Comp · Limit · Matrix · Delay · RTA) with
+//! bar (Gain · EQ In · EQ Out · GEQ · Gate · Comp · Limit · Matrix · Delay · RTA) with
 //! presets, connection status and connect/disconnect on the right, the section
 //! content and the optional debug log. While the DSP is not connected the
 //! content is blurred and a connect button is shown on top.
@@ -21,7 +21,8 @@ use crate::store::{Device, app};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Gain,
-    Eq,
+    EqIn,
+    EqOut,
     Geq,
     Gate,
     Comp,
@@ -32,9 +33,10 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Gain,
-        Section::Eq,
+        Section::EqIn,
+        Section::EqOut,
         Section::Geq,
         Section::Gate,
         Section::Comp,
@@ -47,7 +49,8 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::Gain => "Gain",
-            Section::Eq => "EQ",
+            Section::EqIn => "EQ In",
+            Section::EqOut => "EQ Out",
             Section::Geq => "GEQ",
             Section::Gate => "Gate",
             Section::Comp => "Comp",
@@ -61,7 +64,7 @@ impl Section {
     fn icon(self) -> I {
         match self {
             Section::Gain => I::Tune,
-            Section::Eq => I::ShowChart,
+            Section::EqIn | Section::EqOut => I::ShowChart,
             Section::Geq => I::Equalizer,
             Section::Gate => I::Door,
             Section::Comp => I::Compress,
@@ -79,7 +82,7 @@ pub enum Dialog {
     ChannelMenu(String),
     Rename(String),
     Copy(String),
-    Link(String),
+    Link,
     /// Max level of a channel.
     MaxLevel(String),
     /// Confirm a typed gain above the channel's max level.
@@ -98,7 +101,7 @@ pub struct DspUi {
     /// views that depend on the channel list read this, not the state.
     pub model: Memo<DeviceModel>,
     pub section: RwSignal<Section>,
-    /// Channel to show when the EQ/GEQ page is opened from the overview.
+    /// Channel to show when an EQ/GEQ page is opened from the overview.
     pub eq_channel: RwSignal<Option<String>>,
     pub dialog: RwSignal<Option<Dialog>>,
 }
@@ -106,7 +109,7 @@ pub struct DspUi {
 impl DspUi {
     pub fn open_eq(&self, channel: &str) {
         self.eq_channel.set(Some(channel.to_string()));
-        self.section.set(Section::Eq);
+        self.section.set(if self.model.get_untracked().is_input(channel) { Section::EqIn } else { Section::EqOut });
     }
 }
 
@@ -134,7 +137,8 @@ pub fn DspPage(device: Device) -> impl IntoView {
         let section = ui.section.get();
         match section {
             Section::Gain => view! { <pages::gain::GainPage/> }.into_any(),
-            Section::Eq => view! { <pages::eq::EqPage/> }.into_any(),
+            Section::EqIn => view! { <pages::eq::EqPage inputs=true/> }.into_any(),
+            Section::EqOut => view! { <pages::eq::EqPage inputs=false/> }.into_any(),
             Section::Geq => view! { <pages::geq::GeqPage/> }.into_any(),
             Section::Gate => view! { <pages::dynamics::GatePage/> }.into_any(),
             Section::Comp => view! { <pages::dynamics::CompressorPage/> }.into_any(),
@@ -222,7 +226,7 @@ fn SectionBar(show_debug: RwSignal<bool>) -> impl IntoView {
                     class:selected=move || ui.section.get() == s
                     title=s.label()
                     on:click=move |_| {
-                        if s != Section::Eq && s != Section::Geq {
+                        if !matches!(s, Section::EqIn | Section::EqOut | Section::Geq) {
                             ui.eq_channel.set(None);
                         }
                         ui.section.set(s);
@@ -241,6 +245,7 @@ fn SectionBar(show_debug: RwSignal<bool>) -> impl IntoView {
         let items = Signal::derive(move || {
             vec![
                 (I::Edit, "Edit DSP".to_string(), Callback::new(move |_| ui.dialog.set(Some(Dialog::EditDsp)))),
+                (I::Link, "Link channels …".to_string(), Callback::new(move |_| ui.dialog.set(Some(Dialog::Link)))),
                 (I::Settings, "Settings".to_string(), Callback::new(move |_| ui.dialog.set(Some(Dialog::Settings)))),
                 (
                     I::Bug,

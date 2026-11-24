@@ -12,7 +12,7 @@ use dsp_core::protocol as p;
 use leptos::html;
 use leptos::prelude::*;
 
-use crate::components::common::{Check, PanelCard, ToggleButton, link_groups_memo, link_names_memo};
+use crate::components::common::{Check, PanelCard, Segmented, ToggleButton, link_groups_memo, link_names_memo};
 use crate::components::fader::{Fader, MeterSpec};
 use crate::components::value_field::ValueField;
 use crate::fmt::{db_mark_label, format_db_value, parse_number};
@@ -39,15 +39,17 @@ pub fn group_channels(inputs: bool) -> Vec<&'static str> {
 #[component]
 pub fn GainPage() -> impl IntoView {
     let device = ui().device;
-    let key = format!("hiddenEqCurves.{}", device.id());
-    let hidden = RwSignal::new(local_settings::get_string_set(&key));
+    // Kept by the server (panel data): the same on every client and after restarts.
+    let id = StoredValue::new(device.id());
+    let hidden = Memo::new(move |_| {
+        id.with_value(|id| app().panel.with(|p| p.hidden_curves.get(id).into_iter().flatten().cloned().collect::<BTreeSet<_>>()))
+    });
     let toggle = Callback::new(move |ch: String| {
-        hidden.update(|h| {
-            if !h.remove(&ch) {
-                h.insert(ch);
-            }
-        });
-        local_settings::set_string_set(&key, &hidden.get_untracked());
+        let mut next = hidden.get_untracked();
+        if !next.remove(&ch) {
+            next.insert(ch);
+        }
+        id.with_value(|id| app().set_hidden_curves(id, next.into_iter().collect()));
     });
     let model = ui().model;
     let counts = move || {
@@ -59,11 +61,13 @@ pub fn GainPage() -> impl IntoView {
     // group on either side, so inputs and outputs stay aligned.
     let groups = links.groups;
     let show_links = Memo::new(move |_| groups.with(|g| !g.is_empty()));
+    // Magnitude or phase, the same browser setting as the EQ pages.
+    let phase = RwSignal::new(local_settings::get_string("eqGraph").as_deref() == Some("phase"));
     view! {
         <div class="gain-page">
             <div class="gain-grid" style=counts>
-                <EqOverview inputs=true hidden=hidden on_toggle=toggle/>
-                <EqOverview inputs=false hidden=hidden on_toggle=toggle/>
+                <EqOverview inputs=true hidden=hidden on_toggle=toggle phase=phase/>
+                <EqOverview inputs=false hidden=hidden on_toggle=toggle phase=phase/>
                 <FaderGroup inputs=true links=links show_links=show_links/>
                 <FaderGroup inputs=false links=links show_links=show_links/>
             </div>
@@ -384,22 +388,40 @@ fn db_to_y(db: f64) -> f64 {
     0.5 - db.clamp(-RANGE_DB, RANGE_DB) / RANGE_DB * 0.5
 }
 
-/// SVG path of a response curve with [steps] points over 20 Hz – 20 kHz.
-pub fn curve_path(eq: &ChannelEq, steps: usize) -> String {
+fn deg_to_y(deg: f64) -> f64 {
+    0.5 - deg.clamp(-180.0, 180.0) / 180.0 * 0.5
+}
+
+/// Height (0 top … 1 bottom) of the curve at [hz]: magnitude or phase.
+fn curve_y(eq: &ChannelEq, hz: f64, phase: bool) -> f64 {
+    if phase { deg_to_y(eq.phase_deg(hz)) } else { db_to_y(eq.db(hz)) }
+}
+
+/// SVG path of a response curve with [steps] points over 20 Hz – 20 kHz; a
+/// phase wrap starts a new segment instead of a vertical line.
+pub fn curve_path(eq: &ChannelEq, steps: usize, phase: bool) -> String {
     let mut path = String::with_capacity(steps * 14);
+    let mut last = None::<f64>;
     for s in 0..=steps {
         let x = s as f64 / steps as f64;
-        let y = db_to_y(eq.db(x_to_hz(x)));
-        path.push_str(&format!("{}{:.1},{:.1}", if s == 0 { "M" } else { "L" }, x * W, y * H));
+        let y = curve_y(eq, x_to_hz(x), phase);
+        let jump = last.is_none_or(|l| (y - l).abs() > 0.5);
+        path.push_str(&format!("{}{:.1},{:.1}", if jump { "M" } else { "L" }, x * W, y * H));
+        last = Some(y);
     }
     path
 }
 
 /// The total response of every channel of one group (PEQ, filters and, for
-/// inputs, the GEQ). The legend has a checkbox per channel to hide its curve;
-/// clicking a curve opens the EQ page for it.
+/// inputs, the GEQ), as magnitude or phase. The legend has a checkbox per
+/// channel to hide its curve; clicking a curve opens the EQ page for it.
 #[component]
-fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callback<String>) -> impl IntoView {
+fn EqOverview(
+    inputs: bool,
+    hidden: Memo<BTreeSet<String>>,
+    on_toggle: Callback<String>,
+    phase: RwSignal<bool>,
+) -> impl IntoView {
     let ui = ui();
     let device = ui.device;
     let svg = NodeRef::<html::Div>::new();
@@ -411,7 +433,10 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
             .enumerate()
             .map(|(i, ch)| {
                 let eq = Memo::new(move |_| device.state.with(|s| ChannelEq::of(s, ch)));
-                let path = Memo::new(move |_| eq.with(|e| curve_path(e, 160)));
+                let path = Memo::new(move |_| {
+                    let ph = phase.get();
+                    eq.with(|e| curve_path(e, 160, ph))
+                });
                 (ch, i, eq, path)
             })
             .collect::<Vec<_>>()
@@ -424,10 +449,11 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
         let y = (ev.client_y() as f64 - rect.top()) / rect.height().max(1.0);
         let hz = x_to_hz(x);
         let hidden = hidden.get_untracked();
+        let ph = phase.get_untracked();
         let best = curves.with_untracked(|list| {
             list.iter()
                 .filter(|(ch, ..)| !hidden.contains(*ch))
-                .map(|(ch, _, eq, _)| (*ch, (eq.with_untracked(|e| db_to_y(e.db(hz))) - y).abs()))
+                .map(|(ch, _, eq, _)| (*ch, (eq.with_untracked(|e| curve_y(e, hz, ph)) - y).abs()))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(ch, _)| ch)
         });
@@ -436,23 +462,42 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
         }
     };
 
-    let grid = [100.0, 1000.0, 10000.0]
-        .map(|hz| {
+    // Every 1-2-…-9 line of a decade, the decades brighter.
+    let grid = [10.0, 100.0, 1000.0, 10000.0]
+        .into_iter()
+        .flat_map(|decade| (1..10).map(move |m| (decade * m as f64, m == 1)))
+        .filter(|(hz, _)| (MIN_HZ..=MAX_HZ).contains(hz))
+        .map(|(hz, decade)| {
             let x = hz_to_x(hz) * W;
-            view! { <line class="graph-grid" x1=x y1="0" x2=x y2=H/> }
+            view! { <line class="graph-grid" x1=x y1="0" x2=x y2=H opacity=if decade { "1" } else { "0.45" }/> }
         })
         .collect_view();
-    let db_lines = [-12.0, -6.0, 6.0, 12.0]
-        .map(|db| {
-            let y = db_to_y(db) * H;
-            view! { <line class="graph-grid" x1="0" y1=y x2=W y2=y opacity="0.47"/> }
-        })
-        .collect_view();
-    let labels = [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")]
+    // Level lines and labels: ±6/±12 dB, or ±45/±90/±135° in the phase view.
+    let marks = move || -> Vec<(f64, String)> {
+        if phase.get() {
+            [135.0, 90.0, 45.0, 0.0, -45.0, -90.0, -135.0].map(|d: f64| (deg_to_y(d), format!("{}°", d as i64))).to_vec()
+        } else {
+            [12.0, 6.0, 0.0, -6.0, -12.0].map(|db| (db_to_y(db), format!("{}dB", db_mark_label(db)))).to_vec()
+        }
+    };
+    let db_lines = move || {
+        marks()
+            .into_iter()
+            .filter(|(y, _)| *y != 0.5)
+            .map(|(y, _)| view! { <line class="graph-grid" x1="0" y1=y * H x2=W y2=y * H opacity="0.6"/> })
+            .collect_view()
+    };
+    let labels = [(20.0, "20Hz"), (100.0, "100Hz"), (1000.0, "1kHz"), (10000.0, "10kHz")]
         .map(|(hz, text)| {
             view! { <span class="graph-label" style=format!("left:calc({:.3}% + 3px)", hz_to_x(hz) * 100.0)>{text}</span> }
         })
         .collect_view();
+    let db_labels = move || {
+        marks()
+            .into_iter()
+            .map(|(y, text)| view! { <span class="graph-db" style=format!("top:{:.3}%", y * 100.0)>{text}</span> })
+            .collect_view()
+    };
     let paths = move || {
         let hidden = hidden.get();
         curves
@@ -482,8 +527,18 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
 
     let title = if inputs { "Inputs · EQ" } else { "Outputs · EQ" };
     let accent = if inputs { "var(--input)" } else { "var(--output)" };
+    let trailing = view! {
+        <span class="graph-mode" data-view-ok>
+            <Segmented labels=vec!["Mag", "Phase"] selected=Signal::derive(move || phase.get() as usize)
+                on_select=Callback::new(move |i: usize| {
+                    phase.set(i == 1);
+                    local_settings::set_string("eqGraph", if i == 1 { "phase" } else { "magnitude" });
+                })/>
+        </span>
+    }
+    .into_any();
     view! {
-        <PanelCard title=Signal::derive(move || title.to_string()) accent=accent>
+        <PanelCard title=Signal::derive(move || title.to_string()) accent=accent trailing=trailing>
             // Opening the EQ page and hiding curves only change the view.
             <div class="eq-overview" data-view-ok node_ref=svg on:click=on_click>
                 <svg viewBox=format!("0 0 {W} {H}") preserveAspectRatio="none">
@@ -493,6 +548,7 @@ fn EqOverview(inputs: bool, hidden: RwSignal<BTreeSet<String>>, on_toggle: Callb
                     {paths}
                 </svg>
                 {labels}
+                {db_labels}
             </div>
             <div class="legend" data-view-ok>{legend}</div>
         </PanelCard>

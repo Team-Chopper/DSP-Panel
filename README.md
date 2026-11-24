@@ -20,8 +20,8 @@ Phone / tablet / laptop ──HTTPS + WebSocket──▶ dsp-server ──TCP 97
 
 ## Features
 
-**Every page for every DSP** – one tab per DSP, sections Gain · EQ · GEQ · Gate · Comp · Limit · Matrix ·
-Delay · RTA. Console-style faders (drag, wheel, arrow keys, −/+ steppers with auto-repeat, double-click to
+**Every page for every DSP** – one tab per DSP, sections Gain · EQ In · EQ Out · GEQ · Gate · Comp · Limit ·
+Matrix · Delay · RTA; dark or light theme. Console-style faders (drag, wheel, arrow keys, −/+ steppers with auto-repeat, double-click to
 reset, Shift for fine moves, haptic tick at 0 dB on phones); every value can also be typed.
 
 - **Gain** – faders with dBFS meters, clip and limiter LEDs, mute and polarity; an EQ overview of all channels
@@ -104,7 +104,7 @@ All data lives in the data directory as JSON/YAML files:
 | `devices.json` | the DSPs (address, model, device ID, lock password, max levels) |
 | `presets.json` | the preset library |
 | `safety.json` | what mute all has to unmute, output gains saved for the test generator |
-| `panel.json` | limiter calculator, link group names, limit light settings |
+| `panel.json` | limiter calculator, link group names, limit light settings, hidden EQ overview curves |
 
 `devices.json` and `presets.json` have the format of the old Dart server, so data can be copied between both.
 `auth.json` and `secret.key` of an earlier version are no longer used and can be deleted.

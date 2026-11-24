@@ -546,6 +546,15 @@ impl Hub {
                 self.broadcast(&self.panel_message());
                 return error;
             }
+            Some(msg::HIDDEN_CURVES) => {
+                let dsp = message.get("dsp").and_then(Value::as_str);
+                let (Some(dsp), Some(channels)) = (dsp, string_list(message.get("channels"))) else {
+                    return Some("dsp/channels missing".into());
+                };
+                let error = self.panel().set_hidden_curves(dsp, &channels).err();
+                self.broadcast(&self.panel_message());
+                return error;
+            }
             Some(msg::LIGHT_SETTINGS) => {
                 let Some(settings) = message.get("settings") else { return Some("settings missing".into()) };
                 let error = self.panel().set_light(settings).err();

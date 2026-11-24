@@ -528,3 +528,51 @@ fn FaderMeter(spec: MeterSpec, indicators: bool, cap: f64) -> impl IntoView {
         </div>
     }
 }
+
+/// A level meter on its own (no fader): clip and, for outputs, limiter
+/// indicator on top, the bar below, on the gain taper like the fader meters.
+/// Written by the meter bank, nothing re-renders.
+#[component]
+pub fn LevelMeter(device: Device, channel: String, #[prop(default = false)] limit: bool) -> impl IntoView {
+    let lit = NodeRef::<html::Div>::new();
+    let peak = NodeRef::<html::Div>::new();
+    let clip = NodeRef::<html::Div>::new();
+    let limit_led = NodeRef::<html::Div>::new();
+    let registrations = StoredValue::new(Vec::<u64>::new());
+    Effect::new(move |_| {
+        let (Some(lit), Some(peak), Some(clip)) = (lit.get(), peak.get(), clip.get()) else { return };
+        let mut ids = Vec::new();
+        device.meters.update_value(|bank| {
+            ids.push(bank.register_bar(&channel, lit.into(), peak.into(), crate::taper::GAIN_TAPER));
+            ids.push(bank.register_led(&channel, clip.into(), Led::Clip));
+            if let Some(el) = limit_led.get_untracked() {
+                ids.push(bank.register_led(&channel, el.into(), Led::Limit));
+            }
+        });
+        registrations.set_value(ids);
+    });
+    on_cleanup(move || {
+        let ids = registrations.get_value();
+        device.meters.update_value(|bank| {
+            for id in ids {
+                bank.unregister(id);
+            }
+        });
+    });
+    view! {
+        <div class="level-meter">
+            <div class="level-leds">
+                {limit.then(|| view! { <div class="led limit" node_ref=limit_led title="Limiter working">"L"</div> })}
+                <div class="led clip" node_ref=clip title="Clip">"C"</div>
+            </div>
+            <div class="level-bar">
+                <div class="meter">
+                    <div class="meter-dim"></div>
+                    <div class="meter-lit" node_ref=lit></div>
+                    <div class="meter-gaps"></div>
+                    <div class="meter-peak" node_ref=peak></div>
+                </div>
+            </div>
+        </div>
+    }
+}

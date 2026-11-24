@@ -1,7 +1,5 @@
-//! UI settings remembered per browser (localStorage), e.g. which EQ curves are
-//! hidden on the gain page. Without storage (private mode) nothing is kept.
-
-use std::collections::BTreeSet;
+//! UI settings remembered per browser (localStorage), e.g. the EQ graph view and
+//! the RTA input. Without storage (private mode) nothing is kept.
 
 const PREFIX: &str = "dsp-panel.";
 
@@ -17,12 +15,4 @@ pub fn set_string(key: &str, value: &str) {
     if let Some(s) = storage() {
         let _ = s.set_item(&format!("{PREFIX}{key}"), value);
     }
-}
-
-pub fn get_string_set(key: &str) -> BTreeSet<String> {
-    get_string(key).and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()
-}
-
-pub fn set_string_set(key: &str, values: &BTreeSet<String>) {
-    set_string(key, &serde_json::to_string(values).unwrap_or_default());
 }

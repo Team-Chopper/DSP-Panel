@@ -1,6 +1,7 @@
 //! Gate (inputs), compressor and limiter (outputs), each on its own page:
-//! channel selection, transfer curve (input level → output level) and the
-//! parameters as horizontal faders below.
+//! channel selection, transfer curve (input level → output level) with the
+//! parameters as horizontal faders below it, and the level meters of the
+//! group on the right like the original editor.
 //!
 //! The value ranges are those of the original editor: attack 1 … 999 ms,
 //! release 10 … 3000 ms, gate hold 10 … 999 ms, knee 0 … 12 dB.
@@ -15,16 +16,16 @@ use leptos::html;
 use leptos::prelude::*;
 
 use crate::components::common::{ChannelSelector, Check, PanelCard};
-use crate::components::fader::Fader;
+use crate::components::fader::{Fader, LevelMeter};
 use crate::components::size::use_size;
 use crate::components::value_field::ValueField;
-use crate::fmt::{fixed, format_db_value, parse_number};
+use crate::fmt::{db_mark_label, fixed, format_db_value, parse_number};
 use crate::icons::{I, Icon};
 use crate::meters::Led;
 use crate::pages::dsp::ui;
 use crate::pages::limiter_calc::LimiterCalcCard;
 use crate::store::{Device, app, filter_of};
-use crate::taper::Taper;
+use crate::taper::{GAIN_MARKS, GAIN_TAPER, Taper};
 
 // Times in ms (raw + 1) of the original editor.
 const ATTACK_MS: (i64, i64) = (1, 999);
@@ -245,14 +246,21 @@ fn DynamicsPage(kind: Kind) -> impl IntoView {
                 on_select=Callback::new(move |c: String| selection.set(Some(c)))/>
             {move || {
                 let ch = channel.get();
-                view! { <DynamicsContent device=device kind=kind channel=ch color=color/> }
+                let on_select = Callback::new(move |c: String| selection.set(Some(c)));
+                view! { <DynamicsContent device=device kind=kind channel=ch color=color on_select=on_select/> }
             }}
         </div>
     }
 }
 
 #[component]
-fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static str) -> impl IntoView {
+fn DynamicsContent(
+    device: Device,
+    kind: Kind,
+    channel: String,
+    color: &'static str,
+    on_select: Callback<String>,
+) -> impl IntoView {
     let ch = StoredValue::new(channel);
     let state = Memo::new(move |_| ch.with_value(|c| Dyn::of(device, kind, c)));
     let set = move |f: Field, v: i64| {
@@ -281,6 +289,9 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
     if kind != Kind::Gate {
         params.push(knee_row(state, set, defaults.get(Field::Knee), color));
     }
+    if kind == Kind::Compressor {
+        params.push(ratio_row(state, set, color));
+    }
 
     let badge = move || {
         let on = state.with(Dyn::active);
@@ -294,29 +305,12 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
             <Hint text="Below the threshold the gate closes. -90 dB = always open."/>
         }
         .into_any(),
-        Kind::Compressor => {
-            let ratio = Memo::new(move |_| state.with(|s| s.get(Field::Ratio)));
-            let options = p::COMPRESSOR_RATIO_NAMES
-                .iter()
-                .enumerate()
-                .map(|(i, name)| view! { <option value=i selected=move || ratio.get() == i as i64>{*name}</option> })
-                .collect_view();
-            view! {
-                {badge}
-                <ActivityLed device=device channel=ch.get_value() led=Led::Comp/>
-                <div class="side-label">"Ratio"</div>
-                <select class="ratio-select mono"
-                    style=move || format!("color:{}", if ratio.get() == 0 { "var(--muted)" } else { color })
-                    on:change=move |ev| {
-                        if let Ok(v) = event_target_value(&ev).parse::<i64>() {
-                            set(Field::Ratio, v);
-                        }
-                    }>
-                    {options}
-                </select>
-            }
-            .into_any()
+        Kind::Compressor => view! {
+            {badge}
+            <ActivityLed device=device channel=ch.get_value() led=Led::Comp/>
+            <Hint text="Ratio 1:1 means the compressor is off."/>
         }
+        .into_any(),
         Kind::Limiter => view! {
             {badge}
             <ActivityLed device=device channel=ch.get_value() led=Led::Limit/>
@@ -328,15 +322,65 @@ fn DynamicsContent(device: Device, kind: Kind, channel: String, color: &'static 
 
     view! {
         <div class="dyn-body">
-            <PanelCard title=title accent=color class="dyn-curve-card">
-                <div class="dyn-curve-row">
-                    <TransferCurve state=state color=color/>
-                    <div class="dyn-side">{side}</div>
-                </div>
-            </PanelCard>
-            <PanelCard class="dyn-params">{params}</PanelCard>
+            <div class="dyn-main">
+                <PanelCard title=title accent=color class="dyn-curve-card">
+                    <div class="dyn-curve-row">
+                        <TransferCurve state=state color=color/>
+                        <div class="dyn-side">{side}</div>
+                    </div>
+                </PanelCard>
+                <PanelCard class="dyn-params">{params}</PanelCard>
+                <MetersCard device=device inputs=kind == Kind::Gate selected=ch.get_value() on_select=on_select/>
+            </div>
             {extras}
         </div>
+    }
+}
+
+// ─── Level meters beside the curve and the parameters ───
+
+/// Level meters of every channel of the group (inputs or outputs) with a
+/// scale, like the original editor beside its curve; the shown channel is
+/// highlighted, a click on a name shows that channel.
+#[component]
+fn MetersCard(device: Device, inputs: bool, selected: String, on_select: Callback<String>) -> impl IntoView {
+    let model = ui().model.get_untracked();
+    let channels = if inputs { model.inputs } else { model.outputs };
+    let color = if inputs { "var(--input)" } else { "var(--output)" };
+    let scale = GAIN_MARKS
+        .iter()
+        .map(|db| {
+            let pos = GAIN_TAPER.to_position(*db);
+            view! { <span class="level-mark" style=format!("bottom:{:.2}%", pos * 100.0)>{db_mark_label(*db)}</span> }
+        })
+        .collect_view();
+    let columns = channels
+        .iter()
+        .map(|&ch| {
+            let name = Memo::new(move |_| device.alias(ch));
+            view! {
+                <div class="level-column" class:selected=ch == selected>
+                    <button class="level-name" data-view-ok title=move || format!("Show {}", name.get())
+                        on:click=move |_| on_select.run(ch.to_string())>{move || name.get()}</button>
+                    <LevelMeter device=device channel=ch.to_string() limit=!inputs/>
+                </div>
+            }
+        })
+        .collect_view();
+    view! {
+        <PanelCard title=Signal::derive(move || if inputs { "Input levels" } else { "Output levels" }.to_string())
+            accent=color class="meters-card">
+            <div class="level-meters" style=format!("--gc:{color}")>
+                <div class="level-column scale">
+                    <span class="level-name"></span>
+                    <div class="level-meter">
+                        <div class="level-leds"></div>
+                        <div class="level-bar">{scale}</div>
+                    </div>
+                </div>
+                {columns}
+            </div>
+        </PanelCard>
     }
 }
 
@@ -568,6 +612,43 @@ fn knee_row(
     )
 }
 
+fn ratio_label(index: f64) -> String {
+    match index.round() as usize {
+        i @ (0 | 5 | 9 | 13) => p::COMPRESSOR_RATIO_NAMES[i].trim_start_matches("1:").to_string(),
+        15 => "∞".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Ratio of the compressor: a fader over the ratio steps and, like the
+/// original editor, a spin box with the value ("1:2.5") instead of a typed field.
+fn ratio_row(state: Memo<Dyn>, set: impl Fn(Field, i64) + Copy + Send + Sync + 'static, color: &'static str) -> AnyView {
+    let last = p::COMPRESSOR_RATIO_NAMES.len() as i64 - 1;
+    let ratio = Memo::new(move |_| state.with(|s| s.get(Field::Ratio)).clamp(0, last));
+    let put = move |v: i64| set(Field::Ratio, v.clamp(0, last));
+    let name = move || p::COMPRESSOR_RATIO_NAMES[ratio.get() as usize];
+    view! {
+        <div class="param-row">
+            <span class="param-label">"Ratio"</span>
+            <div class="param-fader">
+                <Fader vertical=false value=Signal::derive(move || ratio.get() as f64) taper=Taper::Linear(0.0, last as f64)
+                    marks={(0..=last).map(|i| i as f64).collect::<Vec<_>>()} label={ratio_label as fn(f64) -> String}
+                    color=color step=Signal::derive(|| 1.0) reset=0.0 on_change=Callback::new(move |v: f64| put(v.round() as i64))/>
+            </div>
+            <div class="spin-box" title="Compressor ratio (input : output above the threshold)">
+                <span class="spin-value mono" class:off=move || ratio.get() == 0>{name}</span>
+                <div class="spin-buttons">
+                    <button class="up" title="Higher ratio" aria-label="Higher ratio" prop:disabled={move || ratio.get() >= last}
+                        on:click={move |_| put(ratio.get_untracked() + 1)}></button>
+                    <button class="down" title="Lower ratio" aria-label="Lower ratio" prop:disabled={move || ratio.get() <= 0}
+                        on:click={move |_| put(ratio.get_untracked() - 1)}></button>
+                </div>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
 // ─── Side panel ───
 
 #[component]
@@ -608,32 +689,38 @@ fn ActivityLed(device: Device, channel: String, led: Led) -> impl IntoView {
 
 // ─── Transfer curve ───
 
-const CURVE_MIN: f64 = -90.0;
+const CURVE_MIN: f64 = -100.0;
 const CURVE_MAX: f64 = 20.0;
+/// Room for the axis labels left and below the plot.
+const AXIS_LEFT: f64 = 34.0;
+const AXIS_BOTTOM: f64 = 18.0;
+const AXIS_PAD: f64 = 8.0;
 
-/// Input level (x) against output level (y), −90 … +20 dB.
+/// Input level (x) against output level (y), −100 … +20 dB like the original
+/// editor, with the axes labelled outside the plot.
 #[component]
 fn TransferCurve(state: Memo<Dyn>, color: &'static str) -> impl IntoView {
     let container = NodeRef::<html::Div>::new();
     let size = use_size(container);
     let drawing = move || {
         let (w, h) = size.get();
-        if w < 20.0 || h < 20.0 {
+        let (pw, ph) = (w - AXIS_LEFT - AXIS_PAD, h - AXIS_BOTTOM - AXIS_PAD);
+        if pw < 20.0 || ph < 20.0 {
             return ().into_any();
         }
-        let x = move |db: f64| (db - CURVE_MIN) / (CURVE_MAX - CURVE_MIN) * w;
-        let y = move |db: f64| h - (db.clamp(CURVE_MIN, CURVE_MAX) - CURVE_MIN) / (CURVE_MAX - CURVE_MIN) * h;
-        let grid = (0..=10)
+        let x = move |db: f64| AXIS_LEFT + (db - CURVE_MIN) / (CURVE_MAX - CURVE_MIN) * pw;
+        let y = move |db: f64| AXIS_PAD + ph - (db.clamp(CURVE_MIN, CURVE_MAX) - CURVE_MIN) / (CURVE_MAX - CURVE_MIN) * ph;
+        let grid = (0..=12)
             .map(|i| {
-                let db = -80.0 + 10.0 * i as f64;
+                let db = CURVE_MIN + 10.0 * i as f64;
                 let major = db % 20.0 == 0.0;
-                let opacity = if major { 1.0 } else { 0.35 };
+                let class = if db == 0.0 { "curve-grid zero" } else if major { "curve-grid major" } else { "curve-grid" };
                 view! {
-                    <line x1=x(db) y1="0" x2=x(db) y2=h stroke="var(--border)" stroke-opacity=opacity/>
-                    <line x1="0" y1=y(db) x2=w y2=y(db) stroke="var(--border)" stroke-opacity=opacity/>
+                    <line class=class x1=x(db) y1=y(CURVE_MAX) x2=x(db) y2=y(CURVE_MIN)/>
+                    <line class=class x1=x(CURVE_MIN) y1=y(db) x2=x(CURVE_MAX) y2=y(db)/>
                     {major.then(|| view! {
-                        <text class="curve-label" x=x(db) + 2.0 y=h - 2.0>{format!("{}", db as i64)}</text>
-                        <text class="curve-label" x="2" y=y(db) - 2.0>{format!("{}", db as i64)}</text>
+                        <text class="curve-label" x=x(db) y=h - 4.0 text-anchor="middle">{format!("{}", db as i64)}</text>
+                        <text class="curve-label" x=AXIS_LEFT - 5.0 y=y(db) + 3.0 text-anchor="end">{format!("{}", db as i64)}</text>
                     })}
                 }
             })
@@ -641,9 +728,9 @@ fn TransferCurve(state: Memo<Dyn>, color: &'static str) -> impl IntoView {
         let curve = move || {
             state.with(|s| {
                 let t = s.threshold_db().clamp(CURVE_MIN, CURVE_MAX);
-                let mut path = String::with_capacity(221 * 14);
-                for step in 0..=220 {
-                    let input = CURVE_MIN + (CURVE_MAX - CURVE_MIN) * step as f64 / 220.0;
+                let mut path = String::with_capacity(241 * 14);
+                for step in 0..=240 {
+                    let input = CURVE_MIN + (CURVE_MAX - CURVE_MIN) * step as f64 / 240.0;
                     path.push_str(&format!(
                         "{}{:.1},{:.1}",
                         if step == 0 { "M" } else { "L" },
@@ -653,7 +740,7 @@ fn TransferCurve(state: Memo<Dyn>, color: &'static str) -> impl IntoView {
                 }
                 let (kx, ky) = (x(t), y(s.response(t)));
                 view! {
-                    <line x1=kx y1="0" x2=kx y2=h stroke=color stroke-opacity="0.35"/>
+                    <line x1=kx y1=y(CURVE_MAX) x2=kx y2=y(CURVE_MIN) stroke=color stroke-opacity="0.35"/>
                     <path d=path fill="none" stroke=color stroke-width="2.5" stroke-linejoin="round"/>
                     <circle cx=kx cy=ky r="9" fill=color fill-opacity="0.24"/>
                     <circle cx=kx cy=ky r="6" fill=color stroke="var(--bg-deep)" stroke-width="1.5"/>
@@ -662,10 +749,13 @@ fn TransferCurve(state: Memo<Dyn>, color: &'static str) -> impl IntoView {
         };
         view! {
             <svg class="layer">
+                <rect x=AXIS_LEFT y=AXIS_PAD width=pw height=ph fill="var(--bg-deep)"/>
                 {grid}
-                <line x1=x(CURVE_MIN) y1=y(CURVE_MIN) x2=x(CURVE_MAX) y2=y(CURVE_MAX) stroke="var(--muted)" stroke-opacity="0.43"/>
+                <line x1=x(CURVE_MIN) y1=y(CURVE_MIN) x2=x(CURVE_MAX) y2=y(CURVE_MAX) stroke="var(--muted)" stroke-opacity="0.43"
+                    stroke-dasharray="4 4"/>
                 {curve}
-                <text class="curve-title" x="4" y="11">"in → out"</text>
+                <text class="curve-title" x=AXIS_LEFT + 6.0 y=AXIS_PAD + 13.0>"out dB ↑"</text>
+                <text class="curve-title" x=AXIS_LEFT + pw - 6.0 y=AXIS_PAD + ph - 6.0 text-anchor="end">"in dB →"</text>
             </svg>
         }
         .into_any()

@@ -118,6 +118,7 @@ fn PanelPage() -> impl IntoView {
                     <div class="logo"><Icon icon=I::GraphicEq size=18/></div>
                     <span class="app-title">"DSP Panel"</span>
                     <span class="spacer"></span>
+                    <ThemeToggle/>
                     <ReadOnlyToggle/>
                     <Show when=move || !app.dsps.with(Vec::is_empty)>
                         <MuteAllButton/>
@@ -151,6 +152,26 @@ fn PanelPage() -> impl IntoView {
                 <DspDialog initial=None on_close=Callback::new(move |_| adding.set(false))/>
             </Show>
         </div>
+    }
+}
+
+/// Light or dark theme, remembered per browser (`data-theme` on the root
+/// element selects the colours in style.css).
+#[component]
+fn ThemeToggle() -> impl IntoView {
+    let light = RwSignal::new(crate::local_settings::get_string("theme").as_deref() == Some("light"));
+    Effect::new(move |_| {
+        let theme = if light.get() { "light" } else { "dark" };
+        if let Some(root) = document().document_element() {
+            let _ = root.set_attribute("data-theme", theme);
+        }
+        crate::local_settings::set_string("theme", theme);
+    });
+    view! {
+        <button class="icon-button" title=move || if light.get() { "Switch to dark mode" } else { "Switch to light mode" }
+            on:click=move |_| light.update(|l| *l = !*l)>
+            {move || view! { <Icon icon=if light.get() { I::DarkMode } else { I::LightMode } size=20/> }}
+        </button>
     }
 }
 

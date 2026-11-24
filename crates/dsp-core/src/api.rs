@@ -101,6 +101,7 @@ pub mod msg {
     pub const LIMITER_SETUP: &str = "limiterSetup";
     pub const LINK_NAME: &str = "linkName";
     pub const LIGHT_SETTINGS: &str = "lightSettings";
+    pub const HIDDEN_CURVES: &str = "hiddenCurves";
 
     /// Prefix of the "dsp" id that addresses a server preset (offline editor).
     pub const PRESET_PREFIX: &str = "preset:";

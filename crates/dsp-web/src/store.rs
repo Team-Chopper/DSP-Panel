@@ -253,6 +253,20 @@ impl App {
         }
     }
 
+    /// Channels of [dsp] whose curve the EQ overview hides (kept by the server).
+    pub fn set_hidden_curves(&self, dsp: &str, channels: Vec<String>) {
+        if self.require_connection() {
+            self.panel.update(|p| {
+                if channels.is_empty() {
+                    p.hidden_curves.remove(dsp);
+                } else {
+                    p.hidden_curves.insert(dsp.to_string(), channels.clone());
+                }
+            });
+            send(json!({"t": msg::HIDDEN_CURVES, "dsp": dsp, "channels": channels}));
+        }
+    }
+
     pub fn set_light_settings(&self, settings: LightSettings) {
         if self.require_connection() {
             self.panel.update(|p| p.light = settings.clone());
@@ -903,12 +917,6 @@ impl Device {
 
     pub fn link_mask(&self, channel: &str) -> i64 {
         self.state.with_untracked(|s| s.link_mask(channel))
-    }
-
-    /// Remove [channel] from its link group.
-    pub fn unlink(&self, channel: &str) {
-        let (master, slaves) = self.state.with_untracked(|s| ops::unlink_target(s, channel));
-        self.set_link_slaves(&master, slaves);
     }
 
     /// Copy the settings of [from] to each of [targets] (same group). On a DSP

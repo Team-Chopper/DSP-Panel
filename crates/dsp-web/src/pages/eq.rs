@@ -73,16 +73,24 @@ fn round_gain(db: f64) -> f64 {
 }
 
 #[component]
-pub fn EqPage() -> impl IntoView {
+pub fn EqPage(inputs: bool) -> impl IntoView {
     let ui = ui();
     let device = ui.device;
     let model = ui.model;
-    let channel = RwSignal::new(ui.eq_channel.get_untracked().unwrap_or_else(|| model.get_untracked().inputs[0].to_string()));
+    let first = move || {
+        let m = model.get_untracked();
+        if inputs { m.inputs[0] } else { m.outputs[0] }.to_string()
+    };
+    let in_group = move |c: &str| {
+        let m = model.get_untracked();
+        m.has_channel(c) && m.is_input(c) == inputs
+    };
+    let channel = RwSignal::new(ui.eq_channel.get_untracked().filter(|c| in_group(c)).unwrap_or_else(first));
     // Keep the channel valid when the model changes.
     Effect::new(move |_| {
-        let m = model.get();
-        if !m.has_channel(&channel.get_untracked()) {
-            channel.set(m.inputs[0].to_string());
+        model.track();
+        if !in_group(&channel.get_untracked()) {
+            channel.set(first());
         }
     });
     let band = RwSignal::new(0usize);
@@ -98,7 +106,7 @@ pub fn EqPage() -> impl IntoView {
         }
     });
 
-    let color = move || if model.get().is_input(&channel.get()) { "var(--input)" } else { "var(--output)" };
+    let color = if inputs { "var(--input)" } else { "var(--output)" };
     let band_count = Memo::new(move |_| {
         let ch = channel.get();
         device.state.with(|s| s.peq_bands.get(&ch).map_or(0, Vec::len))
@@ -209,8 +217,8 @@ pub fn EqPage() -> impl IntoView {
     };
 
     view! {
-        <div class="eq-page" style=move || format!("--chc:{}", color())>
-            <ChannelSelector device=device selected=channel on_select=Callback::new(move |c: String| {
+        <div class="eq-page" style=format!("--chc:{color}")>
+            <ChannelSelector device=device selected=channel inputs=inputs outputs=!inputs on_select=Callback::new(move |c: String| {
                 if c != channel.get_untracked() {
                     proposal.set(None);
                     import.set(None);
@@ -249,18 +257,12 @@ pub fn EqPage() -> impl IntoView {
                             <BandFaders device=device channel=channel band=band/>
                         </div>
                     </PanelCard>
-                    <PanelCard title=Signal::derive(|| "Filters".to_string())>
-                        <div class="filters">
-                            <FilterColumn device=device channel=channel high_pass=true/>
-                            <div class="vsep"></div>
-                            <FilterColumn device=device channel=channel high_pass=false/>
-                        </div>
-                    </PanelCard>
+                    <FilterCard device=device channel=channel high_pass=true/>
+                    <FilterCard device=device channel=channel high_pass=false/>
                     <PanelCard title=Signal::derive(|| "Gain".to_string()) class="gain-card">
                         {move || {
                             let ch = channel.get();
-                            let c = if model.get_untracked().is_input(&ch) { "var(--input)" } else { "var(--output)" };
-                            view! { <ChannelStrip channel=ch color=c show_name=false/> }
+                            view! { <ChannelStrip channel=ch color=color show_name=false/> }
                         }}
                     </PanelCard>
                 </div>
@@ -275,12 +277,15 @@ pub fn SmallToggle(
     label: &'static str,
     #[prop(into)] active: Signal<bool>,
     color: &'static str,
-    #[prop(default = 56)] width: u32,
+    /// Width in px, 0 = full width.
+    #[prop(default = 56)]
+    width: u32,
     #[prop(optional)] title: &'static str,
     on_click: Callback<()>,
 ) -> impl IntoView {
+    let width = if width == 0 { "100%".to_string() } else { format!("{width}px") };
     view! {
-        <button class="small-toggle" class:on=move || active.get() style=format!("--tc:{color};width:{width}px")
+        <button class="small-toggle" class:on=move || active.get() style=format!("--tc:{color};width:{width}")
             title=title on:click=move |_| on_click.run(())>
             {label}
         </button>
@@ -376,10 +381,10 @@ fn BandTable(device: Device, channel: RwSignal<String>, selected: RwSignal<usize
         <div class="band-table">
             <div class="band-head">
                 <span style="width:30px">"#"</span>
-                <span style="width:118px">"TYPE"</span>
                 <span style="width:82px">"FREQ Hz"</span>
-                <span style="width:82px">"GAIN dB"</span>
                 <span style="width:82px">"Q"</span>
+                <span style="width:82px">"GAIN dB"</span>
+                <span style="width:118px">"TYPE"</span>
             </div>
             {rows}
         </div>
@@ -407,24 +412,21 @@ fn BandRow(device: Device, channel: String, index: usize, selected: RwSignal<usi
                 <span class="dot" style=move || format!("background:{}", if band.with(|b| b.bypass) { "var(--muted)" } else { color })></span>
                 <span class="mono">{index + 1}</span>
             </span>
-            <select class="type-select" on:change=move |ev| {
-                if let Ok(t) = event_target_value(&ev).parse::<i64>() {
-                    edit(PeqEdit { peq_type: Some(t), ..Default::default() });
-                }
-            }>
-                {(0..p::PEQ_TYPE_NAMES.len()).map(|t| {
-                    view! {
-                        <option value=t selected=move || band.with(|b| b.peq_type == t as i64) title=p::PEQ_TYPE_NAMES[t]>
-                            {SHORT_TYPE_NAMES[t]}
-                        </option>
-                    }
-                }).collect_view()}
-            </select>
             <div class="band-value">
                 <ValueField height=24 text=Signal::derive(move || format_hz(p::peq_freq_to_hz(band.with(|b| b.freq_raw))))
                     on_submit=Callback::new(move |input: String| match parse_frequency(&input) {
                         Some(hz) if hz > 0.0 => {
                             edit2(PeqEdit { freq_raw: Some(p::peq_hz_to_freq(hz.clamp(20.0, 20000.0))), ..Default::default() });
+                            true
+                        }
+                        _ => false,
+                    })/>
+            </div>
+            <div class="band-value">
+                <ValueField height=24 text=Signal::derive(move || p::format_q(band.with(|b| b.q_raw)).to_string())
+                    on_submit=Callback::new(move |input: String| match parse_number(&input) {
+                        Some(q) if q > 0.0 => {
+                            edit4(PeqEdit { q_raw: Some(p::peq_q_to_raw(q)), ..Default::default() });
                             true
                         }
                         _ => false,
@@ -440,16 +442,19 @@ fn BandRow(device: Device, channel: String, index: usize, selected: RwSignal<usi
                         None => false,
                     })/>
             </div>
-            <div class="band-value">
-                <ValueField height=24 text=Signal::derive(move || p::format_q(band.with(|b| b.q_raw)).to_string())
-                    on_submit=Callback::new(move |input: String| match parse_number(&input) {
-                        Some(q) if q > 0.0 => {
-                            edit4(PeqEdit { q_raw: Some(p::peq_q_to_raw(q)), ..Default::default() });
-                            true
-                        }
-                        _ => false,
-                    })/>
-            </div>
+            <select class="type-select" on:change=move |ev| {
+                if let Ok(t) = event_target_value(&ev).parse::<i64>() {
+                    edit(PeqEdit { peq_type: Some(t), ..Default::default() });
+                }
+            }>
+                {(0..p::PEQ_TYPE_NAMES.len()).map(|t| {
+                    view! {
+                        <option value=t selected=move || band.with(|b| b.peq_type == t as i64) title=p::PEQ_TYPE_NAMES[t]>
+                            {SHORT_TYPE_NAMES[t]}
+                        </option>
+                    }
+                }).collect_view()}
+            </select>
             <SmallToggle label="Bypass" active=Signal::derive(move || band.with(|b| b.bypass)) color="var(--danger)"
                 on_click=Callback::new(move |_| {
                     let bypass = !band.get_untracked().bypass;
@@ -484,7 +489,8 @@ fn BandFaders(device: Device, channel: RwSignal<String>, band: RwSignal<usize>) 
         let (s1, s2, s3, s4, s5, s6) = (set.clone(), set.clone(), set.clone(), set.clone(), set.clone(), set);
         let q_marks: Vec<f64> = q_marks().into_iter().filter(|m| *m <= q_max as f64).collect();
         view! {
-            <div class="band-faders">
+            <div class="band-faders" style=format!("--bc:{color}")>
+                <div class="band-faders-title">{format!("Band {} parameters", b + 1)}</div>
                 <FaderColumn title="Freq">
                     <div class="fader-box">
                         <Fader value=Signal::derive(move || data.with(|d| d.freq_raw as f64))
@@ -552,8 +558,10 @@ pub fn FaderColumn(title: &'static str, children: Children) -> impl IntoView {
 
 // ─── HPF / LPF ───
 
+/// High pass or low pass in a card of its own like the original editor:
+/// fader, cut-off frequency, slope and bypass.
 #[component]
-fn FilterColumn(device: Device, channel: RwSignal<String>, high_pass: bool) -> impl IntoView {
+fn FilterCard(device: Device, channel: RwSignal<String>, high_pass: bool) -> impl IntoView {
     let filter = Memo::new(move |_| {
         let ch = channel.get();
         device.state.with(|s| filter_of(s, &ch, high_pass))
@@ -564,19 +572,10 @@ fn FilterColumn(device: Device, channel: RwSignal<String>, high_pass: bool) -> i
     });
     let color = if high_pass { "var(--danger)" } else { "var(--info)" };
     let set_freq = move |raw: i64| device.set_filter(&channel.get_untracked(), high_pass, Some(raw), None, None);
+    let title = Signal::derive(move || if high_pass { "High Pass" } else { "Low Pass" }.to_string());
     view! {
+        <PanelCard title=title accent=color class="filter-card">
         <div class="filter-column">
-            <div class="row">
-                <span class="filter-name" style=move || format!("color:{}", if filter.with(FilterState::enabled) { color } else { "var(--muted)" })>
-                    {if high_pass { "HPF" } else { "LPF" }}
-                </span>
-                <span class="spacer"></span>
-                <SmallToggle label="Bypass" active=Signal::derive(move || !filter.with(FilterState::enabled)) color="var(--danger)"
-                    on_click=Callback::new(move |_| {
-                        let enabled = filter.get_untracked().enabled();
-                        device.set_filter(&channel.get_untracked(), high_pass, None, Some(!enabled), None);
-                    })/>
-            </div>
             <div class="fader-box" style=move || format!("opacity:{}", if filter.with(FilterState::enabled) { 1.0 } else { 0.55 })>
                 <Fader value=Signal::derive(move || filter.with(|f| f.freq_raw as f64))
                     taper=Taper::Linear(0.0, p::FREQ_RAW_MAX as f64) marks=freq_marks()
@@ -593,6 +592,7 @@ fn FilterColumn(device: Device, channel: RwSignal<String>, high_pass: bool) -> i
                     }
                     _ => false,
                 })/>
+            <div class="filter-sub">"Slope"</div>
             <select class="slope-select" on:change=move |ev| {
                 if let Ok(s) = event_target_value(&ev).parse::<i64>() {
                     device.set_filter_slope(&channel.get_untracked(), s, high_pass);
@@ -602,7 +602,14 @@ fn FilterColumn(device: Device, channel: RwSignal<String>, high_pass: bool) -> i
                     <option value=s selected=move || slope.get() == s as i64>{p::CROSSOVER_SLOPE_NAMES[s]}</option>
                 }).collect_view()}
             </select>
+            <SmallToggle label="Bypass" active=Signal::derive(move || !filter.with(FilterState::enabled)) color="var(--danger)"
+                width=0 title="Switch the filter off"
+                on_click=Callback::new(move |_| {
+                    let enabled = filter.get_untracked().enabled();
+                    device.set_filter(&channel.get_untracked(), high_pass, None, Some(!enabled), None);
+                })/>
         </div>
+        </PanelCard>
     }
 }
 
@@ -701,6 +708,9 @@ struct GraphShapes {
     total: String,
     /// (x, y, colour, label, bypass, selected)
     points: Vec<(f64, f64, &'static str, usize, bool, bool)>,
+    /// Q, frequency and gain of the selected band beside its point, like the
+    /// original editor: (x, first line y, colour, lines).
+    info: Option<(f64, f64, &'static str, [String; 3])>,
 }
 
 fn band_curve(b: &PeqBand, hz: &[f64]) -> Vec<f64> {
@@ -849,6 +859,18 @@ fn shapes(
     for i in order {
         let (x, y) = g.band_point(&bands[i]);
         out.points.push((x, y, band_color(i), i + 1, bands[i].bypass, i == selected));
+    }
+    if let Some(b) = bands.get(selected) {
+        let (x, y) = g.band_point(b);
+        let lines = [
+            format!("Q {}", p::format_q(b.q_raw)),
+            format!("{}Hz", format_hz(p::peq_freq_to_hz(b.freq_raw))),
+            format!("{}dB", format_db_value(b.gain_db)),
+        ];
+        // Below the point, above it near the bottom; kept inside the plot.
+        let first = if y + 60.0 > PAD_TOP + g.h() { y - 50.0 } else { y + 26.0 };
+        let x = x.clamp(PAD_LEFT + 34.0, PAD_LEFT + g.w() - 34.0);
+        out.info = Some((x, first, band_color(selected), lines));
     }
     out
 }
@@ -1101,6 +1123,14 @@ pub fn PeqGraph(
                 }
             })
             .collect_view();
+        let info = d.info.map(|(x, y, color, lines)| {
+            let texts = lines
+                .into_iter()
+                .enumerate()
+                .map(|(k, line)| view! { <text class="point-info" x=x y=y + 12.0 * k as f64 text-anchor="middle" fill=color>{line}</text> })
+                .collect_view();
+            view! { <g>{texts}</g> }
+        });
         view! {
             <clipPath id="peq-clip"><rect x=PAD_LEFT y=PAD_TOP width=g.w() height=g.h()/></clipPath>
             <g clip-path="url(#peq-clip)">
@@ -1111,6 +1141,7 @@ pub fn PeqGraph(
                 {proposal}
                 <path d=d.total fill="none" stroke="var(--text)" stroke-width="2.4" stroke-linejoin="round"/>
             </g>
+            {info}
             {points}
         }
     };
