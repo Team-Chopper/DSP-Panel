@@ -38,10 +38,23 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The server is built with cargo zigbuild like the local packages: zig compiles the C parts of ring for
+      # the x86-64 base instruction set. The runner's musl-gcc used BMI (andn), which older CPUs of the
+      # target VMs (Ivy Bridge) do not have: the server died with SIGILL at the TLS start.
+      - uses: mlugg/setup-zig@v2
+        if: steps.version.outputs.skip != 'true'
+        with:
+          version: 0.17.0
+
+      - uses: taiki-e/install-action@v2
+        if: steps.version.outputs.skip != 'true'
+        with:
+          tool: cargo-zigbuild@0.24.0
+
       - name: Toolchain
         if: steps.version.outputs.skip != 'true'
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          sudo apt-get update -q && sudo apt-get install -y -q qemu-user
           rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown   # toolchain from rust-toolchain.toml
           curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.22.0/trunk-x86_64-unknown-linux-gnu.tar.gz \
             | sudo tar -xz -C /usr/local/bin trunk
@@ -57,7 +70,40 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         run: |
           (cd crates/dsp-web && trunk build --release)
-          cargo build --release -p dsp-server --target x86_64-unknown-linux-musl
+          cargo zigbuild --release -p dsp-server --target x86_64-unknown-linux-musl
+
+      # Start the server with TLS on an emulated Ivy Bridge CPU (no BMI, AVX2, FMA) and make one HTTPS request:
+      # an instruction the oldest VM cannot run stops the release here instead of on the VM.
+      - name: Check on an old CPU
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          dir=$(mktemp -d)
+          mkdir -p "$dir/data"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+            -keyout "$dir/key.pem" -out "$dir/cert.pem" 2>/dev/null
+          cat > "$dir/config.yaml" <<EOF
+          listen:
+            address: 127.0.0.1
+            port: 18444
+          tls:
+            enabled: true
+            cert: $dir/cert.pem
+            key: $dir/key.pem
+          data_dir: $dir/data
+          web_root: $PWD/crates/dsp-web/dist
+          EOF
+          qemu-x86_64 -cpu IvyBridge target/x86_64-unknown-linux-musl/release/dsp-server serve --config "$dir/config.yaml" \
+            > "$dir/log" 2>&1 &
+          pid=$!
+          ok=false
+          for i in $(seq 90); do
+            if curl -skf https://127.0.0.1:18444/api/status; then ok=true; break; fi
+            kill -0 $pid 2>/dev/null || break
+            sleep 1
+          done
+          echo; cat "$dir/log"
+          kill $pid 2>/dev/null || true
+          $ok || { echo "::error::The server does not run on an Ivy Bridge CPU"; exit 1; }
 
       - name: Package
         if: steps.version.outputs.skip != 'true'

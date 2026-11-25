@@ -138,7 +138,9 @@ dart run bin/generate.dart ..\..\crates\dsp-core\tests\fixtures\parity.json
 GitHub builds the releases ([.github/workflows/release.yml](.github/workflows/release.yml)): bump `version` in
 [Cargo.toml](Cargo.toml) and push to `main`. If there is no release `v<version>` yet, the workflow runs the tests,
 builds the package on Linux and publishes the release with `dsp-panel-rs-linux-x64.tar.gz` and `latest-x64.json`.
-Pushes without a new version build nothing.
+Pushes without a new version build nothing. The server is built with `cargo zigbuild` (x86-64 base instruction set,
+so it also runs on older server CPUs), and before publishing the workflow starts it with TLS on an emulated Ivy
+Bridge CPU and makes one HTTPS request.
 
 A package for testing can still be built locally with `.\tool\build_dist.ps1` (needs zig and cargo-zigbuild:
 `winget install zig.zig`, `cargo install cargo-zigbuild`); it goes to `dist/`, `-Arch arm64` builds for ARM.
