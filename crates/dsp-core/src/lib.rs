@@ -1,7 +1,7 @@
 //! Protocol, device model and web-panel API for the DSP 206 and DSP 408,
 //! shared by the server and the web client.
 //!
-//! This is the Rust port of `dart/packages/dsp_core` (Dart). Byte sequences, value
+//! This is the Rust port of the Dart `dsp_core` (git history up to v1.0.0-alpha.6). Byte sequences, value
 //! encodings, JSON formats and op semantics are identical, so the Rust and
 //! Dart implementations can talk to each other and read each other's files.
 

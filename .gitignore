@@ -4,11 +4,3 @@ CLAUDE.md
 /target
 /dist
 /crates/dsp-web/dist
-/tool/parity/.dart_tool
-/tool/parity/pubspec.lock
-
-# Old Dart/Flutter version (dart/)
-# Deploy target of dart/tool/deploy.ps1 (user@host)
-.deploy-target
-# Local data of make dev-server
-.dev-data/

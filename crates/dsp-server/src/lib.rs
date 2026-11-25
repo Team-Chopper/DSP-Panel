@@ -1,6 +1,6 @@
 //! DSP panel server: owns the TCP connections to the DSPs, serves the web
 //! client and talks to the browsers over one WebSocket. Port of the Dart
-//! server (dart/server/), with the same API, files and behaviour.
+//! server (git history up to v1.0.0-alpha.6), with the same API, files and behaviour.
 
 pub mod config;
 pub mod http;

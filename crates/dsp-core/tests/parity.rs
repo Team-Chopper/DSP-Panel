@@ -1,5 +1,6 @@
 //! Parity with the Dart implementation: replays the reference data written by
-//! tool/parity/bin/generate.dart (the Dart dsp_core) and checks that the
+//! the Dart dsp_core (frozen; the Dart code and its generator are in the git
+//! history up to tag v1.0.0-alpha.6) and checks that the
 //! Rust port validates, links, applies, encodes, decodes and describes the
 //! same way, byte for byte.
 

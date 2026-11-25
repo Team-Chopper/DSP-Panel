@@ -15,8 +15,7 @@
 #
 # The Linux binary is cross-compiled with cargo-zigbuild (needs zig and
 # cargo-zigbuild on PATH). The web client (crates\dsp-web) is built with trunk;
-# -Web <folder> packages another build instead (e.g. -Web dart\build\web for
-# the old Flutter client).
+# -Web <folder> packages another build instead.
 
 param(
   [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',

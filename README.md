@@ -124,14 +124,9 @@ cargo run -p dsp-server -- serve --no-tls --port 8090 --data-dir <dir> --web-roo
 
 Open http://localhost:8090 and add the simulated DSPs (127.0.0.1, ports 19761–19763).
 
-`crates/dsp-core/tests/parity.rs` checks the Rust core byte for byte against reference data of the old Dart
-core. Regenerate it after changing `dart/packages/dsp_core`:
-
-```powershell
-cd tool\parity
-dart pub get --offline
-dart run bin/generate.dart ..\..\crates\dsp-core\tests\fixtures\parity.json
-```
+`crates/dsp-core/tests/parity.rs` checks the Rust core byte for byte against reference data written by the old
+Dart core. The data is frozen: the Dart version and its generator were removed (git history up to tag
+v1.0.0-alpha.6).
 
 ### Release
 
@@ -154,9 +149,7 @@ A package for testing can still be built locally with `.\tool\build_dist.ps1` (n
 | [crates/dsp-web](crates/dsp-web) | the web client (Leptos, WebAssembly) |
 | [crates/fake-dsp](crates/fake-dsp) | simulated DSPs for development and tests |
 | [deploy](deploy) | install scripts, systemd unit, example configuration |
-| [tool](tool) | local package script, parity reference generator |
-| [release](release) | old update location, frozen at 1.0.0-alpha.5 – new releases are GitHub releases |
-| [dart](dart) | the old Dart/Flutter version (v0.9.0), frozen, kept as reference |
+| [tool](tool) | local package script |
 | [PROTOCOL-RE.md](PROTOCOL-RE.md), [ORIGINAL-SOFTWARE.md](ORIGINAL-SOFTWARE.md) | the protocol and how the original editor uses it |
 | [TODO.md](TODO.md) | open checks on real hardware and how to capture them |
 

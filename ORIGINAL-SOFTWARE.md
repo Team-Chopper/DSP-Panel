@@ -836,12 +836,9 @@ since when each part is used.
 [`crates/dsp-core/src/protocol.rs`](crates/dsp-core/src/protocol.rs),
 [`config_dump.rs`](crates/dsp-core/src/config_dump.rs),
 [`ops.rs`](crates/dsp-core/src/ops.rs) and
-[`crates/dsp-server/src/session.rs`](crates/dsp-server/src/session.rs); in the
-old Dart version (`dart/`, behaviour of 0.9.0) in
-[`protocol_service.dart`](dart/packages/dsp_core/lib/src/protocol_service.dart),
-[`config_dump.dart`](dart/packages/dsp_core/lib/src/config_dump.dart),
-[`device_ops.dart`](dart/packages/dsp_core/lib/src/device_ops.dart) and
-[`dsp_session.dart`](dart/server/lib/src/dsp_session.dart).
+[`crates/dsp-server/src/session.rs`](crates/dsp-server/src/session.rs); the
+old Dart version (behaviour of 0.9.0, removed, git history up to tag v1.0.0-alpha.6) had the same in
+`protocol_service.dart`, `config_dump.dart`, `device_ops.dart` and `dsp_session.dart`.
 
 ### 15.1 Used the same way
 
